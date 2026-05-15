@@ -1,112 +1,54 @@
 // ============================================================
-//  SOLANA MULTI-WALLET TRACKER — FAST BOT (60s window)
-//  Zero credits. No webhook provider. Runs forever for free.
-//  + SELL SIGNAL TRACKER — fires when all coordinated wallets exit
+//  SOLANA COMBINED BOT
+//  1. Fast Tracker  — 5 wallets within 30s of mint
+//  2. Slow Tracker  — 3 wallets within 5min, token < 60min
+//  3. Whale Tracker — migrated tokens, large trades $5k+
+//  All three run in one process, three Telegram groups
 // ============================================================
 
-const https   = require('https');
-const http    = require('http');
-const fs      = require('fs');
+const https     = require('https');
+const http      = require('http');
+const fs        = require('fs');
 const WebSocket = require('ws');
 
 // ── CONFIG ────────────────────────────────────────────────────
-const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN;
-const CHAT_ID          = process.env.CHAT_ID;
-const GMGN_API_KEY     = process.env.GMGN_API_KEY;
-const SHYFT_API_KEY    = process.env.SHYFT_API_KEY;
+const GMGN_API_KEY  = process.env.GMGN_API_KEY;
+const SHYFT_API_KEY = process.env.SHYFT_API_KEY;
 
-const SOL_MINT         = 'So11111111111111111111111111111111111111112';
-const WINDOW_SECS      = 60;
-const MAX_TOKEN_AGE    = 20;
-const STRICT_AGE_CHECK = true;
+const TELEGRAM_TOKEN      = process.env.TELEGRAM_TOKEN;
+const CHAT_ID_FAST        = process.env.CHAT_ID_FAST        || '-5081620734';
+const CHAT_ID_SLOW        = process.env.CHAT_ID_SLOW        || '-1003888330833';
+const CHAT_ID_WHALE       = process.env.CHAT_ID_WHALE       || '-5174318212';
+const RENDER_URL          = process.env.RENDER_EXTERNAL_URL || '';
+
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+// ── FAST BOT CONFIG ───────────────────────────────────────────
+const FAST_WINDOW_SECS    = 30; // matches FAST_MAX_TOKEN_AGE
+const FAST_MAX_TOKEN_AGE  = 30;
+const FAST_MIN_WALLETS    = 5;
+
+// ── FAST MIGRATION CONFIG ────────────────────────────────────
+const FAST_MIG_MAX_AGE    = 30;  // token must hit MC threshold within 30s of mint
+const FAST_MIG_MIN_WALLETS = 2;  // 2 tracked wallets (excluding dev)
+const FAST_MIG_MIN_MC      = 38_000; // $40k market cap threshold
+
+// ── SLOW BOT CONFIG ───────────────────────────────────────────
+const SLOW_WINDOW_SECS    = 300;
+const SLOW_MAX_TOKEN_AGE  = 3600;
+const SLOW_MIN_WALLETS    = 3;
+const SLOW_SAME_NAME_THRESHOLD = 10;
+const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
 
-// ── NOTABLE HOLDERS ─────────────────────────────────────────────────────
-// Uses free Solana RPC only — getTokenLargestAccounts + getBalance.
-const NOTABLE_HOLDER_THRESHOLD = 50_000;
+// ── WHALE BOT CONFIG ──────────────────────────────────────────
+const WHALE_THRESHOLD         = 5000;   // $5k single or cumulative
+const WHALE_MIN_HOLDERS       = 1000;
+const WHALE_CHECK_INTERVAL_MS = 2 * 60 * 1000;  // check every 2 min
+const WHALE_MAX_AGE_HOURS     = 24;
+const WHALE_FETCH_INTERVAL_MS = 5 * 60 * 1000;  // fetch new migrations every 5 min
 
-let solPriceCache = { price: null, ts: 0 };
-async function getSolPrice() {
-  const now = Math.floor(Date.now() / 1000);
-  if (solPriceCache.price && now - solPriceCache.ts < 300) return solPriceCache.price;
-  const info = await getCachedTokenInfo('So11111111111111111111111111111111111111112');
-  const price = parseFloat(info?.price ?? 0);
-  if (price > 0) solPriceCache = { price, ts: now };
-  return solPriceCache.price ?? 150;
-}
-
-async function getTokenAccountOwner(tokenAccountPubkey) {
-  const result = await httpsPost(HTTP_RPC, {
-    jsonrpc: '2.0', id: 1,
-    method: 'getAccountInfo',
-    params: [tokenAccountPubkey, { encoding: 'jsonParsed', commitment: 'confirmed' }]
-  });
-  return result?.result?.value?.data?.parsed?.info?.owner ?? null;
-}
-
-async function getWalletSolValueUsd(walletAddress, solPrice) {
-  const result = await httpsPost(HTTP_RPC, {
-    jsonrpc: '2.0', id: 1,
-    method: 'getBalance',
-    params: [walletAddress, { commitment: 'confirmed' }]
-  });
-  const lamports = result?.result?.value ?? 0;
-  return (lamports / 1e9) * solPrice;
-}
-
-async function fetchNotableHolders(mint, tokenInfo) {
-  try {
-    const result = await httpsPost(HTTP_RPC, {
-      jsonrpc: '2.0', id: 1,
-      method: 'getTokenLargestAccounts',
-      params: [mint, { commitment: 'confirmed' }]
-    });
-    const accounts = result?.result?.value ?? [];
-    if (!accounts.length) return [];
-
-    const solPrice    = await getSolPrice();
-    const tokenPrice  = parseFloat(tokenInfo?.price ?? 0);
-    const totalSupply = parseFloat(tokenInfo?.circulating_supply ?? tokenInfo?.total_supply ?? 0);
-
-    log(`[HOLDERS] Checking ${accounts.length} top holders for ${mint.substring(0, 8)}...`);
-
-    const notable = [];
-    const seen    = new Set();
-
-    for (const account of accounts.slice(0, 20)) {
-      await new Promise(r => setTimeout(r, 200));
-      const owner = await getTokenAccountOwner(account.address);
-      if (!owner || seen.has(owner)) continue;
-      seen.add(owner);
-      if (WALLET_SET.has(owner)) continue;
-
-      const tokenAmt      = parseFloat(account.uiAmount ?? account.uiAmountString ?? 0);
-      const tokenValueUsd = tokenPrice > 0 ? tokenAmt * tokenPrice : 0;
-      const solValueUsd   = await getWalletSolValueUsd(owner, solPrice);
-      await new Promise(r => setTimeout(r, 200));
-
-      const totalValue = tokenValueUsd + solValueUsd;
-      if (totalValue >= NOTABLE_HOLDER_THRESHOLD) {
-        const pctStr = totalSupply > 0
-          ? ` (${((tokenAmt / totalSupply) * 100).toFixed(1)}%)`
-          : '';
-        const valStr = totalValue >= 1_000_000
-          ? `$${(totalValue / 1_000_000).toFixed(1)}M`
-          : `$${Math.round(totalValue / 1000)}k`;
-        notable.push({ addr: owner, valStr, pctStr });
-        log(`[HOLDERS] Notable: ${owner.substring(0, 8)} — ${valStr}${pctStr}`);
-      }
-    }
-    return notable;
-  } catch(e) {
-    log(`[ERR] fetchNotableHolders: ${e.message}`);
-    return [];
-  }
-}
-
-// ── SIGNAL FILTER ─────────────────────────────────────────────
-// No filter — always fire if 4+ wallets buy within 20s of mint
-
+// ── RPC ───────────────────────────────────────────────────────
 const WSS_PRIMARY  = SHYFT_API_KEY
   ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
   : 'wss://api.mainnet-beta.solana.com';
@@ -116,179 +58,231 @@ const HTTP_RPC     = SHYFT_API_KEY
   : 'https://api.mainnet-beta.solana.com';
 
 // ── FIRED ALERTS ──────────────────────────────────────────────
-const FIRED_FILE = '/tmp/fired_alerts.json';
+const FIRED_FILE       = '/tmp/sol_combined_fired.json';
+const WHALE_FIRED_FILE = '/tmp/sol_whale_fired.json';
 
-function loadFiredAlerts() {
+function loadSet(path) {
   try {
-    if (fs.existsSync(FIRED_FILE)) {
-      const raw = fs.readFileSync(FIRED_FILE, 'utf8');
-      return new Set(JSON.parse(raw));
-    }
-  } catch(e) { log(`[INIT] Could not load fired alerts: ${e.message}`); }
+    if (fs.existsSync(path)) return new Set(JSON.parse(fs.readFileSync(path, 'utf8')));
+  } catch(e) {}
   return new Set();
 }
 
-function saveFiredAlert(mint) {
-  firedAlerts.add(mint);
-  try { fs.writeFileSync(FIRED_FILE, JSON.stringify([...firedAlerts]), 'utf8'); }
-  catch(e) { log(`[WARN] Could not save fired alert: ${e.message}`); }
+function saveSet(path, set) {
+  try { fs.writeFileSync(path, JSON.stringify([...set]), 'utf8'); } catch(e) {}
 }
 
 // ── WALLETS ───────────────────────────────────────────────────
 const WALLETS = [
-  "CzbN6T1gKkKutvuPXcxNmV8FLqzjsDWebWmg9o8e2ZbU", "H8s4GoDcABkvykQSS7mUSHTSKUcxivoULUXgZDkjuoUf",
-  "AmNMqM5VbPwtG14gLBdtrqZpQrhSzavLkQPufS8CQ7LB", "AMRsSeU5JpqwQWJGNLMpZzRCZSFEwYQYbMnms3dD4311",
-  "2bBRwhGoL4fRZk6g8NnhBZywsF8PdLJnBRfWDCEMogD2", "6EDaVsS6enYgJ81tmhEkiKFcb4HuzPUVFZeom6PHUqN3",
-  "Aqje5DsN4u2PHmQxGF9PKfpsDGwQRCBhWeLKHCFhSMXk", "HiSo5kykqDPs3EG14Fk9QY4B5RvkuEs8oJTiqPX3EDAn",
-  "FxN3VZ4BosL5urG2yoeQ156JSdmavm9K5fdLxjkPmaMR", "JDQKDrc1TQgBRvdFh56tkta5sYcDj1SoP52Eiu64rSrT",
-  "HyYNVYmnFmi87NsQqWzLJhUTPBKQUfgfhdbBa554nMFF", "GeUnv1jmtviRbR7Gu1JnXSGkUMUgFVBHuEVQVpTaUX1W",
-  "78N177fzNJpp8pG49xDv1efYcTMSzo9tPTKEA9mAVkh2", "8ZN71XTdVo8yRovnGLmNgW3Tgniw6A4J3JGLvPD686FP",
-  "DPNPVvoGdwNBY849ryx2JZzakWuWbDTfSUYr8aNfKLwA", "Hp34goKgAhAYW6sw9iFAZofvDTr3DAhtkSKF1R9bAk2P",
-  "95ZCf3jKMHeFYvPXVZW3Ek6AEPDyjebosqnc7eNioVMo", "G7NvZKjoVqBDWciSYtWWgUPB7DA1iJavdvH5jty2FAmM",
-  "BCagckXeMChUKrHEd6fKFA1uiWDtcmCXMsqaheLiUPJd", "4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9",
-  "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o", "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6",
-  "2T5NgDDidkvhJQg8AHDi74uCFwgp25pYFMRZXBaCUNBH", "515vh1DrPuwMATt9Zoq9kP4sJL9fyojA1dHJu4DQpNRp",
-  "GpTXmkdvrTajqkzX1fBmC4BUjSboF9dHgfnqPqj8WAc4", "2ezv4U5HmPpkt2xLsKnw1FyyGmjFBeW7c166p99Hw2xB",
-  "EaVboaPxFCYanjoNWdkxTbPvt57nhXGu5i6m9m6ZS2kK", "FAicXNV5FVqtfbpn4Zccs71XcfGeyxBSGbqLDyDJZjke",
-  "BAr5csYtpWoNpwhUjixX7ZPHXkUciFZzjBp9uNxZXJPh", "B32QbbdDAyhvUQzjcaM5j6ZVKwjCxAwGH5Xgvb9SJqnC",
-  "8HcYptCBAaPFWkmupiSAmysZ6Z8jB7N1c4YhVjhX7zbg", "FFEjC9MHhpQViBPrD2iU6LmV2hEigyhLJaL7MZUZzyD4",
-  "FTaSBuVj6w2S7XUa8fw19xrLy57DDr6kZDL6sxDXtvTP", "FSAmbD6jm6SZZQadSJeC1paX3oTtAiY9hTx1UYzVoXqj",
-  "G6fUXjMKPJzCY1rveAE6Qm7wy5U3vZgKDJmN1VPAdiZC", "Ar2Y6o1QmrRAskjii1cRfijeKugHH13ycxW5cd7rro1x",
-  "5aLY85pyxiuX3fd4RgM3Yc1e3MAL6b7UgaZz6MS3JUfG", "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt",
+  "CzbN6T1gKkKutvuPXcxNmV8FLqzjsDWebWmg9o8e2ZbU","H8s4GoDcABkvykQSS7mUSHTSKUcxivoULUXgZDkjuoUf",
+  "AmNMqM5VbPwtG14gLBdtrqZpQrhSzavLkQPufS8CQ7LB","AMRsSeU5JpqwQWJGNLMpZzRCZSFEwYQYbMnms3dD4311",
+  "2bBRwhGoL4fRZk6g8NnhBZywsF8PdLJnBRfWDCEMogD2","6EDaVsS6enYgJ81tmhEkiKFcb4HuzPUVFZeom6PHUqN3",
+  "Aqje5DsN4u2PHmQxGF9PKfpsDGwQRCBhWeLKHCFhSMXk","HiSo5kykqDPs3EG14Fk9QY4B5RvkuEs8oJTiqPX3EDAn",
+  "FxN3VZ4BosL5urG2yoeQ156JSdmavm9K5fdLxjkPmaMR","JDQKDrc1TQgBRvdFh56tkta5sYcDj1SoP52Eiu64rSrT",
+  "HyYNVYmnFmi87NsQqWzLJhUTPBKQUfgfhdbBa554nMFF","GeUnv1jmtviRbR7Gu1JnXSGkUMUgFVBHuEVQVpTaUX1W",
+  "78N177fzNJpp8pG49xDv1efYcTMSzo9tPTKEA9mAVkh2","8ZN71XTdVo8yRovnGLmNgW3Tgniw6A4J3JGLvPD686FP",
+  "DPNPVvoGdwNBY849ryx2JZzakWuWbDTfSUYr8aNfKLwA","Hp34goKgAhAYW6sw9iFAZofvDTr3DAhtkSKF1R9bAk2P",
+  "95ZCf3jKMHeFYvPXVZW3Ek6AEPDyjebosqnc7eNioVMo","G7NvZKjoVqBDWciSYtWWgUPB7DA1iJavdvH5jty2FAmM",
+  "BCagckXeMChUKrHEd6fKFA1uiWDtcmCXMsqaheLiUPJd","4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9",
+  "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o","8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6",
+  "2T5NgDDidkvhJQg8AHDi74uCFwgp25pYFMRZXBaCUNBH","515vh1DrPuwMATt9Zoq9kP4sJL9fyojA1dHJu4DQpNRp",
+  "GpTXmkdvrTajqkzX1fBmC4BUjSboF9dHgfnqPqj8WAc4","2ezv4U5HmPpkt2xLsKnw1FyyGmjFBeW7c166p99Hw2xB",
+  "EaVboaPxFCYanjoNWdkxTbPvt57nhXGu5i6m9m6ZS2kK","FAicXNV5FVqtfbpn4Zccs71XcfGeyxBSGbqLDyDJZjke",
+  "BAr5csYtpWoNpwhUjixX7ZPHXkUciFZzjBp9uNxZXJPh","B32QbbdDAyhvUQzjcaM5j6ZVKwjCxAwGH5Xgvb9SJqnC",
+  "8HcYptCBAaPFWkmupiSAmysZ6Z8jB7N1c4YhVjhX7zbg","FFEjC9MHhpQViBPrD2iU6LmV2hEigyhLJaL7MZUZzyD4",
+  "FTaSBuVj6w2S7XUa8fw19xrLy57DDr6kZDL6sxDXtvTP","FSAmbD6jm6SZZQadSJeC1paX3oTtAiY9hTx1UYzVoXqj",
+  "G6fUXjMKPJzCY1rveAE6Qm7wy5U3vZgKDJmN1VPAdiZC","Ar2Y6o1QmrRAskjii1cRfijeKugHH13ycxW5cd7rro1x",
+  "5aLY85pyxiuX3fd4RgM3Yc1e3MAL6b7UgaZz6MS3JUfG","DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt",
   "7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5",
-  "BCnqsPEtA1TkgednYEebRpkmwFRJDCjMQcKZMMtEdArc", "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
-  "5ZuV8eqkvzYFVEKbLvGBdexL2tFv7E5BCd2HZpjqbdg", "FM1YCKED2KaqB8Uat8aB1nsffR1vezr7s6FAEieXJgke",
-  "AV7PjXHL5JXZ1YoYRoN9Dsstg1x2UciBupMCXcJP8gUz", "Dzp1SrZ474xwGp6ZEP6cNKo39u9zeXe1YAuTkyZyv3t4",
-  "whamNNP9tHoxLg92yHvJPdYhghEoCg1qYTsh5a2oLbx", "HdKJM6Lvfp9aV9tvEMC8AD4GnsbFgMUkHLoK923Sn1ET",
-  "5FqUo9aBjsp7QeeyN6Vi2ZmF2fjS4H5EU7wnAQwPy17z", "7hHmfYYR7L8LsCKk5akjtvVu1BbJRgHGJ2n6s7gbeKG4",
-  "CjtqWn4toBbJ1feRZBDhz3TwBjbZm5RpES8rvKWTuNtk", "FAX4qRQdiSj2iWDYvkJ21VieVCXGREtwMhEyAHSJ1aqp",
-  "9VXuNqqqzniYYW3fRDeaCtUUtqWsEeWWn5umh3aF9h17", "DAEdBmTPEKM6xkwfzC3d411QUe6coKpkND6UURa4CvHC",
-  "iPUp3qkm39ycMGbywWFMUyvaDhiiPGXeWXaDtmHNe6C", "CfkaAru9ArJ2tAStYHvbAyRBJL3EhDzsWYV2KYg9shxB",
-  "EeLjBXRELqrcWAXbnj8T4jQPS9Qh7UGWiKxovsJ36pZY", "H5Wh4EDvWQT4mShH746V5VDqxHQkaQZyPWfuhy1PRVBg",
-  "GH9yk8vgFvHnAD8JZqXxr3hBN1Lr1mJ9NPzrP5mVqiJe", "7hkd2kdx4bMyuUDgktZvykDh69r8YkkrX4kf1sW2C8T6",
-  "8ghYW6ftL5kUemfsoA9X37rz3ZnvyMSZRAx1kt1CxpoS", "GKaJNFDp2W5uCYfNKnTPN63tFXKgXgaDSfnTVfksBeq1",
-  "DaKpjVJFxq3y4iZcEu12wzpXGCNBkQE587VNACUj15rT", "C4ARzqpvZ4gR3ta89H5Yz7UyPTpRm22BL5U91e5dHTSf",
-  "BSFxyBwsHQsDXULygBpsTu6iUmfHUbCr6j4geZSN6YJG", "9Zu8AigeXgFAajBTni2VWw6Wmz7XxDqHmY5nQwdCWAyY",
-  "9dkeTBYaHJzxVgVZqympcHmPeQvHtQv1sArZiZuwmhgp", "AQdBYZNy3BZ1vouGUjA1w9Ay7aq7kH5UQSuh4LQWKotY",
-  "HTM87R4mgjDdiF6Yfn8duK9vbDmZxiPCTRbGvm7eCAJY", "8i5U2uNBEuTc4zskYP14zbebDg2RSwrrG8REhEnJb97K",
-  "7E9jfxCczubz4FXkkVKzUMHXGwzJxyppC4m7y3ew8ATg", "8v6ztxZwhPBNmA6aGrBzzrt6UBf2fZZfsWqZ9Lt47Kpv",
-  "6nU2L7MQVUWjtdKHVpuZA9aind73nd3rXC4YFo8KQCy4", "5zCkbcD74hFPeBHwYdwJLJAoLVgHX45AFeR7RzC8vFiD",
-  "8HeDT75s5g4CtCimH5B5nySqCiQhtWii8UnZhxBtFo38", "A8Z1ejQGk45EJibBPJviWnM3UvwKSuYun53nSCkWKM52",
-  "D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA", "BZC7VEj5Y9Ege3cTRGBZW2zW7pjw3hpiSkcAoYKysvue",
-  "FgifQEkRkSSXZjf2cJ4c55BhVts2yrNKzmzBLLyicg8b", "EFaQQTGywnD4CjQQvTugUiyVT4LV9G6MsWqiub8X6unN",
-  "HUgpmqL6r4Z4iEZiVuNZ6J6QnAsSZpsL8giVyVtz3QhT", "FaBGrHWjcJ8vKnbgUtsdpZjvF7YAAajtQTWmmEHiKtQr",
-  "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp", "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa",
-  // Added wallets
-  "7moqFjvm2MwAiMtCZoqYoTAPzRBxxMRT2ddyHThQuWjr", // Smart 15
-  "DjM7Tu7whh6P3pGVBfDzwXAx2zaw51GJWrJE3PwtuN7s", // CHILLHOUSE Dev
-  "AvcWA3ngM55sSpjh1FZthmqA7V6BHo4f555a8w3Wv3ij", // Honeypot Dev
-  "J7nJ35d8EGU3fHCVCUun56C1MKakdoEQ38CFLHAhWDwP", // Together Dev
-  "6ujZxnphRxTqveaQtLAQHFoWz16xhLWZbTijcgZN4fRp", // BadBunny Dev
-  "nazikTJezTC3W2fxXE3wzs495PYzXMiq5o7co6YYACA",  // YZY Dev
-  "BtMBMPkoNbnLF9Xn552guQq528KKXcsNBNNBre3oaQtr", // Letterbomb(horse)
-  "EYfdt8cNFyyTEJKp18dcoVbgUHDnM1SK3bT2uKj9XXHc", // Penguin Dev
-  "EgQX9R3Qph1dPHE1Ysou1auSYqRGomCNmLDC28Yg77aq", // Smart 8
+  "BCnqsPEtA1TkgednYEebRpkmwFRJDCjMQcKZMMtEdArc","4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
+  "5ZuV8eqkvzYFVEKbLvGBdexL2tFv7E5BCd2HZpjqbdg","FM1YCKED2KaqB8Uat8aB1nsffR1vezr7s6FAEieXJgke",
+  "AV7PjXHL5JXZ1YoYRoN9Dsstg1x2UciBupMCXcJP8gUz","Dzp1SrZ474xwGp6ZEP6cNKo39u9zeXe1YAuTkyZyv3t4",
+  "whamNNP9tHoxLg92yHvJPdYhghEoCg1qYTsh5a2oLbx","HdKJM6Lvfp9aV9tvEMC8AD4GnsbFgMUkHLoK923Sn1ET",
+  "5FqUo9aBjsp7QeeyN6Vi2ZmF2fjS4H5EU7wnAQwPy17z","7hHmfYYR7L8LsCKk5akjtvVu1BbJRgHGJ2n6s7gbeKG4",
+  "CjtqWn4toBbJ1feRZBDhz3TwBjbZm5RpES8rvKWTuNtk","FAX4qRQdiSj2iWDYvkJ21VieVCXGREtwMhEyAHSJ1aqp",
+  "9VXuNqqqzniYYW3fRDeaCtUUtqWsEeWWn5umh3aF9h17","DAEdBmTPEKM6xkwfzC3d411QUe6coKpkND6UURa4CvHC",
+  "iPUp3qkm39ycMGbywWFMUyvaDhiiPGXeWXaDtmHNe6C","CfkaAru9ArJ2tAStYHvbAyRBJL3EhDzsWYV2KYg9shxB",
+  "EeLjBXRELqrcWAXbnj8T4jQPS9Qh7UGWiKxovsJ36pZY","H5Wh4EDvWQT4mShH746V5VDqxHQkaQZyPWfuhy1PRVBg",
+  "GH9yk8vgFvHnAD8JZqXxr3hBN1Lr1mJ9NPzrP5mVqiJe","7hkd2kdx4bMyuUDgktZvykDh69r8YkkrX4kf1sW2C8T6",
+  "8ghYW6ftL5kUemfsoA9X37rz3ZnvyMSZRAx1kt1CxpoS","GKaJNFDp2W5uCYfNKnTPN63tFXKgXgaDSfnTVfksBeq1",
+  "DaKpjVJFxq3y4iZcEu12wzpXGCNBkQE587VNACUj15rT","C4ARzqpvZ4gR3ta89H5Yz7UyPTpRm22BL5U91e5dHTSf",
+  "BSFxyBwsHQsDXULygBpsTu6iUmfHUbCr6j4geZSN6YJG","9Zu8AigeXgFAajBTni2VWw6Wmz7XxDqHmY5nQwdCWAyY",
+  "9dkeTBYaHJzxVgVZqympcHmPeQvHtQv1sArZiZuwmhgp","AQdBYZNy3BZ1vouGUjA1w9Ay7aq7kH5UQSuh4LQWKotY",
+  "HTM87R4mgjDdiF6Yfn8duK9vbDmZxiPCTRbGvm7eCAJY","8i5U2uNBEuTc4zskYP14zbebDg2RSwrrG8REhEnJb97K",
+  "7E9jfxCczubz4FXkkVKzUMHXGwzJxyppC4m7y3ew8ATg","8v6ztxZwhPBNmA6aGrBzzrt6UBf2fZZfsWqZ9Lt47Kpv",
+  "6nU2L7MQVUWjtdKHVpuZA9aind73nd3rXC4YFo8KQCy4","5zCkbcD74hFPeBHwYdwJLJAoLVgHX45AFeR7RzC8vFiD",
+  "8HeDT75s5g4CtCimH5B5nySqCiQhtWii8UnZhxBtFo38","A8Z1ejQGk45EJibBPJviWnM3UvwKSuYun53nSCkWKM52",
+  "D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA","BZC7VEj5Y9Ege3cTRGBZW2zW7pjw3hpiSkcAoYKysvue",
+  "FgifQEkRkSSXZjf2cJ4c55BhVts2yrNKzmzBLLyicg8b","EFaQQTGywnD4CjQQvTugUiyVT4LV9G6MsWqiub8X6unN",
+  "HUgpmqL6r4Z4iEZiVuNZ6J6QnAsSZpsL8giVyVtz3QhT","FaBGrHWjcJ8vKnbgUtsdpZjvF7YAAajtQTWmmEHiKtQr",
+  "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp","bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa",
+  "7moqFjvm2MwAiMtCZoqYoTAPzRBxxMRT2ddyHThQuWjr",
+  "DjM7Tu7whh6P3pGVBfDzwXAx2zaw51GJWrJE3PwtuN7s",
+  "AvcWA3ngM55sSpjh1FZthmqA7V6BHo4f555a8w3Wv3ij",
+  "J7nJ35d8EGU3fHCVCUun56C1MKakdoEQ38CFLHAhWDwP",
+  "6ujZxnphRxTqveaQtLAQHFoWz16xhLWZbTijcgZN4fRp",
+  "nazikTJezTC3W2fxXE3wzs495PYzXMiq5o7co6YYACA",
+  "BtMBMPkoNbnLF9Xn552guQq528KKXcsNBNNBre3oaQtr",
+  "EYfdt8cNFyyTEJKp18dcoVbgUHDnM1SK3bT2uKj9XXHc",
+  "EgQX9R3Qph1dPHE1Ysou1auSYqRGomCNmLDC28Yg77aq",
+  "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", // Cupsey
+  "CtPxvpWo1pk7HtL6KwpCLMMdsXHC6fdqAN1bPiracaQq", // STINKDEX Dev
 ];
 const WALLET_SET = new Set(WALLETS);
 
-// ── STATE ─────────────────────────────────────────────────────
-let firedAlerts    = loadFiredAlerts();
-let activeAlerts   = {};
-let devWalletCache = {};
+// Wallet name lookup — all known names
+const WALLET_NAMES = {
+  // Previously named
+  "CzbN6T1gKkKutvuPXcxNmV8FLqzjsDWebWmg9o8e2ZbU": "Income Dev",
+  "HiSo5kykqDPs3EG14Fk9QY4B5RvkuEs8oJTiqPX3EDAn": "CL1 Dev",
+  "8ZN71XTdVo8yRovnGLmNgW3Tgniw6A4J3JGLvPD686FP": "nate91 Dev",
+  "DPNPVvoGdwNBY849ryx2JZzakWuWbDTfSUYr8aNfKLwA": "Life Dev",
+  "Hp34goKgAhAYW6sw9iFAZofvDTr3DAhtkSKF1R9bAk2P": "Machi Dev",
+  "95ZCf3jKMHeFYvPXVZW3Ek6AEPDyjebosqnc7eNioVMo": "Win Dev",
+  "FSAmbD6jm6SZZQadSJeC1paX3oTtAiY9hTx1UYzVoXqj": "Z(BIOLLM Dev)",
+  "7moqFjvm2MwAiMtCZoqYoTAPzRBxxMRT2ddyHThQuWjr": "Smart 15",
+  "DjM7Tu7whh6P3pGVBfDzwXAx2zaw51GJWrJE3PwtuN7s": "CHILLHOUSE Dev",
+  "AvcWA3ngM55sSpjh1FZthmqA7V6BHo4f555a8w3Wv3ij": "Honeypot Dev",
+  "J7nJ35d8EGU3fHCVCUun56C1MKakdoEQ38CFLHAhWDwP": "Together Dev",
+  "6ujZxnphRxTqveaQtLAQHFoWz16xhLWZbTijcgZN4fRp": "BadBunny Dev",
+  "nazikTJezTC3W2fxXE3wzs495PYzXMiq5o7co6YYACA": "YZY Dev",
+  "BtMBMPkoNbnLF9Xn552guQq528KKXcsNBNNBre3oaQtr": "Letterbomb(horse)",
+  "EYfdt8cNFyyTEJKp18dcoVbgUHDnM1SK3bT2uKj9XXHc": "Penguin Dev",
+  "EgQX9R3Qph1dPHE1Ysou1auSYqRGomCNmLDC28Yg77aq": "Smart 8",
+  "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f": "Cupsey",
+  "CtPxvpWo1pk7HtL6KwpCLMMdsXHC6fdqAN1bPiracaQq": "STINKDEX Dev",
+  // Newly matched from document
+  "H8s4GoDcABkvykQSS7mUSHTSKUcxivoULUXgZDkjuoUf": "Elon Dev",
+  "AmNMqM5VbPwtG14gLBdtrqZpQrhSzavLkQPufS8CQ7LB": "VDKH Dev",
+  "AMRsSeU5JpqwQWJGNLMpZzRCZSFEwYQYbMnms3dD4311": "Nothing Dev",
+  "2bBRwhGoL4fRZk6g8NnhBZywsF8PdLJnBRfWDCEMogD2": "Maga Dev",
+  "Aqje5DsN4u2PHmQxGF9PKfpsDGwQRCBhWeLKHCFhSMXk": "Eva Dev",
+  "JDQKDrc1TQgBRvdFh56tkta5sYcDj1SoP52Eiu64rSrT": "ECC Dev",
+  "HyYNVYmnFmi87NsQqWzLJhUTPBKQUfgfhdbBa554nMFF": "Fartcoin Dev",
+  "GeUnv1jmtviRbR7Gu1JnXSGkUMUgFVBHuEVQVpTaUX1W": "Nothing Dev",
+  "78N177fzNJpp8pG49xDv1efYcTMSzo9tPTKEA9mAVkh2": "Sheep",
+  "DAEdBmTPEKM6xkwfzC3d411QUe6coKpkND6UURa4CvHC": "Coinbase Dev",
+  "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o": "Cented 7",
+  "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp": "Pigeon Dev",
+  "FaBGrHWjcJ8vKnbgUtsdpZjvF7YAAajtQTWmmEHiKtQr": "Dale Dev",
+  "HUgpmqL6r4Z4iEZiVuNZ6J6QnAsSZpsL8giVyVtz3QhT": "Sparkles Dev",
+  "EFaQQTGywnD4CjQQvTugUiyVT4LV9G6MsWqiub8X6unN": "Bob Dev",
+  "FgifQEkRkSSXZjf2cJ4c55BhVts2yrNKzmzBLLyicg8b": "Elephant Dev",
+  "BZC7VEj5Y9Ege3cTRGBZW2zW7pjw3hpiSkcAoYKysvue": "Unipcs Dev",
+  "D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA": "Imagine Dev",
+  "A8Z1ejQGk45EJibBPJviWnM3UvwKSuYun53nSCkWKM52": "Punch Dev",
+  "8HeDT75s5g4CtCimH5B5nySqCiQhtWii8UnZhxBtFo38": "Lobstar Dev",
+  "5zCkbcD74hFPeBHwYdwJLJAoLVgHX45AFeR7RzC8vFiD": "Charlie",
+  "6nU2L7MQVUWjtdKHVpuZA9aind73nd3rXC4YFo8KQCy4": "VVM Dev",
+  "8v6ztxZwhPBNmA6aGrBzzrt6UBf2fZZfsWqZ9Lt47Kpv": "Lmeow Dev",
+  "7E9jfxCczubz4FXkkVKzUMHXGwzJxyppC4m7y3ew8ATg": "Mia Dev",
+  "8i5U2uNBEuTc4zskYP14zbebDg2RSwrrG8REhEnJb97K": "Memeless Dev",
+  "HTM87R4mgjDdiF6Yfn8duK9vbDmZxiPCTRbGvm7eCAJY": "Priceless Dev",
+  "AQdBYZNy3BZ1vouGUjA1w9Ay7aq7kH5UQSuh4LQWKotY": "Pfp Dev",
+  "9dkeTBYaHJzxVgVZqympcHmPeQvHtQv1sArZiZuwmhgp": "Chud Dev",
+  "9Zu8AigeXgFAajBTni2VWw6Wmz7XxDqHmY5nQwdCWAyY": "Moss Dev",
+  "BSFxyBwsHQsDXULygBpsTu6iUmfHUbCr6j4geZSN6YJG": "Ziggy Dev",
+  "C4ARzqpvZ4gR3ta89H5Yz7UyPTpRm22BL5U91e5dHTSf": "Ikun Dev",
+  "DaKpjVJFxq3y4iZcEu12wzpXGCNBkQE587VNACUj15rT": "Xmas Dev",
+  "GKaJNFDp2W5uCYfNKnTPN63tFXKgXgaDSfnTVfksBeq1": "Cartel Dev",
+  "8ghYW6ftL5kUemfsoA9X37rz3ZnvyMSZRAx1kt1CxpoS": "Milady Ai Dev",
+  "7hkd2kdx4bMyuUDgktZvykDh69r8YkkrX4kf1sW2C8T6": "Lamb Dev",
+  "GH9yk8vgFvHnAD8JZqXxr3hBN1Lr1mJ9NPzrP5mVqiJe": "Eagy",
+  "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk": "Jijo",
+  "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6": "Cooker",
+  "H5Wh4EDvWQT4mShH746V5VDqxHQkaQZyPWfuhy1PRVBg": "Bonkyo Dev",
+  "EeLjBXRELqrcWAXbnj8T4jQPS9Qh7UGWiKxovsJ36pZY": "LLM Dev",
+  "CfkaAru9ArJ2tAStYHvbAyRBJL3EhDzsWYV2KYg9shxB": "67 Dev",
+  "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa": "Copper Inu Dev",
+  "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt": "Doc",
+};
+
+function walletName(addr) {
+  return WALLET_NAMES[addr] ?? addr.substring(0, 8) + '...';
+}
+
+
+
+// ── STATE — SHARED ────────────────────────────────────────────
+let firedAlerts    = loadSet(FIRED_FILE);
+let whaleFired     = loadSet(WHALE_FIRED_FILE);
+let tokenInfoCache = {};
+let tokenInfoInflight = {};
 let creationCache  = {};
-let skipCache      = {};
-let subIdToWallet  = {};
+let skipCacheFast  = {};
+let skipCacheSlow  = {};
+let devWalletCache = {};
+
+// ── STATE — FAST BOT ──────────────────────────────────────────
+let fastAlerts  = {};
+
+// ── STATE — FAST MIGRATION BOT ────────────────────────────────
+let migAlerts = {};
+let migFired  = loadSet('/tmp/sol_mig_fired.json');
+
+// ── STATE — SLOW BOT ──────────────────────────────────────────
+let slowAlerts  = {};
+
+
+// ── STATE — WHALE BOT ─────────────────────────────────────────
+let watchedTokens  = {};
+let whaleCumulative = {};
+let pendingSigs    = new Set();
+
+// ── WS STATE ──────────────────────────────────────────────────
 let ws             = null;
 let wsReady        = false;
 let reconnectDelay = 5000;
 let usingFallback  = false;
-let pendingSigs    = new Set();
-
-// ── SELL WATCHLIST ────────────────────────────────────────────
-// sellWatchlist[tokenMint] = {
-//   wallets: Set<walletAddress>,   — wallets that need to sell
-//   symbol: string,                — for the alert message
-//   signalTime: number,            — unix ts when buy signal fired
-//   exited: Set<walletAddress>,    — wallets confirmed fully sold
-// }
-let sellWatchlist = {};
-
-// ── UNIFIED TOKEN INFO CACHE ──────────────────────────────────
-let tokenInfoCache    = {};
-let tokenInfoInflight = {};
-
-async function getCachedTokenInfo(mint) {
-  if (mint in tokenInfoCache) return tokenInfoCache[mint];
-  if (tokenInfoInflight[mint]) return tokenInfoInflight[mint];
-  tokenInfoInflight[mint] = fetchTokenInfo(mint).then(info => {
-    // Only cache if we got a valid response WITH creation_timestamp.
-    // A response missing it is incomplete — caching would let bad data persist.
-    if (info && info.creation_timestamp) {
-      tokenInfoCache[mint] = info;
-      setTimeout(() => delete tokenInfoCache[mint], 600000);
-    }
-    delete tokenInfoInflight[mint];
-    return info;
-  });
-  return tokenInfoInflight[mint];
-}
-
-log(`[INIT] Loaded ${firedAlerts.size} previously fired contracts`);
-
-// Cleanup stale windows every 60s
-setInterval(() => {
-  const now = Math.floor(Date.now() / 1000);
-  for (const mint of Object.keys(activeAlerts)) {
-    if (now - activeAlerts[mint].firstSeenAt > WINDOW_SECS) delete activeAlerts[mint];
-  }
-}, 60000);
-
-// Cleanup stale sell watchlist entries after 6 hours
-setInterval(() => {
-  const now = Math.floor(Date.now() / 1000);
-  for (const mint of Object.keys(sellWatchlist)) {
-    if (now - sellWatchlist[mint].signalTime > 6 * 3600) {
-      log(`[SELL] Watchlist entry for ${mint.substring(0, 8)} expired (6h) — removing`);
-      delete sellWatchlist[mint];
-    }
-  }
-}, 5 * 60 * 1000);
+let subIdToWallet  = {};
+let reqIdToWallet  = {};
+let lastMessageAt  = Date.now();
 
 // ── HELPERS ───────────────────────────────────────────────────
+// ── LOG FILE ──────────────────────────────────────────────────
+const LOG_FILE = '/tmp/sol_bot.log';
+const LOG_MAX_LINES = 500;
+let logBuffer = [];
+
 function log(msg) {
   const t = new Date().toLocaleTimeString('en-US', {
     timeZone: 'America/Toronto', hour12: true,
     hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
-  console.log(`[${t}] ${msg}`);
+  const line = `[${t}] ${msg}`;
+  console.log(line);
+  logBuffer.push(line);
+  if (logBuffer.length > LOG_MAX_LINES) logBuffer.shift();
 }
 
 function isActiveHours() {
-  const now     = new Date();
-  const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const val     = eastern.getHours() * 60 + eastern.getMinutes();
-  return val >= 660 && val < 1080; // 11am–6pm ET
+  const eastern = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const val = eastern.getHours() * 60 + eastern.getMinutes();
+  return val >= 660 && val < 1080;
 }
 
-// ── HTTP HELPERS ──────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function fmtUsd(n) {
+  if (!n || isNaN(n)) return 'N/A';
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `$${Math.round(n).toLocaleString()}`;
+  return `$${n.toFixed(2)}`;
+}
+
+// ── HTTP ──────────────────────────────────────────────────────
 function httpsGet(hostname, path, headers = {}) {
   return new Promise((resolve) => {
-    const options = { hostname, path, method: 'GET', headers };
-    const req = https.request(options, (res) => {
+    const req = https.request({ hostname, path, method: 'GET', headers }, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        if (res.statusCode !== 200) {
-          log(`[HTTP] ${hostname} returned ${res.statusCode} for ${path.substring(0, 60)}`);
-          resolve(null);
-          return;
-        }
-        try { resolve(JSON.parse(data)); }
-        catch { log(`[HTTP] JSON parse failed for ${hostname}${path.substring(0, 40)}`); resolve(null); }
+        if (res.statusCode !== 200) { resolve(null); return; }
+        try { resolve(JSON.parse(data)); } catch { resolve(null); }
       });
     });
-    req.on('error', (e) => { log(`[HTTP] Error ${hostname}: ${e.message}`); resolve(null); });
-    req.setTimeout(15000, () => { req.destroy(); log(`[HTTP] Timeout ${hostname}`); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
     req.end();
   });
 }
@@ -297,16 +291,10 @@ function httpsPost(url, body) {
   return new Promise((resolve) => {
     const payload = JSON.stringify(body);
     const u = new URL(url);
-    const options = {
-      hostname: u.hostname,
-      path: u.pathname + u.search,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-      },
-    };
-    const req = https.request(options, (res) => {
+    const req = https.request({
+      hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    }, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
@@ -318,143 +306,31 @@ function httpsPost(url, body) {
   });
 }
 
-// ── SOLANA RPC: getTransaction ────────────────────────────────
 async function getTransaction(signature) {
-  const result = await httpsPost(HTTP_RPC, {
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'getTransaction',
-    params: [
-      signature,
-      { encoding: 'json', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }
-    ]
+  const r = await httpsPost(HTTP_RPC, {
+    jsonrpc: '2.0', id: 1, method: 'getTransaction',
+    params: [signature, { encoding: 'json', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }]
   });
-  return result?.result ?? null;
-}
-
-// ── MINT EXTRACTION ───────────────────────────────────────────
-function extractMint(tx) {
-  const meta     = tx?.meta;
-  const msg      = tx?.transaction?.message;
-  if (!meta || !msg) return null;
-
-  const postBals = meta.postTokenBalances ?? [];
-  const preBals  = meta.preTokenBalances  ?? [];
-  const preOwned = new Set(preBals.map(b => b.mint));
-
-  let mint = postBals.find(b => b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint))?.mint;
-  if (!mint) mint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
-  return mint ?? null;
-}
-
-// ── SELL DETECTION ────────────────────────────────────────────
-// Returns the mint address if this tx is a full sell of a watched
-// token by the given wallet, otherwise null.
-function extractFullSell(tx, trackedWallet) {
-  const meta = tx?.meta;
-  if (!meta) return null;
-
-  const preBals  = meta.preTokenBalances  ?? [];
-  const postBals = meta.postTokenBalances ?? [];
-
-  // Account keys — may be array of strings or array of objects depending on encoding
-  const rawKeys     = tx?.transaction?.message?.accountKeys ?? [];
-  const accountKeys = rawKeys.map(k => (typeof k === 'string' ? k : (k?.pubkey ?? '')));
-
-  // Helper: resolve owner — use .owner field first, fall back to accountKeys[accountIndex]
-  function resolveOwner(balEntry) {
-    if (balEntry.owner) return balEntry.owner;
-    const idx = balEntry.accountIndex;
-    if (idx !== undefined && accountKeys[idx]) return accountKeys[idx];
-    return null;
-  }
-
-  for (const pre of preBals) {
-    if (!pre.mint || pre.mint === SOL_MINT) continue;
-    if (!sellWatchlist[pre.mint]) continue;
-
-    const ownerOfPre = resolveOwner(pre);
-    if (!ownerOfPre || ownerOfPre !== trackedWallet) continue;
-
-    // Pre-balance must be > 0 (they held something)
-    const preAmt = parseFloat(pre.uiTokenAmount?.uiAmountString ?? pre.uiTokenAmount?.amount ?? '0');
-    if (preAmt <= 0) continue;
-
-    // Post-balance must be 0 — if entry missing entirely, balance is 0 (token account closed)
-    const post    = postBals.find(p => p.mint === pre.mint && resolveOwner(p) === trackedWallet);
-    const postAmt = post ? parseFloat(post.uiTokenAmount?.uiAmountString ?? post.uiTokenAmount?.amount ?? '0') : 0;
-
-    if (postAmt === 0) {
-      log(`[SELL] Full exit detected: wallet ${trackedWallet.substring(0, 8)} sold all of ${pre.mint.substring(0, 8)}`);
-      return pre.mint;
-    }
-  }
-
-  return null;
-}
-
-// ── SELL SIGNAL ───────────────────────────────────────────────
-function sendSellSignal(tokenMint, entry) {
-  const elapsed = Math.floor(Date.now() / 1000) - entry.signalTime;
-  const mins    = Math.floor(elapsed / 60);
-  const secs    = elapsed % 60;
-  const elapsedStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-  const walletCount = entry.wallets.size;
-
-  const signalTime = new Date().toLocaleTimeString('en-US', {
-    timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
-  });
-
-  sendTelegram(
-    `🚨 <b>SELL Signal — All Wallets Exited</b>\n\n` +
-    `Token: #${entry.symbol}\n` +
-    `Contract: <code>${tokenMint}</code>\n` +
-    `Wallets Exited: ${walletCount}/${walletCount}\n` +
-    `Time Since Buy Signal: ${elapsedStr}\n` +
-    `Signal Time: ${signalTime}\n\n` +
-    `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
-  );
-
-  log(`[SELL] 🚨 Sell signal fired for #${entry.symbol} (${tokenMint.substring(0, 8)}) | ${walletCount} wallets exited in ${elapsedStr}`);
-}
-
-// ── HANDLE SELL TX ────────────────────────────────────────────
-async function handlePotentialSell(trackedWallet, tx) {
-  const soldMint = extractFullSell(tx, trackedWallet);
-  if (!soldMint) return;
-
-  const entry = sellWatchlist[soldMint];
-  if (!entry) return;
-
-  // Only care about wallets we're watching for this token
-  if (!entry.wallets.has(trackedWallet)) return;
-
-  // Mark this wallet as exited
-  entry.exited.add(trackedWallet);
-  const remaining = entry.wallets.size - entry.exited.size;
-
-  log(`[SELL] ${trackedWallet.substring(0, 8)} exited #${entry.symbol} | ${entry.exited.size}/${entry.wallets.size} exited | ${remaining} remaining`);
-
-  // All wallets have fully sold
-  if (entry.exited.size >= entry.wallets.size) {
-    sendSellSignal(soldMint, entry);
-    delete sellWatchlist[soldMint];
-  }
+  return r?.result ?? null;
 }
 
 // ── GMGN ──────────────────────────────────────────────────────
-async function gmgnGet(path, params = {}) {
-  params.timestamp = Math.floor(Date.now() / 1000).toString();
-  params.client_id = Math.random().toString(36).substring(2) + Date.now().toString(36);
-  const query   = new URLSearchParams(params).toString();
+async function gmgnGet(path, params = {}, skipAuth = false) {
+  if (!skipAuth) {
+    params.timestamp = Math.floor(Date.now() / 1000).toString();
+    params.client_id = Math.random().toString(36).substring(2) + Date.now().toString(36);
+  }
+  const query = new URLSearchParams(params).toString();
   const headers = {
-    'X-APIKEY':   GMGN_API_KEY,
-    'Accept':     'application/json',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'X-APIKEY': GMGN_API_KEY,
+    'Accept': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
   };
-  const parsed = await httpsGet('openapi.gmgn.ai', `${path}?${query}`, headers);
+  const fullPath = query ? `${path}?${query}` : path;
+  const parsed = await httpsGet('openapi.gmgn.ai', fullPath, headers);
   if (parsed?.code === 0 && parsed?.data) return parsed.data;
-  log(`[GMGN] Error ${path}: ${JSON.stringify(parsed)?.substring(0, 100)}`);
+  // Some endpoints return data directly without code wrapper
+  if (parsed && !parsed.code && !parsed.error) return parsed;
   return null;
 }
 
@@ -465,23 +341,109 @@ async function fetchTokenInfo(mint) {
 async function fetchFreshWallets(mint) {
   const data = await gmgnGet('/v1/token/security', { chain: 'sol', address: mint });
   if (!data) return null;
-  log(`[GMGN] Security keys: ${Object.keys(data).join(', ')}`);
-  return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
+  return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? null;
 }
 
-// ── DEXSCREENER FETCH HELPER ────────────────────────────────────────────
+async function getCachedTokenInfo(mint) {
+  if (mint in tokenInfoCache) return tokenInfoCache[mint];
+  if (tokenInfoInflight[mint]) return tokenInfoInflight[mint];
+  tokenInfoInflight[mint] = fetchTokenInfo(mint).then(info => {
+    if (info && info.creation_timestamp) {
+      tokenInfoCache[mint] = info;
+      setTimeout(() => delete tokenInfoCache[mint], 600000);
+    }
+    delete tokenInfoInflight[mint];
+    return info;
+  });
+  return tokenInfoInflight[mint];
+}
 
-// ── SAME-NAME COUNT ────────────────────────────────────────────────────────────
-// PRIMARY: direct mint lookup (more reliable, less rate limited than search).
-// FALLBACK: symbol search if mint lookup returns no pairs for this chain.
-// Returns a number always (0+) — null only if both paths completely fail.
+// ── DEXSCREENER ───────────────────────────────────────────────
+async function dexFetch(url) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': 'application/json',
+  };
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const result = await new Promise((resolve) => {
+      const req = https.get(url, { headers }, (res) => {
+        if ([301,302,307,308].includes(res.statusCode) && res.headers.location) {
+          res.resume();
+          const rr = https.get(res.headers.location, { headers }, (res2) => {
+            let d = ''; res2.on('data', c => d += c);
+            res2.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+          });
+          rr.on('error', () => resolve(null));
+          rr.setTimeout(15000, () => { rr.destroy(); resolve(null); });
+          return;
+        }
+        if (res.statusCode === 429) { res.resume(); resolve('429'); return; }
+        if (res.statusCode !== 200) { res.resume(); resolve(null); return; }
+        let d = ''; res.on('data', c => d += c);
+        res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+      });
+      req.on('error', () => resolve(null));
+      req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+    });
+    if (result === '429') { await sleep((attempt+1)*5000); continue; }
+    if (result) return result;
+    if (attempt < 3) await sleep(2000);
+  }
+  return null;
+}
 
-async function getTokenAge(mint) {
+async function fetchSameNameCount(mint, symbol) {
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const cutoff = 5 * 3600;
+
+  function countMatches(pairs, sym, ex) {
+    return pairs.filter(p => {
+      if ((p.chainId ?? p.chain_id) !== 'solana') return false;
+      if (p.baseToken?.symbol?.toUpperCase() !== sym.toUpperCase()) return false;
+      if (p.baseToken?.address === ex) return false;
+      const ca = p.pairCreatedAt ?? p.pair_created_at;
+      if (!ca) return false;
+      const ageSecs = nowSecs - Math.floor(ca / 1000);
+      return ageSecs >= 0 && ageSecs <= cutoff;
+    }).length;
+  }
+
+  // Need symbol to search — if unknown, try to resolve from mint first
+  let sym = (symbol && symbol !== 'UNKNOWN') ? symbol : null;
+
+  if (!sym) {
+    log(`[Dex] No symbol for ${mint.substring(0,8)} — fetching from mint pairs`);
+    const r0 = await dexFetch(`https://api.dexscreener.com/token-pairs/v1/solana/${mint}`);
+    const pairs0 = Array.isArray(r0) ? r0 : (r0?.pairs ?? r0?.data ?? []);
+    sym = pairs0.find(p => p.chainId === 'solana')?.baseToken?.symbol ?? null;
+    if (!sym) {
+      log(`[Dex] ❌ Could not resolve symbol for ${mint.substring(0,8)}`);
+      return null;
+    }
+  }
+
+  // Direct symbol search — this is what actually returns all tokens with that name
+  log(`[Dex] Searching #${sym} across all Solana pairs...`);
+  await sleep(2000);
+  const r = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(sym)}`);
+  if (r) {
+    const pairs = Array.isArray(r) ? r : (r.pairs ?? r.data ?? []);
+    const c = countMatches(pairs, sym, mint);
+    log(`[Dex] ✅ #${sym}: ${c} same-name tokens in last 5h (${pairs.length} total results)`);
+    return c;
+  }
+
+  log(`[Dex] ❌ Search failed for #${sym}`);
+  return null;
+}
+
+// ── TOKEN AGE ─────────────────────────────────────────────────
+async function getTokenAge(mint, maxAge, skipCache) {
   const now = Math.floor(Date.now() / 1000);
   if (skipCache[mint]) return -1;
   if (creationCache[mint]) {
     const age = now - creationCache[mint];
-    if (age > MAX_TOKEN_AGE) { skipCache[mint] = true; return -1; }
+    if (age > maxAge) { skipCache[mint] = true; return -1; }
     return age;
   }
   const info = await getCachedTokenInfo(mint);
@@ -490,225 +452,549 @@ async function getTokenAge(mint) {
   if (!createdAt) return null;
   creationCache[mint] = createdAt;
   const age = now - createdAt;
-  if (age > MAX_TOKEN_AGE) { skipCache[mint] = true; return -1; }
+  if (age > maxAge) { skipCache[mint] = true; return -1; }
   return age;
 }
 
 // ── TELEGRAM ──────────────────────────────────────────────────
-function sendTelegram(message) {
-  const body = JSON.stringify({ chat_id: CHAT_ID, text: message, parse_mode: 'HTML' });
-  const req  = https.request({
+function sendTelegram(chatId, message) {
+  const body = JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'HTML' });
+  const req = https.request({
     hostname: 'api.telegram.org',
-    path:     `/bot${TELEGRAM_TOKEN}/sendMessage`,
-    method:   'POST',
-    headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
   }, (res) => {
-    let d = '';
-    res.on('data', c => d += c);
+    let d = ''; res.on('data', c => d += c);
     res.on('end', () => {
-      try {
-        const p = JSON.parse(d);
-        if (!p.ok) log(`[TG Error] ${p.description}`);
-        else log(`[TG] Signal delivered`);
-      } catch { log(`[TG Error] Parse failed`); }
+      try { const p = JSON.parse(d); if (!p.ok) log(`[TG Error] ${p.description}`); else log(`[TG] Delivered to ${chatId}`); }
+      catch { log(`[TG Error] Parse failed`); }
     });
   });
   req.on('error', e => log(`[TG ERR] ${e.message}`));
-  req.write(body);
-  req.end();
+  req.write(body); req.end();
+}
+
+// ── NOTABLE HOLDERS (RPC-based) ───────────────────────────────
+const NOTABLE_THRESHOLD = 50_000;
+let solPriceCache = { price: null, ts: 0 };
+
+async function getSolPrice() {
+  const now = Math.floor(Date.now() / 1000);
+  if (solPriceCache.price && now - solPriceCache.ts < 300) return solPriceCache.price;
+  const info = await getCachedTokenInfo(SOL_MINT);
+  const price = parseFloat(info?.price ?? 0);
+  if (price > 0) solPriceCache = { price, ts: now };
+  return solPriceCache.price ?? 150;
+}
+
+async function fetchNotableHolders(mint, tokenInfo) {
+  try {
+    const result = await httpsPost(HTTP_RPC, {
+      jsonrpc: '2.0', id: 1, method: 'getTokenLargestAccounts',
+      params: [mint, { commitment: 'confirmed' }]
+    });
+    const accounts = result?.result?.value ?? [];
+    if (!accounts.length) return [];
+    const solPrice = await getSolPrice();
+    const tokenPrice = parseFloat(tokenInfo?.price ?? 0);
+    const totalSupply = parseFloat(tokenInfo?.circulating_supply ?? tokenInfo?.total_supply ?? 0);
+    const notable = []; const seen = new Set();
+    for (const account of accounts.slice(0, 20)) {
+      await sleep(200);
+      const ownerRes = await httpsPost(HTTP_RPC, {
+        jsonrpc: '2.0', id: 1, method: 'getAccountInfo',
+        params: [account.address, { encoding: 'jsonParsed', commitment: 'confirmed' }]
+      });
+      const owner = ownerRes?.result?.value?.data?.parsed?.info?.owner ?? null;
+      if (!owner || seen.has(owner) || WALLET_SET.has(owner)) continue;
+      seen.add(owner);
+      const tokenAmt = parseFloat(account.uiAmount ?? 0);
+      const tokenVal = tokenPrice > 0 ? tokenAmt * tokenPrice : 0;
+      const solRes = await httpsPost(HTTP_RPC, {
+        jsonrpc: '2.0', id: 1, method: 'getBalance',
+        params: [owner, { commitment: 'confirmed' }]
+      });
+      await sleep(200);
+      const solVal = ((solRes?.result?.value ?? 0) / 1e9) * solPrice;
+      const total = tokenVal + solVal;
+      if (total >= NOTABLE_THRESHOLD) {
+        const pctStr = totalSupply > 0 ? ` (${((tokenAmt/totalSupply)*100).toFixed(1)}%)` : '';
+        const valStr = total >= 1_000_000 ? `$${(total/1_000_000).toFixed(1)}M` : `$${Math.round(total/1000)}k`;
+        notable.push({ addr: owner, valStr, pctStr });
+      }
+    }
+    return notable;
+  } catch(e) { log(`[ERR] fetchNotableHolders: ${e.message}`); return []; }
+}
+
+// ── MINT EXTRACTION ───────────────────────────────────────────
+function extractMint(tx) {
+  const meta = tx?.meta; const msg = tx?.transaction?.message;
+  if (!meta || !msg) return null;
+  const postBals = meta.postTokenBalances ?? [];
+  const preBals = meta.preTokenBalances ?? [];
+  const preOwned = new Set(preBals.map(b => b.mint));
+  let mint = postBals.find(b => b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint))?.mint;
+  if (!mint) mint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
+  return mint ?? null;
 }
 
 
-// ── SIGNAL ────────────────────────────────────────────────────
-async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, coordinatedWallets) {
+// ── FAST BOT SIGNAL ───────────────────────────────────────────
+async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
   try {
-    const now = Math.floor(Date.now() / 1000);
+    const now = Math.floor(Date.now()/1000);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
     let liquidityStr = 'N/A', marketCapStr = 'N/A';
-    let devWallet = null, devAthMc = null, devAth = 'N/A', devAthSymbol = '';
-    let freshWalletsFromInfo = null;
+    let devWallet = null, devAth = 'N/A';
 
     if (tokenInfo) {
       symbol = tokenInfo.symbol ?? 'UNKNOWN';
-      const createdAt = tokenInfo.creation_timestamp;
-      if (createdAt) {
-        mintTimeStr = new Date(createdAt * 1000).toLocaleTimeString('en-US', {
-          timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
-        });
-        const s = now - createdAt;
-        ageStr = s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
+      const ca = tokenInfo.creation_timestamp;
+      if (ca) {
+        mintTimeStr = new Date(ca*1000).toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+        const s = now - ca; ageStr = s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
       }
       const liq = parseFloat(tokenInfo.liquidity);
       if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
       let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
-      if (isNaN(mc) || mc === 0) {
-        const price  = parseFloat(tokenInfo.price);
-        const supply = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply);
-        if (!isNaN(price) && !isNaN(supply) && price > 0 && supply > 0) mc = price * supply;
-      }
+      if (isNaN(mc) || mc === 0) { const p = parseFloat(tokenInfo.price); const s = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply); if (!isNaN(p) && !isNaN(s) && p > 0 && s > 0) mc = p*s; }
       if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-
-      const creatorAddr = tokenInfo.dev?.creator_address;
-      if (creatorAddr) devWallet = creatorAddr;
-
+      const ca2 = tokenInfo.dev?.creator_address; if (ca2) devWallet = ca2;
       const athInfo = tokenInfo.dev?.ath_token_info;
-      if (athInfo?.ath_mc) {
-        const parsed = parseFloat(athInfo.ath_mc);
-        if (!isNaN(parsed)) {
-          devAthMc     = parsed;
-          devAthSymbol = athInfo.symbol ? ` #${athInfo.symbol}` : '';
-          devAth       = parsed >= 1_000_000
-            ? `$${(parsed / 1_000_000).toFixed(1)}M${devAthSymbol}`
-            : `$${parsed.toLocaleString('en-US', { maximumFractionDigits: 0 })}${devAthSymbol}`;
-        }
+      if (athInfo?.ath_mc) { const p = parseFloat(athInfo.ath_mc); if (!isNaN(p)) { devAth = p >= 1_000_000 ? `$${(p/1_000_000).toFixed(1)}M${athInfo.symbol?' #'+athInfo.symbol:''}` : `$${p.toLocaleString('en-US',{maximumFractionDigits:0})}${athInfo.symbol?' #'+athInfo.symbol:''}`; } }
+    }
+
+    const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+
+    sendTelegram(CHAT_ID_FAST,
+      `⚡ <b>Fast Signal — $38k in 30s (${walletCount}w)</b>\n\n` +
+      `Token: #${symbol}\n` +
+      `Contract: <code>${tokenMint}</code>\n` +
+      `Mint Time: ${mintTimeStr}\n` +
+      `Token Age at $40k: ${ageStr}\n` +
+      `Liquidity: ${liquidityStr}\n` +
+      `Market Cap: ${marketCapStr}\n` +
+      `Wallets: ${walletCount} bought within ${elapsed}s of mint\n` +
+      `Buyers: ${coordWallets ? [...coordWallets].map(a => walletName(a)).join(', ') : 'N/A'}\n\n` +
+      `Dev Wallet: ${devWallet ? `<code>${devWallet}</code>` : 'N/A'}\n` +
+      `Dev ATH: ${devAth}\n\n` +
+      `Signal Time: ${signalTime}\n\n` +
+      `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
+    );
+    log(`[MIG] Signal sent for #${symbol} — ${walletCount} wallets, $40k+ in ${elapsed}s`);
+  } catch(e) { log(`[ERR] buildMigrationSignal: ${e.message}`); }
+}
+
+async function buildFastSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
+  try {
+    const now = Math.floor(Date.now()/1000);
+    let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
+    let liquidityStr = 'N/A', marketCapStr = 'N/A';
+    let devWallet = null, devAth = 'N/A';
+    let freshWalletsFromInfo = null;
+
+    if (tokenInfo) {
+      symbol = tokenInfo.symbol ?? 'UNKNOWN';
+      const ca = tokenInfo.creation_timestamp;
+      if (ca) {
+        mintTimeStr = new Date(ca*1000).toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+        const s = now - ca; ageStr = s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
       }
-
-      const fwStat = tokenInfo.wallet_tags_stat?.fresh_wallets;
-      if (fwStat !== undefined && fwStat !== null) freshWalletsFromInfo = fwStat;
+      const liq = parseFloat(tokenInfo.liquidity);
+      if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+      let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
+      if (isNaN(mc) || mc === 0) { const p = parseFloat(tokenInfo.price); const s = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply); if (!isNaN(p) && !isNaN(s) && p > 0 && s > 0) mc = p*s; }
+      if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+      const ca2 = tokenInfo.dev?.creator_address; if (ca2) devWallet = ca2;
+      const athInfo = tokenInfo.dev?.ath_token_info;
+      if (athInfo?.ath_mc) { const p = parseFloat(athInfo.ath_mc); if (!isNaN(p)) { devAth = p >= 1_000_000 ? `$${(p/1_000_000).toFixed(1)}M${athInfo.symbol?' #'+athInfo.symbol:''}` : `$${p.toLocaleString('en-US',{maximumFractionDigits:0})}${athInfo.symbol?' #'+athInfo.symbol:''}`; } }
+      const fw = tokenInfo.wallet_tags_stat?.fresh_wallets; if (fw != null) freshWalletsFromInfo = fw;
     }
 
-    // Fetch fresh wallets count for display (no filter applied)
-    const freshWalletsFromSecurity = freshWalletsFromInfo === null
-      ? await fetchFreshWallets(tokenMint)
-      : null;
-    const freshWallets = freshWalletsFromInfo ?? freshWalletsFromSecurity;
-    // Always fire — no same-name or dev ATH filter on this bot
-
-    // ── REGISTER SELL WATCHLIST ─────────────────────────────────────────────
-    // Register sell watchlist — signal always fires when 4+ wallets coordinate within 20s
-    if (coordinatedWallets && coordinatedWallets.size > 0) {
-      sellWatchlist[tokenMint] = {
-        wallets:    new Set(coordinatedWallets),
-        exited:     new Set(),
-        symbol:     symbol !== 'UNKNOWN' ? symbol : tokenMint.substring(0, 8),
-        signalTime: Math.floor(Date.now() / 1000),
-      };
-      log(`[SELL] Watching ${coordinatedWallets.size} wallets for exits on #${sellWatchlist[tokenMint].symbol} (${tokenMint.substring(0, 8)})`);
-    }
-
-    // ── NOTABLE HOLDERS ─────────────────────────────────────────────────────
+    const freshWallets = freshWalletsFromInfo ?? await fetchFreshWallets(tokenMint);
     const notableHolders = await fetchNotableHolders(tokenMint, tokenInfo);
+
     let notableLine = '';
     if (notableHolders.length > 0) {
-      const lines = notableHolders.map(h =>
-        `  • <code>${h.addr}</code> — ${h.valStr}${h.pctStr}`
-      );
-      notableLine = `\n\n💰 <b>Notable Holders (>$50k wallet)</b>\n` + lines.join('\n');
+      notableLine = `\n\n💰 <b>Notable Holders (>$50k)</b>\n` +
+        notableHolders.map(h => `  • <code>${h.addr}</code> — ${h.valStr}${h.pctStr}`).join('\n');
     }
 
-    const signalTime = new Date().toLocaleTimeString('en-US', {
-      timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
-    });
+    const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
-    const devWalletLine = devWallet ? `<code>${devWallet}</code>` : 'N/A';
-
-    sendTelegram(
-      `⚡ <b>4-Wallet Fast Signal (20s)</b>\n\n` +
+    sendTelegram(CHAT_ID_FAST,
+      `⚡ <b>5-Wallet Fast Signal (30s)</b>\n\n` +
       `Token: #${symbol}\n` +
       `Contract: <code>${tokenMint}</code>\n` +
       `Mint Time: ${mintTimeStr}\n` +
       `Token Age: ${ageStr}\n` +
       `Liquidity: ${liquidityStr}\n` +
       `Market Cap: ${marketCapStr}\n` +
-      `Fresh Wallets: ${freshWallets !== null ? freshWallets : 'N/A'}\n` +
-      `Wallets Coordinated: ${walletCount} within ${elapsed}s\n\n` +
-      `Dev Wallet: ${devWalletLine}\n` +
+      `Fresh Wallets: ${freshWallets ?? 'N/A'}\n` +
+      `Wallets Coordinated: ${walletCount} within ${elapsed}s\n` +
+      `Wallets: ${[...coordWallets].map(a => walletName(a)).join(', ')}\n\n` +
+      `Dev Wallet: ${devWallet ? `<code>${devWallet}</code>` : 'N/A'}\n` +
       `Dev ATH: ${devAth}` +
       notableLine +
       `\n\nSignal Time: ${signalTime}\n\n` +
       `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
     );
-    log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0, 8)}) | Dev ATH: ${devAth} | Notable: ${notableHolders.length} | Wallets: ${walletCount}`);
-  } catch(e) { log(`[ERR] buildAndSendSignal: ${e.message}`); }
+    log(`[FAST] Signal sent for #${symbol}`);
+  } catch(e) { log(`[ERR] buildFastSignal: ${e.message}`); }
 }
 
+// ── SLOW BOT SIGNAL FILTER ────────────────────────────────────
+function slowShouldFire(symbol, sameNameCount, devWallet, devAthMc) {
+  const devIsTracked = devWallet && devWallet !== 'N/A' && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
+  const devAthPasses = devWallet && devWallet !== 'N/A' && devAthMc !== null && devAthMc >= SLOW_DEV_ATH_THRESHOLD;
+  const sameNamePasses = sameNameCount !== null && sameNameCount >= SLOW_SAME_NAME_THRESHOLD;
+  if (sameNamePasses) { log(`[SLOW FILTER] ✅ same-name ${sameNameCount}`); return true; }
+  if (devAthPasses) { log(`[SLOW FILTER] ✅ dev ATH ${fmtUsd(devAthMc)}`); return true; }
+  if (devIsTracked) { log(`[SLOW FILTER] ✅ dev is tracked wallet`); return true; }
+  log(`[SLOW FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${sameNameCount??'?'}, devATH: ${fmtUsd(devAthMc)}`);
+  return false;
+}
+
+async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
+  try {
+    const now = Math.floor(Date.now()/1000);
+    let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
+    let liquidityStr = 'N/A', marketCapStr = 'N/A';
+    let devWallet = 'N/A', devAth = 'N/A', devAthMc = null;
+    let freshWalletsFromInfo = null;
+
+    if (tokenInfo) {
+      symbol = tokenInfo.symbol ?? 'UNKNOWN';
+      const ca = tokenInfo.creation_timestamp;
+      if (ca) {
+        mintTimeStr = new Date(ca*1000).toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+        const s = now - ca; ageStr = s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
+      }
+      const liq = parseFloat(tokenInfo.liquidity);
+      if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+      let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
+      if (isNaN(mc) || mc === 0) { const p = parseFloat(tokenInfo.price); const s = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply); if (!isNaN(p) && !isNaN(s) && p > 0 && s > 0) mc = p*s; }
+      if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+      const ca2 = tokenInfo.dev?.creator_address; if (ca2) devWallet = ca2;
+      const athInfo = tokenInfo.dev?.ath_token_info;
+      if (athInfo?.ath_mc) { const p = parseFloat(athInfo.ath_mc); if (!isNaN(p)) { devAthMc = p; devAth = p >= 1_000_000 ? `$${(p/1_000_000).toFixed(1)}M${athInfo.symbol?' #'+athInfo.symbol:''}` : `$${p.toLocaleString('en-US',{maximumFractionDigits:0})}${athInfo.symbol?' #'+athInfo.symbol:''}`; } }
+      const fw = tokenInfo.wallet_tags_stat?.fresh_wallets; if (fw != null) freshWalletsFromInfo = fw;
+    }
+
+    const devAthPassesAlready = devAthMc !== null && devAthMc >= SLOW_DEV_ATH_THRESHOLD;
+    const devIsTrackedAlready = devWallet && devWallet !== 'N/A' && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
+
+    let sameNameCount = null;
+    if (!devAthPassesAlready && !devIsTrackedAlready) {
+      log(`[SLOW] Fetching same-name count for #${symbol} (${tokenMint.substring(0,8)})`);
+      sameNameCount = await fetchSameNameCount(tokenMint, symbol);
+      log(`[SLOW] Same-name result: ${sameNameCount ?? 'null'} for #${symbol}`);
+    } else {
+      log(`[SLOW FILTER] ✅ Dev passes immediately — skipping DexScreener`);
+    }
+
+    if (!slowShouldFire(symbol, sameNameCount, devWallet, devAthMc)) return;
+
+    const freshWallets = freshWalletsFromInfo ?? await fetchFreshWallets(tokenMint);
+    const notableHolders = await fetchNotableHolders(tokenMint, tokenInfo);
+    let notableLine = '';
+    if (notableHolders.length > 0) {
+      notableLine = `\n\n💰 <b>Notable Holders (>$50k)</b>\n` +
+        notableHolders.map(h => `  • <code>${h.addr}</code> — ${h.valStr}${h.pctStr}`).join('\n');
+    }
+
+    const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+
+    sendTelegram(CHAT_ID_SLOW,
+      `🚨 <b>3-Wallet Signal</b>\n\n` +
+      `Token: #${symbol}\n` +
+      `Contract: <code>${tokenMint}</code>\n` +
+      `Mint Time: ${mintTimeStr}\n` +
+      `Token Age: ${ageStr}\n` +
+      `Liquidity: ${liquidityStr}\n` +
+      `Market Cap: ${marketCapStr}\n` +
+      `Same-Name Count (5h): ${sameNameCount ?? '?'}\n` +
+      `Fresh Wallets: ${freshWallets ?? 'N/A'}\n` +
+      `Wallets Coordinated: ${walletCount} within ${elapsed}s\n` +
+      `Wallets: ${[...coordWallets].map(a => walletName(a)).join(', ')}\n\n` +
+      `Dev Wallet: ${devWallet !== 'N/A' ? `<code>${devWallet}</code>` : 'N/A'}\n` +
+      `Dev ATH: ${devAth}` +
+      notableLine +
+      `\n\nSignal Time: ${signalTime}\n\n` +
+      `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
+    );
+    log(`[SLOW] Signal sent for #${symbol}`);
+  } catch(e) { log(`[ERR] buildSlowSignal: ${e.message}`); }
+}
+
+
 // ── COORDINATION LOGIC ────────────────────────────────────────
-async function handleWalletBuy(trackedWallet, tokenMint) {
-  if (firedAlerts.has(tokenMint)) {
-    log(`[SKIP] ${tokenMint.substring(0, 8)} already signalled`);
-    return;
-  }
+async function handleWalletBuy(trackedWallet, tokenMint, whaleOnly = false) {
+  if (firedAlerts.has(tokenMint) && !whaleOnly) return;
 
   if (!devWalletCache[tokenMint]) {
     const devInfo = await getCachedTokenInfo(tokenMint);
     devWalletCache[tokenMint] = devInfo?.dev?.creator_address ?? 'unknown';
     setTimeout(() => delete devWalletCache[tokenMint], 600000);
   }
-  if (devWalletCache[tokenMint] && devWalletCache[tokenMint] !== 'unknown' &&
-      trackedWallet === devWalletCache[tokenMint]) {
-    log(`[SKIP] ${trackedWallet.substring(0, 8)} is the dev — not counting`);
-    return;
+  if (devWalletCache[tokenMint] !== 'unknown' && trackedWallet === devWalletCache[tokenMint]) {
+    log(`[SKIP] ${trackedWallet.substring(0,8)} is dev`); return;
   }
 
-  const age = await getTokenAge(tokenMint);
-  if (age === -1) { log(`[SKIP] ${tokenMint.substring(0, 8)} too old`); return; }
-  if (age === null) {
-    if (STRICT_AGE_CHECK) { log(`[SKIP] ${tokenMint.substring(0, 8)} age unknown — strict mode rejects`); return; }
-    log(`[WARN] Age unknown for ${tokenMint.substring(0, 8)} — allowing`);
-  } else {
-    log(`[AGE] ${tokenMint.substring(0, 8)} is ${age < 60 ? age+'s' : Math.floor(age/60)+'m '+age%60+'s'} old`);
+  const now = Math.floor(Date.now()/1000);
+
+  // Skip all coordination/fast/slow/accum when outside active hours
+  if (!whaleOnly) {
+
+  // ── FAST MIGRATION BOT ──────────────────────────────────
+  if (!migFired.has(tokenMint)) {
+    const migAge = creationCache[tokenMint] ? now - creationCache[tokenMint] : null;
+    if (migAge !== null && migAge <= FAST_MIG_MAX_AGE) {
+      if (!migAlerts[tokenMint]) {
+        migAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: creationCache[tokenMint] ?? now };
+      }
+      migAlerts[tokenMint].wallets.add(trackedWallet);
+      const mc = migAlerts[tokenMint].wallets.size;
+      log(`[MIG] ${mc}/${FAST_MIG_MIN_WALLETS} for ${tokenMint.substring(0,8)} within ${migAge}s`);
+      if (mc >= FAST_MIG_MIN_WALLETS) {
+        const tokenInfo = await getCachedTokenInfo(tokenMint);
+        let tokenMC = parseFloat(tokenInfo?.market_cap ?? tokenInfo?.usd_market_cap ?? 0);
+        if ((isNaN(tokenMC) || tokenMC === 0) && tokenInfo?.price && tokenInfo?.circulating_supply) {
+          tokenMC = parseFloat(tokenInfo.price) * parseFloat(tokenInfo.circulating_supply);
+        }
+        if (tokenMC >= FAST_MIG_MIN_MC) {
+          const elapsed = now - migAlerts[tokenMint].firstSeenAt;
+          const coordWallets = new Set(migAlerts[tokenMint].wallets);
+          migFired.add(tokenMint); saveSet('/tmp/sol_mig_fired.json', migFired);
+          delete migAlerts[tokenMint];
+          await buildMigrationSignal(tokenMint, coordWallets.size, elapsed, tokenInfo, coordWallets);
+        } else {
+          log(`[MIG] ${tokenMint.substring(0,8)} MC ${tokenMC > 0 ? '$'+Math.round(tokenMC).toLocaleString() : 'unknown'} — below $${FAST_MIG_MIN_MC.toLocaleString()} threshold`);
+        }
+      }
+    }
   }
 
-  const now = Math.floor(Date.now() / 1000);
-
-  if (!activeAlerts[tokenMint]) {
-    // Pin window start to token mint time so all buys within 20s of mint are captured
-    const mintTs = creationCache[tokenMint] ?? now;
-    activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: mintTs };
+  // ── FAST BOT ────────────────────────────────────────────
+  const fastAge = await getTokenAge(tokenMint, FAST_MAX_TOKEN_AGE, skipCacheFast);
+  if (fastAge !== -1 && fastAge !== null) {
+    if (!fastAlerts[tokenMint]) {
+      const mintTs = creationCache[tokenMint] ?? now;
+      fastAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: mintTs };
+    }
+    const fe = fastAlerts[tokenMint];
+    // Window pinned to mint time — 5 wallets must buy within 30s of mint, no rolling reset
+    const secsSinceMint = now - fe.firstSeenAt;
+    if (secsSinceMint <= FAST_MAX_TOKEN_AGE) {
+      fe.wallets.add(trackedWallet);
+      log(`[FAST] ${fe.wallets.size}/${FAST_MIN_WALLETS} for ${tokenMint.substring(0,8)} — ${secsSinceMint}s since mint`);
+      if (fe.wallets.size >= FAST_MIN_WALLETS) {
+        const coordWallets = new Set(fe.wallets);
+        firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
+        delete fastAlerts[tokenMint];
+        const tokenInfo = await getCachedTokenInfo(tokenMint);
+        await buildFastSignal(tokenMint, fe.wallets.size, secsSinceMint, tokenInfo, coordWallets);
+        return;
+      }
+    } else {
+      delete fastAlerts[tokenMint]; // mint window expired
+    }
   }
 
-  const entry = activeAlerts[tokenMint];
-
-  // Window is pinned to token mint time — all buys within 20s of mint count
-  // firstSeenAt is set to the token's creation time for accurate windowing
-  if (now - entry.firstSeenAt > WINDOW_SECS) {
-    log(`[RESET] ${tokenMint.substring(0, 8)} window expired — resetting`);
-    activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
+  // ── SLOW BOT ────────────────────────────────────────────
+  const slowAge = await getTokenAge(tokenMint, SLOW_MAX_TOKEN_AGE, skipCacheSlow);
+  if (slowAge === -1) { log(`[SLOW SKIP] ${tokenMint.substring(0,8)} too old`); }
+  else if (slowAge === null) { log(`[SLOW SKIP] ${tokenMint.substring(0,8)} age unknown`); }
+  else {
+    if (!slowAlerts[tokenMint]) {
+      slowAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
+    }
+    const se = slowAlerts[tokenMint];
+    if (now - se.firstSeenAt > SLOW_WINDOW_SECS) {
+      log(`[SLOW RESET] ${tokenMint.substring(0,8)}`);
+      slowAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
+    }
+    se.wallets.add(trackedWallet);
+    log(`[SLOW] ${se.wallets.size}/${SLOW_MIN_WALLETS} for ${tokenMint.substring(0,8)} within ${now-se.firstSeenAt}s`);
+    if (se.wallets.size >= SLOW_MIN_WALLETS) {
+      const elapsed = now - se.firstSeenAt;
+      const coordWallets = new Set(se.wallets);
+      firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
+      delete slowAlerts[tokenMint];
+      const tokenInfo = await getCachedTokenInfo(tokenMint);
+      await buildSlowSignal(tokenMint, se.wallets.size, elapsed, tokenInfo, coordWallets);
+    }
   }
 
-  entry.wallets.add(trackedWallet);
-  const count = entry.wallets.size;
-  log(`[COUNT] ${count}/4 for ${tokenMint.substring(0, 8)} within ${now - entry.firstSeenAt}s`);
+  } // end !whaleOnly
 
-  if (count >= 4) {
-    const elapsed = now - entry.firstSeenAt;
-    const coordinatedWallets = new Set(entry.wallets);
-    saveFiredAlert(tokenMint);
-    delete activeAlerts[tokenMint];
-    const tokenInfo = await getCachedTokenInfo(tokenMint);
-    await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo, coordinatedWallets);
+
+  // ── WHALE WATCHLIST — only watch tokens under 24h old ────────
+  if (!whaleFired.has(tokenMint) && !watchedTokens[tokenMint]) {
+    const info = tokenInfoCache[tokenMint] ?? null;
+    const nowTs = Math.floor(Date.now()/1000);
+    const mintTime = creationCache[tokenMint] ?? info?.creation_timestamp ?? null;
+    // Only add if token is under 24h old — skip established tokens
+    if (mintTime && (nowTs - mintTime) > WHALE_MAX_AGE_HOURS * 3600) {
+      log(`[WHALE] ${tokenMint.substring(0,8)} too old — skipping watchlist`);
+    } else {
+      watchedTokens[tokenMint] = {
+        symbol:       info?.symbol ?? 'UNKNOWN',
+        mintTime:     mintTime ?? nowTs,
+        holders:      info?.holder_count ?? 0,
+        addedAt:      nowTs,
+        lastChecked:  0,
+        lastHolderCheck: 0,
+        trackedBuyers: new Set([trackedWallet]),
+      };
+      log(`[WHALE] Watching ${tokenMint.substring(0,8)} #${watchedTokens[tokenMint].symbol} — triggered by ${trackedWallet.substring(0,8)}`);
+    }
+  } else if (watchedTokens[tokenMint]) {
+    if (!watchedTokens[tokenMint].trackedBuyers) watchedTokens[tokenMint].trackedBuyers = new Set();
+    watchedTokens[tokenMint].trackedBuyers.add(trackedWallet);
   }
 }
 
-// ── PROCESS LOG NOTIFICATION ──────────────────────────────────
+// ── WHALE BOT — FETCH MIGRATED TOKENS ────────────────────────
+// Tokens now come from tracked wallet buys in handleWalletBuy above.
+// This function kept as stub so the interval call doesn't break.
+async function fetchMigratedTokens() {
+  return [];
+}
+
+// ── WHALE BOT — CHECK TOKEN FOR LARGE TRADES ─────────────────
+const whaleSeenTx = {};
+
+async function checkTokenTrades(mint, symbol) {
+  try {
+    const tokenEntry = watchedTokens[mint];
+    if (!tokenEntry) return;
+
+    // Try multiple param combinations — log raw response to diagnose
+    let trades = null;
+    for (const params of [
+      { chain: 'sol', address: mint, limit: '50' },
+      { chain: 'sol', address: mint },
+    ]) {
+      const raw = await httpsGet('openapi.gmgn.ai', `/v1/token/trades?${new URLSearchParams({...params, timestamp: Math.floor(Date.now()/1000).toString()}).toString()}`, {
+        'X-APIKEY': GMGN_API_KEY,
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      });
+      if (!raw) { log(`[WHALE] ${mint.substring(0,8)} — null response from GMGN trades`); continue; }
+      log(`[WHALE] ${mint.substring(0,8)} — GMGN response keys: ${Object.keys(raw).join(', ')} | code: ${raw.code}`);
+      const d = raw?.data ?? raw;
+      const t = Array.isArray(d) ? d : (d?.trades ?? d?.data ?? d?.items ?? []);
+      if (t.length) { trades = t; break; }
+      else log(`[WHALE] ${mint.substring(0,8)} — no trades array found in response`);
+    }
+
+    if (!trades || !trades.length) { log(`[WHALE] ${mint.substring(0,8)} — no trade data from GMGN`); return; }
+
+    log(`[WHALE] ${mint.substring(0,8)} #${symbol} — ${trades.length} trades`);
+
+    const nowSecs = Math.floor(Date.now()/1000);
+    if (!whaleSeenTx[mint]) whaleSeenTx[mint] = new Set();
+
+    for (const trade of trades) {
+      const type = (trade.type ?? trade.trade_type ?? '').toLowerCase();
+      if (type && type !== 'buy') continue;
+
+      const usdVal = parseFloat(
+        trade.total_usd ?? trade.amount_usd ?? trade.usd_value ??
+        trade.volume_usd ?? trade.quote_amount ?? 0
+      );
+      if (usdVal <= 0) continue;
+
+      const txHash = trade.tx_hash ?? trade.signature ?? `${trade.timestamp ?? trade.block_time}`;
+      if (whaleSeenTx[mint].has(txHash)) continue;
+      whaleSeenTx[mint].add(txHash);
+
+      whaleCumulative[mint] = (whaleCumulative[mint] || 0) + usdVal;
+      const total = whaleCumulative[mint];
+
+      log(`[WHALE] ${mint.substring(0,8)} #${symbol} — buy ${fmtUsd(usdVal)} | cumulative: ${fmtUsd(total)}`);
+
+      if (usdVal >= WHALE_THRESHOLD || total >= WHALE_THRESHOLD) {
+        const trackedCount = tokenEntry.trackedBuyers?.size ?? 1;
+        whaleFired.add(mint);
+        saveSet(WHALE_FIRED_FILE, whaleFired);
+        delete watchedTokens[mint];
+        delete whaleSeenTx[mint];
+
+        const buyType   = usdVal >= WHALE_THRESHOLD ? 'Single Buy' : 'Cumulative Buy';
+        const tokenInfo = await getCachedTokenInfo(mint);
+        const liq       = tokenInfo?.liquidity ?? 0;
+        const mc        = tokenInfo?.market_cap ?? tokenInfo?.usd_market_cap ?? 0;
+        const holders   = tokenInfo?.holder_count ?? tokenEntry?.holders ?? 'N/A';
+        const mintTs    = tokenInfo?.creation_timestamp ?? tokenEntry?.mintTime ?? null;
+        const ageStr    = mintTs ? (() => { const s = nowSecs - mintTs; return s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`; })() : 'N/A';
+        const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+
+        sendTelegram(CHAT_ID_WHALE,
+          `🐳 <b>Whale Alert — Solana</b>\n\n` +
+          `Token: #${symbol}\n` +
+          `Contract: <code>${mint}</code>\n` +
+          `Token Age: ${ageStr}\n` +
+          `${buyType}: ${fmtUsd(usdVal)}\n` +
+          `Total Spent: ${fmtUsd(total)}\n` +
+          `Tracked Wallets: ${trackedCount}\n` +
+          `Liquidity: ${fmtUsd(liq)}\n` +
+          `Market Cap: ${fmtUsd(mc)}\n` +
+          `Holders: ${holders}\n\n` +
+          `Signal Time: ${signalTime}\n\n` +
+          `<a href="https://gmgn.ai/sol/token/${mint}">GMGN</a>`
+        );
+        log(`[WHALE] 🐳 Signal for #${symbol} — ${fmtUsd(total)} (${buyType})`);
+        return;
+      }
+    }
+  } catch(e) { log(`[WHALE] checkTokenTrades error ${mint.substring(0,8)}: ${e.message}`); }
+}
+
+// ── WHALE BOT — MAIN LOOPS ────────────────────────────────────
+async function whaleFetchLoop() {
+  log(`[WHALE] Watching ${Object.keys(watchedTokens).length} tokens (populated via tracked-wallet buys)`);
+}
+
+async function whaleCheckLoop() {
+  const nowSecs = Math.floor(Date.now()/1000);
+  const mints = Object.keys(watchedTokens);
+  for (const mint of mints) {
+    const token = watchedTokens[mint];
+    if (!token) continue;
+
+    // Remove if over 24 hours since we started watching
+    if (token.addedAt && (nowSecs - token.addedAt) > WHALE_MAX_AGE_HOURS * 3600) {
+      log(`[WHALE] ${mint.substring(0,8)} expired (24h watch) — removing`);
+      delete watchedTokens[mint];
+      continue;
+    }
+
+    // Check trades every 2 minutes
+    if (nowSecs - token.lastChecked >= WHALE_CHECK_INTERVAL_MS / 1000) {
+      token.lastChecked = nowSecs;
+      await checkTokenTrades(mint, token.symbol);
+      await sleep(2000); // 2s between tokens to avoid rate limiting GMGN
+    }
+  }
+}
+
+// ── LOG NOTIFICATION PROCESSING ──────────────────────────────
 async function processLogNotification(params) {
   const value = params?.result?.value;
   const subId = params?.subscription;
-
-  if (!value) {
-    log(`[DEBUG] No value in notification — raw: ${JSON.stringify(params)?.substring(0, 120)}`);
-    return;
-  }
-
-  if (value.err !== null && value.err !== undefined) return;
+  if (!value || (value.err !== null && value.err !== undefined)) return;
 
   const signature     = value.signature;
   const trackedWallet = subIdToWallet[subId];
-
   if (!trackedWallet) return;
 
-  // Sell tracking runs 24/7 — check active sell watches regardless of hour
-  const hasSellWatches = Object.keys(sellWatchlist).length > 0;
+  log(`[LOG HIT] wallet ${trackedWallet.substring(0,8)} | sig ${signature.substring(0,12)}...`);
 
-  // If outside active hours AND no sell watches, nothing to do
-  if (!isActiveHours() && !hasSellWatches) return;
-
-  log(`[LOG HIT] wallet ${trackedWallet.substring(0, 8)} | sig ${signature.substring(0, 12)}...`);
-
-  if (pendingSigs.has(signature)) {
-    log(`[DEBOUNCE] ${signature.substring(0, 12)} already being processed`);
-    return;
-  }
+  if (pendingSigs.has(signature)) { log(`[DEBOUNCE] ${signature.substring(0,12)}`); return; }
   pendingSigs.add(signature);
   setTimeout(() => pendingSigs.delete(signature), 30000);
 
@@ -716,43 +1002,31 @@ async function processLogNotification(params) {
   for (let attempt = 0; attempt < 3; attempt++) {
     tx = await getTransaction(signature);
     if (tx) break;
-    log(`[RPC] getTransaction attempt ${attempt + 1} failed, retrying...`);
-    await new Promise(r => setTimeout(r, 2000));
+    await sleep(2000);
   }
-
-  if (!tx) {
-    log(`[SKIP] Could not fetch tx ${signature.substring(0, 12)}`);
-    return;
-  }
-
-  // ── CHECK FOR SELL FIRST — runs 24/7 ──────────────────────────
-  if (hasSellWatches) {
-    await handlePotentialSell(trackedWallet, tx);
-  }
-
-  // ── BUY DETECTION — active hours only ─────────────────────────
-  if (!isActiveHours()) return;
+  if (!tx) return;
 
   const mint = extractMint(tx);
-  if (!mint) {
-    log(`[SKIP] No token mint in tx for ${trackedWallet.substring(0, 8)}`);
+  if (!mint) return;
+
+  if (!isActiveHours()) {
+    // Outside active hours — only add to whale watchlist
+    await handleWalletBuy(trackedWallet, mint, true);
     return;
   }
 
-  log(`[MINT] ${trackedWallet.substring(0, 8)} bought ${mint.substring(0, 8)}`);
+  log(`[MINT] ${trackedWallet.substring(0,8)} bought ${mint.substring(0,8)}`);
   await handleWalletBuy(trackedWallet, mint);
 }
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
-let reqIdToWallet = {};
-let lastMessageAt = Date.now();
 const WATCHDOG_MS = 3 * 60 * 1000;
 
 setInterval(() => {
   if (!wsReady) return;
   const silent = Date.now() - lastMessageAt;
   if (silent > WATCHDOG_MS) {
-    log(`[WS] Watchdog: no message for ${Math.round(silent/1000)}s — force reconnecting...`);
+    log(`[WS] Watchdog: ${Math.round(silent/1000)}s silent — reconnecting...`);
     wsReady = false;
     try { ws.terminate(); } catch(e) {}
     usingFallback = !usingFallback;
@@ -761,140 +1035,105 @@ setInterval(() => {
   }
 }, 60000);
 
-function connect(useUrl) {
-  const url = useUrl ?? (usingFallback ? WSS_FALLBACK : WSS_PRIMARY);
-  log(`[WS] Connecting to ${usingFallback ? 'FALLBACK' : 'PRIMARY'} endpoint...`);
-
+function connect() {
+  const url = usingFallback ? WSS_FALLBACK : WSS_PRIMARY;
+  log(`[WS] Connecting to ${usingFallback ? 'FALLBACK' : 'PRIMARY'}...`);
   ws = new WebSocket(url, { handshakeTimeout: 30000 });
-  subIdToWallet = {};
-  reqIdToWallet = {};
-  wsReady = false;
+  subIdToWallet = {}; reqIdToWallet = {}; wsReady = false;
 
   ws.on('open', () => {
     log(`[WS] Connected — subscribing to ${WALLETS.length} wallets...`);
-    wsReady = true;
-    reconnectDelay = 5000;
-    lastMessageAt = Date.now();
-
+    wsReady = true; reconnectDelay = 5000; lastMessageAt = Date.now();
     WALLETS.forEach((wallet, i) => {
-      const reqId = i + 1;
-      reqIdToWallet[reqId] = wallet;
-      ws.send(JSON.stringify({
-        jsonrpc: '2.0',
-        id: reqId,
-        method: 'logsSubscribe',
-        params: [
-          { mentions: [wallet] },
-          { commitment: 'confirmed' }
-        ]
-      }));
+      const reqId = i + 1; reqIdToWallet[reqId] = wallet;
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id: reqId, method: 'logsSubscribe',
+        params: [{ mentions: [wallet] }, { commitment: 'confirmed' }] }));
     });
-
-    log(`[WS] All ${WALLETS.length} subscription requests sent`);
-
-    const pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.ping();
-      } else {
-        clearInterval(pingInterval);
-      }
-    }, 30000);
+    log(`[WS] All ${WALLETS.length} subscriptions sent`);
+    const pi = setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.ping(); else clearInterval(pi); }, 30000);
   });
 
   ws.on('pong', () => { lastMessageAt = Date.now(); });
 
   ws.on('message', (data) => {
     lastMessageAt = Date.now();
-    let msg;
-    try { msg = JSON.parse(data.toString()); }
-    catch { return; }
-
-    if (msg.id !== undefined && msg.result !== undefined && typeof msg.result === 'number' && !msg.method) {
+    let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
+    if (msg.id !== undefined && typeof msg.result === 'number' && !msg.method) {
       const wallet = reqIdToWallet[msg.id];
       if (wallet) {
         subIdToWallet[msg.result] = wallet;
         const confirmed = Object.keys(subIdToWallet).length;
-        if (confirmed % 10 === 0) log(`[WS] ${confirmed}/${WALLETS.length} subscriptions confirmed`);
         if (confirmed === WALLETS.length) log(`[WS] ✅ All ${WALLETS.length} subscriptions active`);
       }
       return;
     }
-
     if (msg.method === 'logsNotification') {
-      const subId  = msg.params?.subscription;
-      const wallet = subIdToWallet[subId];
-      log(`[WS] logsNotification subId=${subId} mapped=${wallet ? wallet.substring(0,8) : 'UNKNOWN'}`);
-      processLogNotification(msg.params).catch(e => log(`[ERR] processLogNotification: ${e.message}`));
+      processLogNotification(msg.params).catch(e => log(`[ERR] ${e.message}`));
     }
   });
 
-  ws.on('error', (e) => {
-    log(`[WS] Error: ${e.message}`);
-  });
-
-  ws.on('close', (code, reason) => {
+  ws.on('error', e => log(`[WS] Error: ${e.message}`));
+  ws.on('close', (code) => {
     wsReady = false;
-    log(`[WS] Disconnected (code: ${code}). Reconnecting in ${reconnectDelay / 1000}s...`);
-
-    if (reconnectDelay >= 30000 && !usingFallback && WSS_PRIMARY !== WSS_FALLBACK) {
-      log(`[WS] Switching to fallback endpoint`);
-      usingFallback = true;
-      reconnectDelay = 5000;
-    }
-
+    log(`[WS] Disconnected (${code}). Reconnecting in ${reconnectDelay/1000}s...`);
+    if (reconnectDelay >= 30000 && !usingFallback) { usingFallback = true; reconnectDelay = 5000; }
     setTimeout(() => connect(), reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 60000);
   });
 }
 
-// ── HEALTH CHECK SERVER ───────────────────────────────────────
-const server = http.createServer((req, res) => {
-  const subCount = Object.keys(subIdToWallet).length;
+// ── CLEANUP ───────────────────────────────────────────────────
+setInterval(() => {
+  const now = Math.floor(Date.now()/1000);
+  for (const mint of Object.keys(fastAlerts)) { if (now - fastAlerts[mint].firstSeenAt > FAST_WINDOW_SECS) delete fastAlerts[mint]; }
+  for (const mint of Object.keys(migAlerts)) { if (now - migAlerts[mint].firstSeenAt > FAST_MIG_MAX_AGE * 2) delete migAlerts[mint]; }
+  for (const mint of Object.keys(slowAlerts)) { if (now - slowAlerts[mint].firstSeenAt > SLOW_WINDOW_SECS) delete slowAlerts[mint]; }
+}, 60000);
+
+// ── HEALTH CHECK ──────────────────────────────────────────────
+http.createServer((req, res) => {
+  if (req.url === '/logs') {
+    // Show last 500 log lines — hit /logs in your browser anytime
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(logBuffer.join('\n'));
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end(
-    `SOLANA FAST TRACKER (20s/4-wallet) — LIVE\n` +
+    `SOLANA COMBINED BOT — LIVE\n` +
     `WS: ${wsReady ? 'connected' : 'reconnecting'}\n` +
-    `Subscriptions: ${subCount}/${WALLETS.length}\n` +
-    `Fired alerts: ${firedAlerts.size}\n` +
-    `Active windows: ${Object.keys(activeAlerts).length}\n` +
-    `Sell watchlist: ${Object.keys(sellWatchlist).length} token(s)\n`
+    `Subscriptions: ${Object.keys(subIdToWallet).length}/${WALLETS.length}\n` +
+    `Fast alerts: ${Object.keys(fastAlerts).length}\n` +
+    `Migration alerts: ${Object.keys(migAlerts).length} | Migration fired: ${migFired.size}\n` +
+    `Slow alerts: ${Object.keys(slowAlerts).length}\n` +
+    `Whale watching: ${Object.keys(watchedTokens).length} tokens\n` +
+    `Fired (coord): ${firedAlerts.size} | Fired (whale): ${whaleFired.size}\n` +
+    `\nHit /logs to see last 500 log lines\n`
   );
-});
-
-server.listen(process.env.PORT || 3000, () => {
-  log(`[HTTP] Health server on port ${process.env.PORT || 3000}`);
-});
+}).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`[START] Launching FAST tracker | ${WALLETS.length} wallets | 20s mint window | 4-wallet threshold | Active 11am-6pm ET`);
-log(`[START] WSS primary: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
+log(`[START] Solana combined bot | ${WALLETS.length} wallets | Fast(4w/20s) + Slow(3w/5m) + Whale`);
+log(`[START] WSS: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
 
-// ── OUTBOUND IP LOGGER ────────────────────────────────────────
 https.get('https://api.ipify.org?format=json', (res) => {
-  let d = '';
-  res.on('data', c => d += c);
-  res.on('end', () => {
-    try {
-      const ip = JSON.parse(d).ip;
-      log(`[IP] Outbound IP: ${ip} — add this to GMGN trusted IPs if GMGN calls are failing`);
-    } catch { log(`[IP] Could not parse outbound IP response`); }
-  });
-}).on('error', (e) => log(`[IP] IP check failed: ${e.message}`));
+  let d = ''; res.on('data', c => d += c);
+  res.on('end', () => { try { log(`[IP] ${JSON.parse(d).ip}`); } catch {} });
+}).on('error', () => {});
 
+// Start whale loops
+whaleFetchLoop();
+setInterval(whaleFetchLoop, WHALE_FETCH_INTERVAL_MS);
+setInterval(whaleCheckLoop, 30000);
+
+// Connect WebSocket
 connect();
 
-// ── SELF-PING (keeps Render free tier from sleeping) ──────────
-const RENDER_URL = process.env.RENDER_EXTERNAL_URL || null;
-setInterval(() => {
-  if (!RENDER_URL) return;
-  try {
+// Self-ping
+if (RENDER_URL) {
+  setInterval(() => {
     const mod = RENDER_URL.startsWith('https') ? https : http;
-    const req = mod.get(RENDER_URL + '/', (res) => {
-      log(`[PING] Self-ping OK (${res.statusCode})`);
-    });
-    req.on('error', (e) => log(`[PING] Self-ping failed: ${e.message}`));
-    req.setTimeout(10000, () => req.destroy());
-  } catch(e) {
-    log(`[PING] Self-ping error: ${e.message}`);
-  }
-}, 10 * 60 * 1000);
+    mod.get(RENDER_URL + '/', res => log(`[PING] ${res.statusCode}`))
+      .on('error', e => log(`[PING] ${e.message}`));
+  }, 10 * 60_000);
+}
