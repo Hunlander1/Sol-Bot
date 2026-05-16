@@ -336,11 +336,9 @@ async function getCachedTokenInfo(mint) {
   if (mint in tokenInfoCache) return tokenInfoCache[mint];
   if (tokenInfoInflight[mint]) return tokenInfoInflight[mint];
   tokenInfoInflight[mint] = fetchTokenInfo(mint).then(info => {
-    if (info && info.creation_timestamp) {
-      tokenInfoCache[mint] = info;
-      setTimeout(() => delete tokenInfoCache[mint], 600000);
-    }
+    tokenInfoCache[mint] = info;
     delete tokenInfoInflight[mint];
+    setTimeout(() => delete tokenInfoCache[mint], 600000);
     return info;
   });
   return tokenInfoInflight[mint];
@@ -384,44 +382,48 @@ async function fetchSameNameCount(mint, symbol) {
   const nowSecs = Math.floor(Date.now() / 1000);
   const cutoff = 5 * 3600;
 
-  function countMatches(pairs, sym, ex) {
-    return pairs.filter(p => {
-      if ((p.chainId ?? p.chain_id) !== 'solana') return false;
-      if (p.baseToken?.symbol?.toUpperCase() !== sym.toUpperCase()) return false;
-      if (p.baseToken?.address === ex) return false;
-      const ca = p.pairCreatedAt ?? p.pair_created_at;
-      if (!ca) return false;
-      const ageSecs = nowSecs - Math.floor(ca / 1000);
+  function countMatches(pairs, sym, excludeMint) {
+    return pairs.filter(pair => {
+      if ((pair.chainId ?? pair.chain_id) !== 'solana') return false;
+      if (pair.baseToken?.symbol?.toUpperCase() !== sym.toUpperCase()) return false;
+      if (pair.baseToken?.address === excludeMint) return false;
+      const createdAt = pair.pairCreatedAt ?? pair.pair_created_at;
+      if (!createdAt) return false;
+      const ageSecs = nowSecs - Math.floor(createdAt / 1000);
       return ageSecs >= 0 && ageSecs <= cutoff;
     }).length;
   }
 
-  // Need symbol to search — if unknown, try to resolve from mint first
-  let sym = (symbol && symbol !== 'UNKNOWN') ? symbol : null;
+  // ── PATH 1: direct mint lookup (primary) ──────────────────────────────
+  await new Promise(r => setTimeout(r, 4000));
+  log(`[Dex] Fetching pairs for mint ${mint.substring(0, 8)}...`);
+  const r1 = await dexFetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  if (r1) {
+    const pairs = r1.pairs ?? r1.data ?? [];
+    const resolvedSymbol = (symbol && symbol !== 'UNKNOWN') ? symbol : (pairs.find(p => p.chainId === 'solana')?.baseToken?.symbol ?? null);
+    if (resolvedSymbol) {
+      const count = countMatches(pairs, resolvedSymbol, mint);
+      log(`[Dex] Mint lookup: ${resolvedSymbol} — ${count} same-name tokens in last 5h`);
+      return count;
+    }
+    log(`[Dex] Mint lookup returned pairs but no symbol for ${mint.substring(0, 8)} — returning 0`);
+    return 0;
+  }
 
-  if (!sym) {
-    log(`[Dex] No symbol for ${mint.substring(0,8)} — fetching from mint pairs`);
-    const r0 = await dexFetch(`https://api.dexscreener.com/token-pairs/v1/solana/${mint}`);
-    const pairs0 = Array.isArray(r0) ? r0 : (r0?.pairs ?? r0?.data ?? []);
-    sym = pairs0.find(p => p.chainId === 'solana')?.baseToken?.symbol ?? null;
-    if (!sym) {
-      log(`[Dex] ❌ Could not resolve symbol for ${mint.substring(0,8)}`);
-      return null;
+  // ── PATH 2: symbol search fallback ────────────────────────────────────
+  if (symbol && symbol !== 'UNKNOWN') {
+    log(`[Dex] Mint lookup failed — trying symbol search for ${symbol}...`);
+    await new Promise(r => setTimeout(r, 3000));
+    const r2 = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`);
+    if (r2) {
+      const pairs = r2.pairs ?? r2.data ?? [];
+      const count = countMatches(pairs, symbol, mint);
+      log(`[Dex] Symbol search: ${symbol} — ${count} same-name tokens in last 5h`);
+      return count;
     }
   }
 
-  // Direct symbol search — this is what actually returns all tokens with that name
-  log(`[Dex] Searching #${sym} across all Solana pairs...`);
-  await sleep(2000);
-  const r = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(sym)}`);
-  if (r) {
-    const pairs = Array.isArray(r) ? r : (r.pairs ?? r.data ?? []);
-    const c = countMatches(pairs, sym, mint);
-    log(`[Dex] ✅ #${sym}: ${c} same-name tokens in last 5h (${pairs.length} total results)`);
-    return c;
-  }
-
-  log(`[Dex] ❌ Search failed for #${sym}`);
+  log(`[Dex] Both paths failed for ${mint.substring(0, 8)} — returning null`);
   return null;
 }
 
