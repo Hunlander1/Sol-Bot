@@ -18,7 +18,6 @@ const SHYFT_API_KEY = process.env.SHYFT_API_KEY;
 const TELEGRAM_TOKEN      = process.env.TELEGRAM_TOKEN;
 const CHAT_ID_FAST        = process.env.CHAT_ID_FAST        || '-5081620734';
 const CHAT_ID_SLOW        = process.env.CHAT_ID_SLOW        || '-1003888330833';
-const CHAT_ID_WHALE       = process.env.CHAT_ID_WHALE       || '-5174318212';
 const RENDER_URL          = process.env.RENDER_EXTERNAL_URL || '';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -41,12 +40,6 @@ const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
 
-// ── WHALE BOT CONFIG ──────────────────────────────────────────
-const WHALE_THRESHOLD         = 5000;   // $5k single or cumulative
-const WHALE_MIN_HOLDERS       = 1000;
-const WHALE_CHECK_INTERVAL_MS = 2 * 60 * 1000;  // check every 2 min
-const WHALE_MAX_AGE_HOURS     = 24;
-const WHALE_FETCH_INTERVAL_MS = 5 * 60 * 1000;  // fetch new migrations every 5 min
 
 // ── RPC ───────────────────────────────────────────────────────
 const WSS_PRIMARY  = SHYFT_API_KEY
@@ -59,7 +52,6 @@ const HTTP_RPC     = SHYFT_API_KEY
 
 // ── FIRED ALERTS ──────────────────────────────────────────────
 const FIRED_FILE       = '/tmp/sol_combined_fired.json';
-const WHALE_FIRED_FILE = '/tmp/sol_whale_fired.json';
 
 function loadSet(path) {
   try {
@@ -205,7 +197,6 @@ function walletName(addr) {
 
 // ── STATE — SHARED ────────────────────────────────────────────
 let firedAlerts    = loadSet(FIRED_FILE);
-let whaleFired     = loadSet(WHALE_FIRED_FILE);
 let tokenInfoCache = {};
 let tokenInfoInflight = {};
 let creationCache  = {};
@@ -224,9 +215,6 @@ let migFired  = loadSet('/tmp/sol_mig_fired.json');
 let slowAlerts  = {};
 
 
-// ── STATE — WHALE BOT ─────────────────────────────────────────
-let watchedTokens  = {};
-let whaleCumulative = {};
 let pendingSigs    = new Set();
 
 // ── WS STATE ──────────────────────────────────────────────────
@@ -731,8 +719,8 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
 
 
 // ── COORDINATION LOGIC ────────────────────────────────────────
-async function handleWalletBuy(trackedWallet, tokenMint, whaleOnly = false) {
-  if (firedAlerts.has(tokenMint) && !whaleOnly) return;
+async function handleWalletBuy(trackedWallet, tokenMint) {
+  if (firedAlerts.has(tokenMint)) return;
 
   if (!devWalletCache[tokenMint]) {
     const devInfo = await getCachedTokenInfo(tokenMint);
@@ -745,8 +733,6 @@ async function handleWalletBuy(trackedWallet, tokenMint, whaleOnly = false) {
 
   const now = Math.floor(Date.now()/1000);
 
-  // Skip all coordination/fast/slow/accum when outside active hours
-  if (!whaleOnly) {
 
   // ── FAST MIGRATION BOT ──────────────────────────────────
   if (!migFired.has(tokenMint)) {
@@ -828,159 +814,8 @@ async function handleWalletBuy(trackedWallet, tokenMint, whaleOnly = false) {
     }
   }
 
-  } // end !whaleOnly
-
-
-  // ── WHALE WATCHLIST — only watch tokens under 24h old ────────
-  if (!whaleFired.has(tokenMint) && !watchedTokens[tokenMint]) {
-    const info = tokenInfoCache[tokenMint] ?? null;
-    const nowTs = Math.floor(Date.now()/1000);
-    const mintTime = creationCache[tokenMint] ?? info?.creation_timestamp ?? null;
-    // Only add if token is under 24h old — skip established tokens
-    if (mintTime && (nowTs - mintTime) > WHALE_MAX_AGE_HOURS * 3600) {
-      log(`[WHALE] ${tokenMint.substring(0,8)} too old — skipping watchlist`);
-    } else {
-      watchedTokens[tokenMint] = {
-        symbol:       info?.symbol ?? 'UNKNOWN',
-        mintTime:     mintTime ?? nowTs,
-        holders:      info?.holder_count ?? 0,
-        addedAt:      nowTs,
-        lastChecked:  0,
-        lastHolderCheck: 0,
-        trackedBuyers: new Set([trackedWallet]),
-      };
-      log(`[WHALE] Watching ${tokenMint.substring(0,8)} #${watchedTokens[tokenMint].symbol} — triggered by ${trackedWallet.substring(0,8)}`);
-    }
-  } else if (watchedTokens[tokenMint]) {
-    if (!watchedTokens[tokenMint].trackedBuyers) watchedTokens[tokenMint].trackedBuyers = new Set();
-    watchedTokens[tokenMint].trackedBuyers.add(trackedWallet);
-  }
 }
 
-// ── WHALE BOT — FETCH MIGRATED TOKENS ────────────────────────
-// Tokens now come from tracked wallet buys in handleWalletBuy above.
-// This function kept as stub so the interval call doesn't break.
-async function fetchMigratedTokens() {
-  return [];
-}
-
-// ── WHALE BOT — CHECK TOKEN FOR LARGE TRADES ─────────────────
-const whaleSeenTx = {};
-
-async function checkTokenTrades(mint, symbol) {
-  try {
-    const tokenEntry = watchedTokens[mint];
-    if (!tokenEntry) return;
-
-    // Try multiple param combinations — log raw response to diagnose
-    let trades = null;
-    for (const params of [
-      { chain: 'sol', address: mint, limit: '50' },
-      { chain: 'sol', address: mint },
-    ]) {
-      const raw = await httpsGet('openapi.gmgn.ai', `/v1/token/trades?${new URLSearchParams({...params, timestamp: Math.floor(Date.now()/1000).toString()}).toString()}`, {
-        'X-APIKEY': GMGN_API_KEY,
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      });
-      if (!raw) { log(`[WHALE] ${mint.substring(0,8)} — null response from GMGN trades`); continue; }
-      log(`[WHALE] ${mint.substring(0,8)} — GMGN response keys: ${Object.keys(raw).join(', ')} | code: ${raw.code}`);
-      const d = raw?.data ?? raw;
-      const t = Array.isArray(d) ? d : (d?.trades ?? d?.data ?? d?.items ?? []);
-      if (t.length) { trades = t; break; }
-      else log(`[WHALE] ${mint.substring(0,8)} — no trades array found in response`);
-    }
-
-    if (!trades || !trades.length) { log(`[WHALE] ${mint.substring(0,8)} — no trade data from GMGN`); return; }
-
-    log(`[WHALE] ${mint.substring(0,8)} #${symbol} — ${trades.length} trades`);
-
-    const nowSecs = Math.floor(Date.now()/1000);
-    if (!whaleSeenTx[mint]) whaleSeenTx[mint] = new Set();
-
-    for (const trade of trades) {
-      const type = (trade.type ?? trade.trade_type ?? '').toLowerCase();
-      if (type && type !== 'buy') continue;
-
-      const usdVal = parseFloat(
-        trade.total_usd ?? trade.amount_usd ?? trade.usd_value ??
-        trade.volume_usd ?? trade.quote_amount ?? 0
-      );
-      if (usdVal <= 0) continue;
-
-      const txHash = trade.tx_hash ?? trade.signature ?? `${trade.timestamp ?? trade.block_time}`;
-      if (whaleSeenTx[mint].has(txHash)) continue;
-      whaleSeenTx[mint].add(txHash);
-
-      whaleCumulative[mint] = (whaleCumulative[mint] || 0) + usdVal;
-      const total = whaleCumulative[mint];
-
-      log(`[WHALE] ${mint.substring(0,8)} #${symbol} — buy ${fmtUsd(usdVal)} | cumulative: ${fmtUsd(total)}`);
-
-      if (usdVal >= WHALE_THRESHOLD || total >= WHALE_THRESHOLD) {
-        const trackedCount = tokenEntry.trackedBuyers?.size ?? 1;
-        whaleFired.add(mint);
-        saveSet(WHALE_FIRED_FILE, whaleFired);
-        delete watchedTokens[mint];
-        delete whaleSeenTx[mint];
-
-        const buyType   = usdVal >= WHALE_THRESHOLD ? 'Single Buy' : 'Cumulative Buy';
-        const tokenInfo = await getCachedTokenInfo(mint);
-        const liq       = tokenInfo?.liquidity ?? 0;
-        const mc        = tokenInfo?.market_cap ?? tokenInfo?.usd_market_cap ?? 0;
-        const holders   = tokenInfo?.holder_count ?? tokenEntry?.holders ?? 'N/A';
-        const mintTs    = tokenInfo?.creation_timestamp ?? tokenEntry?.mintTime ?? null;
-        const ageStr    = mintTs ? (() => { const s = nowSecs - mintTs; return s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`; })() : 'N/A';
-        const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-
-        sendTelegram(CHAT_ID_WHALE,
-          `🐳 <b>Whale Alert — Solana</b>\n\n` +
-          `Token: #${symbol}\n` +
-          `Contract: <code>${mint}</code>\n` +
-          `Token Age: ${ageStr}\n` +
-          `${buyType}: ${fmtUsd(usdVal)}\n` +
-          `Total Spent: ${fmtUsd(total)}\n` +
-          `Tracked Wallets: ${trackedCount}\n` +
-          `Liquidity: ${fmtUsd(liq)}\n` +
-          `Market Cap: ${fmtUsd(mc)}\n` +
-          `Holders: ${holders}\n\n` +
-          `Signal Time: ${signalTime}\n\n` +
-          `<a href="https://gmgn.ai/sol/token/${mint}">GMGN</a>`
-        );
-        log(`[WHALE] 🐳 Signal for #${symbol} — ${fmtUsd(total)} (${buyType})`);
-        return;
-      }
-    }
-  } catch(e) { log(`[WHALE] checkTokenTrades error ${mint.substring(0,8)}: ${e.message}`); }
-}
-
-// ── WHALE BOT — MAIN LOOPS ────────────────────────────────────
-async function whaleFetchLoop() {
-  log(`[WHALE] Watching ${Object.keys(watchedTokens).length} tokens (populated via tracked-wallet buys)`);
-}
-
-async function whaleCheckLoop() {
-  const nowSecs = Math.floor(Date.now()/1000);
-  const mints = Object.keys(watchedTokens);
-  for (const mint of mints) {
-    const token = watchedTokens[mint];
-    if (!token) continue;
-
-    // Remove if over 24 hours since we started watching
-    if (token.addedAt && (nowSecs - token.addedAt) > WHALE_MAX_AGE_HOURS * 3600) {
-      log(`[WHALE] ${mint.substring(0,8)} expired (24h watch) — removing`);
-      delete watchedTokens[mint];
-      continue;
-    }
-
-    // Check trades every 2 minutes
-    if (nowSecs - token.lastChecked >= WHALE_CHECK_INTERVAL_MS / 1000) {
-      token.lastChecked = nowSecs;
-      await checkTokenTrades(mint, token.symbol);
-      await sleep(2000); // 2s between tokens to avoid rate limiting GMGN
-    }
-  }
-}
 
 // ── LOG NOTIFICATION PROCESSING ──────────────────────────────
 async function processLogNotification(params) {
@@ -1009,11 +844,7 @@ async function processLogNotification(params) {
   const mint = extractMint(tx);
   if (!mint) return;
 
-  if (!isActiveHours()) {
-    // Outside active hours — only add to whale watchlist
-    await handleWalletBuy(trackedWallet, mint, true);
-    return;
-  }
+  if (!isActiveHours()) return;
 
   log(`[MINT] ${trackedWallet.substring(0,8)} bought ${mint.substring(0,8)}`);
   await handleWalletBuy(trackedWallet, mint);
@@ -1106,25 +937,19 @@ http.createServer((req, res) => {
     `Fast alerts: ${Object.keys(fastAlerts).length}\n` +
     `Migration alerts: ${Object.keys(migAlerts).length} | Migration fired: ${migFired.size}\n` +
     `Slow alerts: ${Object.keys(slowAlerts).length}\n` +
-    `Whale watching: ${Object.keys(watchedTokens).length} tokens\n` +
-    `Fired (coord): ${firedAlerts.size} | Fired (whale): ${whaleFired.size}\n` +
+    `Fired (coord): ${firedAlerts.size}\n` +
     `\nHit /logs to see last 500 log lines\n`
   );
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`[START] Solana combined bot | ${WALLETS.length} wallets | Fast(4w/20s) + Slow(3w/5m) + Whale`);
+log(`[START] Solana combined bot | ${WALLETS.length} wallets | Fast + Slow + Migration`);
 log(`[START] WSS: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
 
 https.get('https://api.ipify.org?format=json', (res) => {
   let d = ''; res.on('data', c => d += c);
   res.on('end', () => { try { log(`[IP] ${JSON.parse(d).ip}`); } catch {} });
 }).on('error', () => {});
-
-// Start whale loops
-whaleFetchLoop();
-setInterval(whaleFetchLoop, WHALE_FETCH_INTERVAL_MS);
-setInterval(whaleCheckLoop, 30000);
 
 // Connect WebSocket
 connect();
