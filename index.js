@@ -794,8 +794,9 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
   // ── SLOW BOT ────────────────────────────────────────────
   const slowAge = await getTokenAge(tokenMint, SLOW_MAX_TOKEN_AGE, skipCacheSlow);
   if (slowAge === -1) { log(`[SLOW SKIP] ${tokenMint.substring(0,8)} too old`); }
-  else if (slowAge === null) { log(`[SLOW SKIP] ${tokenMint.substring(0,8)} age unknown`); }
   else {
+    // Allow unknown age through — same-name count and dev ATH filters will catch bad tokens
+    if (slowAge === null) { log(`[SLOW] ${tokenMint.substring(0,8)} age unknown — allowing (filtered by same-name/dev ATH)`); }
     if (!slowAlerts[tokenMint]) {
       slowAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
     }
