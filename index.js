@@ -197,6 +197,7 @@ function walletName(addr) {
 
 // ── STATE — SHARED ────────────────────────────────────────────
 let firedAlerts    = loadSet(FIRED_FILE);
+let firingNow      = new Set(); // race condition guard
 let tokenInfoCache = {};
 let tokenInfoInflight = {};
 let creationCache  = {};
@@ -808,12 +809,15 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     se.wallets.add(trackedWallet);
     log(`[SLOW] ${se.wallets.size}/${SLOW_MIN_WALLETS} for ${tokenMint.substring(0,8)} within ${now-se.firstSeenAt}s`);
     if (se.wallets.size >= SLOW_MIN_WALLETS) {
+      if (firingNow.has(tokenMint)) return; // concurrent call already firing
+      firingNow.add(tokenMint);
       const elapsed = now - se.firstSeenAt;
       const coordWallets = new Set(se.wallets);
       firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
       delete slowAlerts[tokenMint];
       const tokenInfo = await getCachedTokenInfo(tokenMint);
       await buildSlowSignal(tokenMint, se.wallets.size, elapsed, tokenInfo, coordWallets);
+      firingNow.delete(tokenMint);
     }
   }
 
