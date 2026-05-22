@@ -780,9 +780,9 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
       fe.wallets.add(trackedWallet);
       log(`[FAST] ${fe.wallets.size}/${FAST_MIN_WALLETS} for ${tokenMint.substring(0,8)} — ${secsSinceMint}s since mint`);
       if (fe.wallets.size >= FAST_MIN_WALLETS) {
-        const coordWallets = new Set(fe.wallets);
+        delete fastAlerts[tokenMint]; // synchronously first
         firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
-        delete fastAlerts[tokenMint];
+        const coordWallets = new Set(fe.wallets);
         const tokenInfo = await getCachedTokenInfo(tokenMint);
         await buildFastSignal(tokenMint, fe.wallets.size, secsSinceMint, tokenInfo, coordWallets);
         return;
@@ -809,15 +809,13 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     se.wallets.add(trackedWallet);
     log(`[SLOW] ${se.wallets.size}/${SLOW_MIN_WALLETS} for ${tokenMint.substring(0,8)} within ${now-se.firstSeenAt}s`);
     if (se.wallets.size >= SLOW_MIN_WALLETS) {
-      if (firingNow.has(tokenMint)) return; // concurrent call already firing
-      firingNow.add(tokenMint);
+      // Delete entry synchronously FIRST — prevents any concurrent call from also reaching this block
+      delete slowAlerts[tokenMint];
+      firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
       const elapsed = now - se.firstSeenAt;
       const coordWallets = new Set(se.wallets);
-      firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
-      delete slowAlerts[tokenMint];
       const tokenInfo = await getCachedTokenInfo(tokenMint);
       await buildSlowSignal(tokenMint, se.wallets.size, elapsed, tokenInfo, coordWallets);
-      firingNow.delete(tokenMint);
     }
   }
 
