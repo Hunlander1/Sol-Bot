@@ -679,13 +679,9 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
     const devIsTrackedAlready = devWallet && devWallet !== 'N/A' && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
 
     let sameNameCount = null;
-    if (!devAthPassesAlready && !devIsTrackedAlready) {
-      log(`[SLOW] Fetching same-name count for #${symbol} (${tokenMint.substring(0,8)})`);
-      sameNameCount = await fetchSameNameCount(tokenMint, symbol);
-      log(`[SLOW] Same-name result: ${sameNameCount ?? 'null'} for #${symbol}`);
-    } else {
-      log(`[SLOW FILTER] ✅ Dev passes immediately — skipping DexScreener`);
-    }
+    log(`[SLOW] Fetching same-name count for #${symbol} (${tokenMint.substring(0,8)})`);
+    sameNameCount = await fetchSameNameCount(tokenMint, symbol);
+    log(`[SLOW] Same-name result: ${sameNameCount ?? 'null'} for #${symbol}`);
 
     if (!slowShouldFire(symbol, sameNameCount, devWallet, devAthMc)) return;
 
