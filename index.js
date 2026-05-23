@@ -649,6 +649,7 @@ function slowShouldFire(symbol, sameNameCount, devWallet, devAthMc) {
 }
 
 async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
+  if (firedAlerts.has(tokenMint)) { log(`[SLOW] ${tokenMint.substring(0,8)} already fired — skipping duplicate`); return; }
   try {
     const now = Math.floor(Date.now()/1000);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
@@ -722,6 +723,8 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
 
 
 // ── COORDINATION LOGIC ────────────────────────────────────────
+const processing = new Set(); // synchronous guard against duplicate concurrent signals
+
 async function handleWalletBuy(trackedWallet, tokenMint) {
   if (firedAlerts.has(tokenMint)) return;
 
@@ -809,13 +812,15 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     se.wallets.add(trackedWallet);
     log(`[SLOW] ${se.wallets.size}/${SLOW_MIN_WALLETS} for ${tokenMint.substring(0,8)} within ${now-se.firstSeenAt}s`);
     if (se.wallets.size >= SLOW_MIN_WALLETS) {
-      // Delete entry synchronously FIRST — prevents any concurrent call from also reaching this block
-      delete slowAlerts[tokenMint];
+      if (firedAlerts.has(tokenMint) || processing.has(tokenMint)) return;
+      processing.add(tokenMint); // synchronous — no await between check and add
       firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
+      delete slowAlerts[tokenMint];
       const elapsed = now - se.firstSeenAt;
       const coordWallets = new Set(se.wallets);
       const tokenInfo = await getCachedTokenInfo(tokenMint);
       await buildSlowSignal(tokenMint, se.wallets.size, elapsed, tokenInfo, coordWallets);
+      processing.delete(tokenMint);
     }
   }
 
