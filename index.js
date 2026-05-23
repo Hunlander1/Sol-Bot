@@ -652,6 +652,8 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
   if (firedAlerts.has(tokenMint)) { log(`[SLOW] ${tokenMint.substring(0,8)} already fired — skipping duplicate`); return; }
   try {
     const now = Math.floor(Date.now()/1000);
+    // Always ensure token info is available — fetch if not passed in
+    if (!tokenInfo) tokenInfo = await getCachedTokenInfo(tokenMint);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
     let liquidityStr = 'N/A', marketCapStr = 'N/A';
     let devWallet = 'N/A', devAth = 'N/A', devAthMc = null;
