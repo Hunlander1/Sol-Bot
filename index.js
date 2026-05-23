@@ -723,9 +723,21 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
 
 
 // ── COORDINATION LOGIC ────────────────────────────────────────
-const processing = new Set(); // synchronous guard against duplicate concurrent signals
+const processing = new Set();
+const tokenQueues = {};
 
 async function handleWalletBuy(trackedWallet, tokenMint) {
+  // Serialize all calls for the same token — prevents race conditions
+  if (!tokenQueues[tokenMint]) tokenQueues[tokenMint] = Promise.resolve();
+  tokenQueues[tokenMint] = tokenQueues[tokenMint].then(() =>
+    _handleWalletBuy(trackedWallet, tokenMint).catch(e => log(`[ERR] _handleWalletBuy: ${e.message}`))
+  );
+  await tokenQueues[tokenMint];
+  // Clean up queue after 60s
+  setTimeout(() => delete tokenQueues[tokenMint], 60000);
+}
+
+async function _handleWalletBuy(trackedWallet, tokenMint) {
   if (firedAlerts.has(tokenMint)) return;
 
   if (!devWalletCache[tokenMint]) {
@@ -812,10 +824,12 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     se.wallets.add(trackedWallet);
     log(`[SLOW] ${se.wallets.size}/${SLOW_MIN_WALLETS} for ${tokenMint.substring(0,8)} within ${now-se.firstSeenAt}s`);
     if (se.wallets.size >= SLOW_MIN_WALLETS) {
+      // These three lines are synchronous — no await between them — guaranteed atomic
       if (firedAlerts.has(tokenMint) || processing.has(tokenMint)) return;
-      processing.add(tokenMint); // synchronous — no await between check and add
+      processing.add(tokenMint);
       firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
       delete slowAlerts[tokenMint];
+      // Now safe to await
       const elapsed = now - se.firstSeenAt;
       const coordWallets = new Set(se.wallets);
       const tokenInfo = await getCachedTokenInfo(tokenMint);
