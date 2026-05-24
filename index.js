@@ -23,9 +23,9 @@ const RENDER_URL          = process.env.RENDER_EXTERNAL_URL || '';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 // ── FAST BOT CONFIG ───────────────────────────────────────────
-const FAST_WINDOW_SECS    = 30; // matches FAST_MAX_TOKEN_AGE
-const FAST_MAX_TOKEN_AGE  = 30;
-const FAST_MIN_WALLETS    = 5;
+const FAST_WINDOW_SECS    = 3600; // 60 minutes
+const FAST_MAX_TOKEN_AGE  = 3600; // 60 minutes
+const FAST_MIN_WALLETS    = 7;
 
 // ── FAST MIGRATION CONFIG ────────────────────────────────────
 const FAST_MIG_MAX_AGE    = 30;  // token must hit MC threshold within 30s of mint
@@ -616,7 +616,7 @@ async function buildFastSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
     const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
     sendTelegram(CHAT_ID_FAST,
-      `⚡ <b>5-Wallet Fast Signal (30s)</b>\n\n` +
+      `⚡ <b>7-Wallet Fast Signal (1h)</b>\n\n` +
       `Token: #${symbol}\n` +
       `Contract: <code>${tokenMint}</code>\n` +
       `Mint Time: ${mintTimeStr}\n` +
