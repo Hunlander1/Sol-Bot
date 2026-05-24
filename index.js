@@ -34,7 +34,7 @@ const FAST_MIG_MIN_MC      = 38_000; // $40k market cap threshold
 
 // ── SLOW BOT CONFIG ───────────────────────────────────────────
 const SLOW_WINDOW_SECS    = 300;
-const SLOW_MAX_TOKEN_AGE  = 3600;
+const SLOW_MAX_TOKEN_AGE  = 900; // 15 minutes
 const SLOW_MIN_WALLETS    = 3;
 const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
