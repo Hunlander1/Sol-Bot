@@ -654,6 +654,16 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
     const now = Math.floor(Date.now()/1000);
     // Always ensure token info is available — fetch if not passed in
     if (!tokenInfo) tokenInfo = await getCachedTokenInfo(tokenMint);
+
+    // Verify token age — reject if older than SLOW_MAX_TOKEN_AGE
+    const mintTime = tokenInfo?.creation_timestamp ?? creationCache[tokenMint] ?? null;
+    if (mintTime) {
+      const tokenAge = Math.floor(Date.now()/1000) - mintTime;
+      if (tokenAge > SLOW_MAX_TOKEN_AGE) {
+        log(`[SLOW] ${tokenMint.substring(0,8)} too old at signal time (${Math.floor(tokenAge/60)}m) — suppressed`);
+        return;
+      }
+    }
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
     let liquidityStr = 'N/A', marketCapStr = 'N/A';
     let devWallet = 'N/A', devAth = 'N/A', devAthMc = null;
