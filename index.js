@@ -22,10 +22,6 @@ const RENDER_URL          = process.env.RENDER_EXTERNAL_URL || '';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
-// ── FAST BOT CONFIG ───────────────────────────────────────────
-const FAST_WINDOW_SECS    = 3600; // 60 minutes
-const FAST_MAX_TOKEN_AGE  = 3600; // 60 minutes
-const FAST_MIN_WALLETS    = 7;
 
 // ── FAST MIGRATION CONFIG ────────────────────────────────────
 const FAST_MIG_MAX_AGE    = 30;  // token must hit MC threshold within 30s of mint
@@ -201,12 +197,10 @@ let firingNow      = new Set(); // race condition guard
 let tokenInfoCache = {};
 let tokenInfoInflight = {};
 let creationCache  = {};
-let skipCacheFast  = {};
 let skipCacheSlow  = {};
 let devWalletCache = {};
 
 // ── STATE — FAST BOT ──────────────────────────────────────────
-let fastAlerts  = {};
 
 // ── STATE — FAST MIGRATION BOT ────────────────────────────────
 let migAlerts = {};
@@ -532,110 +526,6 @@ function extractMint(tx) {
 }
 
 
-// ── FAST BOT SIGNAL ───────────────────────────────────────────
-async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
-  try {
-    const now = Math.floor(Date.now()/1000);
-    let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
-    let liquidityStr = 'N/A', marketCapStr = 'N/A';
-    let devWallet = null, devAth = 'N/A';
-
-    if (tokenInfo) {
-      symbol = tokenInfo.symbol ?? 'UNKNOWN';
-      const ca = tokenInfo.creation_timestamp;
-      if (ca) {
-        mintTimeStr = new Date(ca*1000).toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-        const s = now - ca; ageStr = s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
-      }
-      const liq = parseFloat(tokenInfo.liquidity);
-      if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
-      if (isNaN(mc) || mc === 0) { const p = parseFloat(tokenInfo.price); const s = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply); if (!isNaN(p) && !isNaN(s) && p > 0 && s > 0) mc = p*s; }
-      if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      const ca2 = tokenInfo.dev?.creator_address; if (ca2) devWallet = ca2;
-      const athInfo = tokenInfo.dev?.ath_token_info;
-      if (athInfo?.ath_mc) { const p = parseFloat(athInfo.ath_mc); if (!isNaN(p)) { devAth = p >= 1_000_000 ? `$${(p/1_000_000).toFixed(1)}M${athInfo.symbol?' #'+athInfo.symbol:''}` : `$${p.toLocaleString('en-US',{maximumFractionDigits:0})}${athInfo.symbol?' #'+athInfo.symbol:''}`; } }
-    }
-
-    const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-
-    sendTelegram(CHAT_ID_FAST,
-      `⚡ <b>Fast Signal — $38k in 30s (${walletCount}w)</b>\n\n` +
-      `Token: #${symbol}\n` +
-      `Contract: <code>${tokenMint}</code>\n` +
-      `Mint Time: ${mintTimeStr}\n` +
-      `Token Age at $40k: ${ageStr}\n` +
-      `Liquidity: ${liquidityStr}\n` +
-      `Market Cap: ${marketCapStr}\n` +
-      `Wallets: ${walletCount} bought within ${elapsed}s of mint\n` +
-      `Buyers: ${coordWallets ? [...coordWallets].map(a => walletName(a)).join(', ') : 'N/A'}\n\n` +
-      `Dev Wallet: ${devWallet ? `<code>${devWallet}</code>` : 'N/A'}\n` +
-      `Dev ATH: ${devAth}\n\n` +
-      `Signal Time: ${signalTime}\n\n` +
-      `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
-    );
-    log(`[MIG] Signal sent for #${symbol} — ${walletCount} wallets, $40k+ in ${elapsed}s`);
-  } catch(e) { log(`[ERR] buildMigrationSignal: ${e.message}`); }
-}
-
-async function buildFastSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
-  try {
-    const now = Math.floor(Date.now()/1000);
-    let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
-    let liquidityStr = 'N/A', marketCapStr = 'N/A';
-    let devWallet = null, devAth = 'N/A';
-    let freshWalletsFromInfo = null;
-
-    if (tokenInfo) {
-      symbol = tokenInfo.symbol ?? 'UNKNOWN';
-      const ca = tokenInfo.creation_timestamp;
-      if (ca) {
-        mintTimeStr = new Date(ca*1000).toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-        const s = now - ca; ageStr = s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
-      }
-      const liq = parseFloat(tokenInfo.liquidity);
-      if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
-      if (isNaN(mc) || mc === 0) { const p = parseFloat(tokenInfo.price); const s = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply); if (!isNaN(p) && !isNaN(s) && p > 0 && s > 0) mc = p*s; }
-      if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      const ca2 = tokenInfo.dev?.creator_address; if (ca2) devWallet = ca2;
-      const athInfo = tokenInfo.dev?.ath_token_info;
-      if (athInfo?.ath_mc) { const p = parseFloat(athInfo.ath_mc); if (!isNaN(p)) { devAth = p >= 1_000_000 ? `$${(p/1_000_000).toFixed(1)}M${athInfo.symbol?' #'+athInfo.symbol:''}` : `$${p.toLocaleString('en-US',{maximumFractionDigits:0})}${athInfo.symbol?' #'+athInfo.symbol:''}`; } }
-      const fw = tokenInfo.wallet_tags_stat?.fresh_wallets; if (fw != null) freshWalletsFromInfo = fw;
-    }
-
-    const freshWallets = freshWalletsFromInfo ?? await fetchFreshWallets(tokenMint);
-    const notableHolders = await fetchNotableHolders(tokenMint, tokenInfo);
-
-    let notableLine = '';
-    if (notableHolders.length > 0) {
-      notableLine = `\n\n💰 <b>Notable Holders (>$50k)</b>\n` +
-        notableHolders.map(h => `  • <code>${h.addr}</code> — ${h.valStr}${h.pctStr}`).join('\n');
-    }
-
-    const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-
-    sendTelegram(CHAT_ID_FAST,
-      `⚡ <b>7-Wallet Fast Signal (1h)</b>\n\n` +
-      `Token: #${symbol}\n` +
-      `Contract: <code>${tokenMint}</code>\n` +
-      `Mint Time: ${mintTimeStr}\n` +
-      `Token Age: ${ageStr}\n` +
-      `Liquidity: ${liquidityStr}\n` +
-      `Market Cap: ${marketCapStr}\n` +
-      `Fresh Wallets: ${freshWallets ?? 'N/A'}\n` +
-      `Wallets Coordinated: ${walletCount} within ${elapsed}s\n` +
-      `Wallets: ${[...coordWallets].map(a => walletName(a)).join(', ')}\n\n` +
-      `Dev Wallet: ${devWallet ? `<code>${devWallet}</code>` : 'N/A'}\n` +
-      `Dev ATH: ${devAth}` +
-      notableLine +
-      `\n\nSignal Time: ${signalTime}\n\n` +
-      `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
-    );
-    log(`[FAST] Signal sent for #${symbol}`);
-  } catch(e) { log(`[ERR] buildFastSignal: ${e.message}`); }
-}
-
 // ── SLOW BOT SIGNAL FILTER ────────────────────────────────────
 function slowShouldFire(symbol, sameNameCount, devWallet, devAthMc) {
   const devIsTracked = devWallet && devWallet !== 'N/A' && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
@@ -789,31 +679,6 @@ async function _handleWalletBuy(trackedWallet, tokenMint) {
     }
   }
 
-  // ── FAST BOT ────────────────────────────────────────────
-  const fastAge = await getTokenAge(tokenMint, FAST_MAX_TOKEN_AGE, skipCacheFast);
-  if (fastAge !== -1 && fastAge !== null) {
-    if (!fastAlerts[tokenMint]) {
-      const mintTs = creationCache[tokenMint] ?? now;
-      fastAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: mintTs };
-    }
-    const fe = fastAlerts[tokenMint];
-    // Window pinned to mint time — 5 wallets must buy within 30s of mint, no rolling reset
-    const secsSinceMint = now - fe.firstSeenAt;
-    if (secsSinceMint <= FAST_MAX_TOKEN_AGE) {
-      fe.wallets.add(trackedWallet);
-      log(`[FAST] ${fe.wallets.size}/${FAST_MIN_WALLETS} for ${tokenMint.substring(0,8)} — ${secsSinceMint}s since mint`);
-      if (fe.wallets.size >= FAST_MIN_WALLETS) {
-        delete fastAlerts[tokenMint]; // synchronously first
-        firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
-        const coordWallets = new Set(fe.wallets);
-        const tokenInfo = await getCachedTokenInfo(tokenMint);
-        await buildFastSignal(tokenMint, fe.wallets.size, secsSinceMint, tokenInfo, coordWallets);
-        return;
-      }
-    } else {
-      delete fastAlerts[tokenMint]; // mint window expired
-    }
-  }
 
   // ── SLOW BOT ────────────────────────────────────────────
   const slowAge = await getTokenAge(tokenMint, SLOW_MAX_TOKEN_AGE, skipCacheSlow);
@@ -948,7 +813,6 @@ function connect() {
 // ── CLEANUP ───────────────────────────────────────────────────
 setInterval(() => {
   const now = Math.floor(Date.now()/1000);
-  for (const mint of Object.keys(fastAlerts)) { if (now - fastAlerts[mint].firstSeenAt > FAST_WINDOW_SECS) delete fastAlerts[mint]; }
   for (const mint of Object.keys(migAlerts)) { if (now - migAlerts[mint].firstSeenAt > FAST_MIG_MAX_AGE * 2) delete migAlerts[mint]; }
   for (const mint of Object.keys(slowAlerts)) { if (now - slowAlerts[mint].firstSeenAt > SLOW_WINDOW_SECS) delete slowAlerts[mint]; }
 }, 60000);
@@ -966,7 +830,6 @@ http.createServer((req, res) => {
     `SOLANA COMBINED BOT — LIVE\n` +
     `WS: ${wsReady ? 'connected' : 'reconnecting'}\n` +
     `Subscriptions: ${Object.keys(subIdToWallet).length}/${WALLETS.length}\n` +
-    `Fast alerts: ${Object.keys(fastAlerts).length}\n` +
     `Migration alerts: ${Object.keys(migAlerts).length} | Migration fired: ${migFired.size}\n` +
     `Slow alerts: ${Object.keys(slowAlerts).length}\n` +
     `Fired (coord): ${firedAlerts.size}\n` +
