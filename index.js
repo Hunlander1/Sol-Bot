@@ -211,8 +211,6 @@ let slowAlerts  = {};
 
 
 let pendingSigs    = new Set();
-const walletLastSeen = {}; // rate limit per wallet
-const WALLET_RATE_LIMIT_MS = 2000; // max one tx per wallet every 2 seconds
 
 // ── WS STATE ──────────────────────────────────────────────────
 let ws             = null;
@@ -624,20 +622,8 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
 
 // ── COORDINATION LOGIC ────────────────────────────────────────
 const processing = new Set();
-const tokenQueues = {};
 
 async function handleWalletBuy(trackedWallet, tokenMint) {
-  // Serialize all calls for the same token — prevents race conditions
-  if (!tokenQueues[tokenMint]) tokenQueues[tokenMint] = Promise.resolve();
-  tokenQueues[tokenMint] = tokenQueues[tokenMint].then(() =>
-    _handleWalletBuy(trackedWallet, tokenMint).catch(e => log(`[ERR] _handleWalletBuy: ${e.message}`))
-  );
-  await tokenQueues[tokenMint];
-  // Clean up queue after 60s
-  setTimeout(() => delete tokenQueues[tokenMint], 60000);
-}
-
-async function _handleWalletBuy(trackedWallet, tokenMint) {
   if (firedAlerts.has(tokenMint)) return;
 
   if (!devWalletCache[tokenMint]) {
@@ -727,13 +713,6 @@ async function processLogNotification(params) {
   if (!trackedWallet) return;
 
   log(`[LOG HIT] wallet ${trackedWallet.substring(0,8)} | sig ${signature.substring(0,12)}...`);
-
-  // Rate limit per wallet — prevent flooding from a single wallet
-  const now2 = Date.now();
-  if (walletLastSeen[trackedWallet] && now2 - walletLastSeen[trackedWallet] < WALLET_RATE_LIMIT_MS) {
-    return; // silently drop — too many txs from this wallet
-  }
-  walletLastSeen[trackedWallet] = now2;
 
   if (pendingSigs.has(signature)) { log(`[DEBOUNCE] ${signature.substring(0,12)}`); return; }
   pendingSigs.add(signature);
