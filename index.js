@@ -1,4 +1,13 @@
 // ============================================================
+//  ⚠️  CRITICAL RULE — READ BEFORE MAKING ANY CHANGES ⚠️
+//  NEVER modify working code. Only change what is explicitly
+//  asked for. If a feature works, DO NOT touch it.
+//  Working features: slow tracker (rolling window), same-name
+//  count (fetchSameNameCount), fast tracker, migration tracker,
+//  WebSocket, signal building functions.
+//  When fixing a bug — change ONLY the broken part.
+// ============================================================
+// ============================================================
 //  SOLANA COMBINED BOT
 //  1. Fast Tracker  — 5 wallets within 30s of mint
 //  2. Slow Tracker  — 3 wallets within 5min, token < 60min
