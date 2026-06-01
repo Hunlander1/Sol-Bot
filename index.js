@@ -211,6 +211,8 @@ let slowAlerts  = {};
 
 
 let pendingSigs    = new Set();
+const walletLastSeen = {}; // rate limit per wallet
+const WALLET_RATE_LIMIT_MS = 2000; // max one tx per wallet every 2 seconds
 
 // ── WS STATE ──────────────────────────────────────────────────
 let ws             = null;
@@ -725,6 +727,13 @@ async function processLogNotification(params) {
   if (!trackedWallet) return;
 
   log(`[LOG HIT] wallet ${trackedWallet.substring(0,8)} | sig ${signature.substring(0,12)}...`);
+
+  // Rate limit per wallet — prevent flooding from a single wallet
+  const now2 = Date.now();
+  if (walletLastSeen[trackedWallet] && now2 - walletLastSeen[trackedWallet] < WALLET_RATE_LIMIT_MS) {
+    return; // silently drop — too many txs from this wallet
+  }
+  walletLastSeen[trackedWallet] = now2;
 
   if (pendingSigs.has(signature)) { log(`[DEBOUNCE] ${signature.substring(0,12)}`); return; }
   pendingSigs.add(signature);
