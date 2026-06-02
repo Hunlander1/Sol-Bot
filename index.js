@@ -16,6 +16,7 @@ const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN;
 const CHAT_ID          = process.env.CHAT_ID;
 const GMGN_API_KEY     = process.env.GMGN_API_KEY;
 const SHYFT_API_KEY    = process.env.SHYFT_API_KEY;
+const HELIUS_API_KEY   = process.env.HELIUS_API_KEY;
 
 const SOL_MINT         = 'So11111111111111111111111111111111111111112';
 const WINDOW_SECS      = 300;
@@ -25,9 +26,9 @@ const NOTABLE_HOLDER_THRESHOLD = 50_000;
 const SAME_NAME_THRESHOLD = 10;
 const DEV_ATH_THRESHOLD   = 1_000_000;
 
-const WSS_PRIMARY  = SHYFT_API_KEY ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}` : 'wss://api.mainnet-beta.solana.com';
+const WSS_PRIMARY  = HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : SHYFT_API_KEY ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}` : 'wss://api.mainnet-beta.solana.com';
 const WSS_FALLBACK = 'wss://api.mainnet-beta.solana.com';
-const HTTP_RPC     = SHYFT_API_KEY ? `https://rpc.shyft.to?api_key=${SHYFT_API_KEY}` : 'https://api.mainnet-beta.solana.com';
+const HTTP_RPC     = HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : SHYFT_API_KEY ? `https://rpc.shyft.to?api_key=${SHYFT_API_KEY}` : 'https://api.mainnet-beta.solana.com';
 const FIRED_FILE   = '/tmp/fired_alerts.json';
 
 function loadFiredAlerts() {
