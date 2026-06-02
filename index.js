@@ -630,7 +630,6 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
 
 
 // ── COORDINATION LOGIC ────────────────────────────────────────
-const processing = new Set();
 
 async function handleWalletBuy(trackedWallet, tokenMint) {
   if (firedAlerts.has(tokenMint)) return;
@@ -694,17 +693,13 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     se.wallets.add(trackedWallet);
     log(`[SLOW] ${se.wallets.size}/${SLOW_MIN_WALLETS} for ${tokenMint.substring(0,8)} within ${now-se.firstSeenAt}s`);
     if (se.wallets.size >= SLOW_MIN_WALLETS) {
-      // These three lines are synchronous — no await between them — guaranteed atomic
-      if (firedAlerts.has(tokenMint) || processing.has(tokenMint)) return;
-      processing.add(tokenMint);
+      if (firedAlerts.has(tokenMint)) return;
       firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
       delete slowAlerts[tokenMint];
-      // Now safe to await
       const elapsed = now - se.firstSeenAt;
       const coordWallets = new Set(se.wallets);
       const tokenInfo = await getCachedTokenInfo(tokenMint);
       await buildSlowSignal(tokenMint, se.wallets.size, elapsed, tokenInfo, coordWallets);
-      processing.delete(tokenMint);
     }
   }
 
