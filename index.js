@@ -220,8 +220,6 @@ let slowAlerts  = {};
 
 
 let pendingSigs    = new Set();
-let activeTxFetches = 0;
-const MAX_CONCURRENT_TX_FETCHES = 10;
 
 // ── WS STATE ──────────────────────────────────────────────────
 let ws             = null;
@@ -725,8 +723,6 @@ async function processLogNotification(params) {
   setTimeout(() => pendingSigs.delete(signature), 30000);
 
   // Limit concurrent RPC fetches to prevent memory spikes from wallet flooding
-  if (activeTxFetches >= MAX_CONCURRENT_TX_FETCHES) return;
-  activeTxFetches++;
 
   let tx = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -734,7 +730,6 @@ async function processLogNotification(params) {
     if (tx) break;
     await sleep(2000);
   }
-  activeTxFetches--;
   if (!tx) return;
 
   const mint = extractMint(tx);
