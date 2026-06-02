@@ -19,6 +19,15 @@ const CHAT_ID_FAST     = process.env.CHAT_ID_FAST;
 const GMGN_API_KEY     = process.env.GMGN_API_KEY;
 const SHYFT_API_KEY    = process.env.SHYFT_API_KEY;
 const HELIUS_API_KEY   = process.env.HELIUS_API_KEY;
+const ALCHEMY_API_KEY  = process.env.ALCHEMY_API_KEY;
+
+// ── RPC ENDPOINTS — tried in order until one succeeds ─────────
+const HTTP_RPCS = [
+  HELIUS_API_KEY  ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : null,
+  SHYFT_API_KEY   ? `https://rpc.shyft.to?api_key=${SHYFT_API_KEY}` : null,
+  ALCHEMY_API_KEY ? `https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` : null,
+  'https://api.mainnet-beta.solana.com',
+].filter(Boolean);
 
 // ── FAST MIGRATION CONFIG ─────────────────────────────────────
 const FAST_MIG_MIN_WALLETS = 2;
@@ -116,7 +125,6 @@ let wsReady        = false;
 let reconnectDelay = 5000;
 let usingFallback  = false;
 let pendingSigs    = new Set();
-let sellWatchlist  = {};
 let tokenInfoCache    = {};
 let tokenInfoInflight = {};
 const logBuffer = [];
@@ -148,12 +156,6 @@ setInterval(() => {
   for (const mint of Object.keys(activeAlerts)) { if (now - activeAlerts[mint].firstSeenAt > WINDOW_SECS) delete activeAlerts[mint]; }
 }, 60000);
 
-setInterval(() => {
-  const now = Math.floor(Date.now() / 1000);
-  for (const mint of Object.keys(sellWatchlist)) {
-    if (now - sellWatchlist[mint].signalTime > 6 * 3600) { log(`[SELL] Watchlist entry for ${mint.substring(0, 8)} expired`); delete sellWatchlist[mint]; }
-  }
-}, 5 * 60 * 1000);
 
 function isActiveHours() {
   const eastern = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
@@ -194,8 +196,11 @@ function httpsPost(url, body) {
 }
 
 async function getTransaction(signature) {
-  const result = await httpsPost(HTTP_RPC, { jsonrpc: '2.0', id: 1, method: 'getTransaction', params: [signature, { encoding: 'json', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }] });
-  return result?.result ?? null;
+  for (const rpc of HTTP_RPCS) {
+    const result = await httpsPost(rpc, { jsonrpc: '2.0', id: 1, method: 'getTransaction', params: [signature, { encoding: 'json', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }] });
+    if (result?.result) return result.result;
+  }
+  return null;
 }
 
 function extractMint(tx) {
@@ -206,38 +211,6 @@ function extractMint(tx) {
   let mint = postBals.find(b => b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint))?.mint;
   if (!mint) mint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
   return mint ?? null;
-}
-
-function extractFullSell(tx, trackedWallet) {
-  const meta = tx?.meta; if (!meta) return null;
-  const preBals = meta.preTokenBalances ?? []; const postBals = meta.postTokenBalances ?? [];
-  const accountKeys = (tx?.transaction?.message?.accountKeys ?? []).map(k => typeof k === 'string' ? k : (k?.pubkey ?? ''));
-  function resolveOwner(b) { if (b.owner) return b.owner; const idx = b.accountIndex; return (idx !== undefined && accountKeys[idx]) ? accountKeys[idx] : null; }
-  for (const pre of preBals) {
-    if (!pre.mint || pre.mint === SOL_MINT || !sellWatchlist[pre.mint]) continue;
-    const owner = resolveOwner(pre); if (!owner || owner !== trackedWallet) continue;
-    const preAmt = parseFloat(pre.uiTokenAmount?.uiAmountString ?? pre.uiTokenAmount?.amount ?? '0'); if (preAmt <= 0) continue;
-    const post = postBals.find(p => p.mint === pre.mint && resolveOwner(p) === trackedWallet);
-    const postAmt = post ? parseFloat(post.uiTokenAmount?.uiAmountString ?? post.uiTokenAmount?.amount ?? '0') : 0;
-    if (postAmt === 0) { log(`[SELL] Full exit: ${trackedWallet.substring(0,8)} sold ${pre.mint.substring(0,8)}`); return pre.mint; }
-  }
-  return null;
-}
-
-function sendSellSignal(tokenMint, entry) {
-  const elapsed = Math.floor(Date.now() / 1000) - entry.signalTime;
-  const elapsedStr = elapsed >= 60 ? `${Math.floor(elapsed/60)}m ${elapsed%60}s` : `${elapsed}s`;
-  const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-  sendTelegram(`🚨 <b>SELL Signal — All Wallets Exited</b>\n\nToken: #${entry.symbol}\nContract: <code>${tokenMint}</code>\nWallets Exited: ${entry.wallets.size}/${entry.wallets.size}\nTime Since Buy Signal: ${elapsedStr}\nSignal Time: ${signalTime}\n\n<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`, CHAT_ID_SLOW);
-  log(`[SELL] 🚨 Sell signal fired for #${entry.symbol}`);
-}
-
-async function handlePotentialSell(trackedWallet, tx) {
-  const soldMint = extractFullSell(tx, trackedWallet); if (!soldMint) return;
-  const entry = sellWatchlist[soldMint]; if (!entry || !entry.wallets.has(trackedWallet)) return;
-  entry.exited.add(trackedWallet);
-  log(`[SELL] ${trackedWallet.substring(0,8)} exited #${entry.symbol} | ${entry.exited.size}/${entry.wallets.size}`);
-  if (entry.exited.size >= entry.wallets.size) { sendSellSignal(soldMint, entry); delete sellWatchlist[soldMint]; }
 }
 
 async function gmgnGet(path, params = {}) {
@@ -433,10 +406,6 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
     const freshWallets = freshWalletsFromInfo??freshWalletsFromSecurity;
     const sameNameCount = await fetchSameNameCount(tokenMint, symbol);
     if (!shouldFireSignal(tokenMint,symbol,sameNameCount,devWallet,devAthMc)) return;
-    if (coordinatedWallets&&coordinatedWallets.size>0) {
-      sellWatchlist[tokenMint]={wallets:new Set(coordinatedWallets),exited:new Set(),symbol:symbol!=='UNKNOWN'?symbol:tokenMint.substring(0,8),signalTime:Math.floor(Date.now()/1000)};
-      log(`[SELL] Watching ${coordinatedWallets.size} wallets for exits on #${sellWatchlist[tokenMint].symbol}`);
-    }
     const notableHolders = await fetchNotableHolders(tokenMint);
     let notableLine='';
     if(notableHolders.length>0){notableLine=`\n\n💰 <b>Notable Holders (>$50k wallet)</b>\n`+notableHolders.map(h=>`  • <code>${h.addr}</code> — ${h.valStr}${h.pctStr}`).join('\n');}
@@ -542,8 +511,7 @@ async function processLogNotification(params) {
   if (value.err!==null&&value.err!==undefined) return;
   const signature=value.signature; const trackedWallet=subIdToWallet[subId];
   if (!trackedWallet) return;
-  const hasSellWatches=Object.keys(sellWatchlist).length>0;
-  if (!isActiveHours()&&!hasSellWatches) return;
+  if (!isActiveHours()) return;
   log(`[LOG HIT] wallet ${trackedWallet.substring(0,8)} | sig ${signature.substring(0,12)}...`);
   if (pendingSigs.has(signature)) { log(`[DEBOUNCE] ${signature.substring(0,12)} already being processed`); return; }
   pendingSigs.add(signature); setTimeout(()=>pendingSigs.delete(signature),30000);
@@ -554,7 +522,6 @@ async function processLogNotification(params) {
     await new Promise(r=>setTimeout(r,2000));
   }
   if (!tx) { log(`[SKIP] Could not fetch tx ${signature.substring(0,12)}`); return; }
-  if (hasSellWatches) await handlePotentialSell(trackedWallet,tx);
   if (!isActiveHours()) return;
   const mint=extractMint(tx);
   if (!mint) { log(`[SKIP] No token mint in tx for ${trackedWallet.substring(0,8)}`); return; }
@@ -593,7 +560,7 @@ function connect(useUrl) {
 http.createServer((req,res)=>{
   if(req.url==='/logs'){res.writeHead(200,{'Content-Type':'text/plain'});res.end(logBuffer.join('\n'));return;}
   res.writeHead(200,{'Content-Type':'text/plain'});
-  res.end(`SOLANA FAST TRACKER (60s) — LIVE\nWS: ${wsReady?'connected':'reconnecting'}\nSubscriptions: ${Object.keys(subIdToWallet).length}/${WALLETS.length}\nFired alerts: ${firedAlerts.size}\nActive windows: ${Object.keys(activeAlerts).length}\nSell watchlist: ${Object.keys(sellWatchlist).length} token(s)\n\nHit /logs to see last 500 log lines\n`);
+  res.end(`SOLANA FAST TRACKER (60s) — LIVE\nWS: ${wsReady?'connected':'reconnecting'}\nSubscriptions: ${Object.keys(subIdToWallet).length}/${WALLETS.length}\nFired alerts: ${firedAlerts.size}\nActive windows: ${Object.keys(activeAlerts).length}\n\nHit /logs to see last 500 log lines\n`);
 }).listen(process.env.PORT||3000,()=>log(`[HTTP] Health server on port ${process.env.PORT||3000}`));
 
 log(`[START] Launching FAST tracker | ${WALLETS.length} wallets | 60s window | 60s max age | Active 11am-6pm ET`);
