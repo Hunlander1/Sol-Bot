@@ -113,7 +113,6 @@ const WALLETS = [
   "FgifQEkRkSSXZjf2cJ4c55BhVts2yrNKzmzBLLyicg8b","EFaQQTGywnD4CjQQvTugUiyVT4LV9G6MsWqiub8X6unN",
   "HUgpmqL6r4Z4iEZiVuNZ6J6QnAsSZpsL8giVyVtz3QhT",
   "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp","bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa",
-  "7moqFjvm2MwAiMtCZoqYoTAPzRBxxMRT2ddyHThQuWjr",
   "DjM7Tu7whh6P3pGVBfDzwXAx2zaw51GJWrJE3PwtuN7s",
   "AvcWA3ngM55sSpjh1FZthmqA7V6BHo4f555a8w3Wv3ij",
   "J7nJ35d8EGU3fHCVCUun56C1MKakdoEQ38CFLHAhWDwP",
@@ -639,6 +638,8 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     setTimeout(() => delete devWalletCache[tokenMint], 600000);
   }
   if (devWalletCache[tokenMint] !== 'unknown' && trackedWallet === devWalletCache[tokenMint]) {
+    devSkipCache.add(`${trackedWallet}:${tokenMint}`);
+    setTimeout(() => devSkipCache.delete(`${trackedWallet}:${tokenMint}`), 600000);
     log(`[SKIP] ${trackedWallet.substring(0,8)} is dev`); return;
   }
 
@@ -706,6 +707,9 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
 
 
 // ── LOG NOTIFICATION PROCESSING ──────────────────────────────
+// Cache of "walletAddress:tokenMint" pairs confirmed as dev — skip RPC fetch entirely
+const devSkipCache = new Set();
+
 async function processLogNotification(params) {
   const value = params?.result?.value;
   const subId = params?.subscription;
@@ -721,8 +725,6 @@ async function processLogNotification(params) {
   pendingSigs.add(signature);
   setTimeout(() => pendingSigs.delete(signature), 30000);
 
-  // Limit concurrent RPC fetches to prevent memory spikes from wallet flooding
-
   let tx = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     tx = await getTransaction(signature);
@@ -733,6 +735,10 @@ async function processLogNotification(params) {
 
   const mint = extractMint(tx);
   if (!mint) return;
+
+  // Check dev skip cache before doing anything else — avoids all processing for flooding devs
+  const devKey = `${trackedWallet}:${mint}`;
+  if (devSkipCache.has(devKey)) return;
 
   if (!isActiveHours()) return;
 
