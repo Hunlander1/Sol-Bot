@@ -19,7 +19,7 @@ const SHYFT_API_KEY    = process.env.SHYFT_API_KEY;
 
 const SOL_MINT         = 'So11111111111111111111111111111111111111112';
 const WINDOW_SECS      = 300;
-const MAX_TOKEN_AGE    = 60;
+const MAX_TOKEN_AGE    = 900; // 15 minutes
 const STRICT_AGE_CHECK = true;
 const NOTABLE_HOLDER_THRESHOLD = 50_000;
 const SAME_NAME_THRESHOLD = 10;
