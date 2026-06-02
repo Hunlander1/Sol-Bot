@@ -13,10 +13,17 @@ const fs      = require('fs');
 const WebSocket = require('ws');
 
 const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN;
-const CHAT_ID          = process.env.CHAT_ID;
+const CHAT_ID          = process.env.CHAT_ID          || process.env.CHAT_ID_SLOW;
+const CHAT_ID_SLOW     = process.env.CHAT_ID_SLOW     || process.env.CHAT_ID;
+const CHAT_ID_FAST     = process.env.CHAT_ID_FAST;
 const GMGN_API_KEY     = process.env.GMGN_API_KEY;
 const SHYFT_API_KEY    = process.env.SHYFT_API_KEY;
 const HELIUS_API_KEY   = process.env.HELIUS_API_KEY;
+
+// ── FAST MIGRATION CONFIG ─────────────────────────────────────
+const FAST_MIG_MIN_WALLETS = 2;
+const FAST_MIG_MAX_AGE     = 30;   // seconds since mint
+const FAST_MIG_MIN_MC      = 38_000; // $38k market cap
 
 const SOL_MINT         = 'So11111111111111111111111111111111111111112';
 const WINDOW_SECS      = 300;
@@ -97,6 +104,8 @@ const WALLETS = [
 const WALLET_SET = new Set(WALLETS);
 
 let firedAlerts    = loadFiredAlerts();
+let migAlerts      = {};
+let migFired       = new Set();
 let activeAlerts   = {};
 let devWalletCache = {};
 let creationCache  = {};
@@ -219,7 +228,7 @@ function sendSellSignal(tokenMint, entry) {
   const elapsed = Math.floor(Date.now() / 1000) - entry.signalTime;
   const elapsedStr = elapsed >= 60 ? `${Math.floor(elapsed/60)}m ${elapsed%60}s` : `${elapsed}s`;
   const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-  sendTelegram(`🚨 <b>SELL Signal — All Wallets Exited</b>\n\nToken: #${entry.symbol}\nContract: <code>${tokenMint}</code>\nWallets Exited: ${entry.wallets.size}/${entry.wallets.size}\nTime Since Buy Signal: ${elapsedStr}\nSignal Time: ${signalTime}\n\n<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`);
+  sendTelegram(`🚨 <b>SELL Signal — All Wallets Exited</b>\n\nToken: #${entry.symbol}\nContract: <code>${tokenMint}</code>\nWallets Exited: ${entry.wallets.size}/${entry.wallets.size}\nTime Since Buy Signal: ${elapsedStr}\nSignal Time: ${signalTime}\n\n<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`, CHAT_ID_SLOW);
   log(`[SELL] 🚨 Sell signal fired for #${entry.symbol}`);
 }
 
@@ -337,12 +346,56 @@ async function getTokenAge(mint) {
   creationCache[mint]=ca; const age=now-ca; if(age>MAX_TOKEN_AGE){skipCache[mint]=true;return -1;} return age;
 }
 
-function sendTelegram(message) {
-  const body=JSON.stringify({chat_id:CHAT_ID,text:message,parse_mode:'HTML'});
+function sendTelegram(message, chatId) {
+  const target = chatId || CHAT_ID_SLOW || CHAT_ID;
+  const body=JSON.stringify({chat_id:target,text:message,parse_mode:'HTML'});
   const req=https.request({hostname:'api.telegram.org',path:`/bot${TELEGRAM_TOKEN}/sendMessage`,method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}},(res)=>{
-    let d=''; res.on('data',c=>d+=c); res.on('end',()=>{ try{const p=JSON.parse(d);if(!p.ok)log(`[TG Error] ${p.description}`);else log(`[TG] Signal delivered`);}catch{log(`[TG Error] Parse failed`);} });
+    let d=''; res.on('data',c=>d+=c); res.on('end',()=>{ try{const p=JSON.parse(d);if(!p.ok)log(`[TG Error] ${p.description}`);else log(`[TG] Delivered to ${target}`);}catch{log(`[TG Error] Parse failed`);} });
   });
   req.on('error',e=>log(`[TG ERR] ${e.message}`)); req.write(body); req.end();
+}
+
+// ── FAST MIGRATION SIGNAL ─────────────────────────────────────
+async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
+  try {
+    const now = Math.floor(Date.now()/1000);
+    let symbol='UNKNOWN', mintTimeStr='N/A', ageStr='N/A', liquidityStr='N/A', marketCapStr='N/A';
+    let devWallet=null, devAth='N/A';
+    if (tokenInfo) {
+      symbol = tokenInfo.symbol ?? 'UNKNOWN';
+      const ca = tokenInfo.creation_timestamp;
+      if (ca) {
+        mintTimeStr = new Date(ca*1000).toLocaleTimeString('en-US',{timeZone:'America/Toronto',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
+        const s = now-ca; ageStr = s<60?`${s}s`:`${Math.floor(s/60)}m ${s%60}s`;
+      }
+      const liq = parseFloat(tokenInfo.liquidity); if(!isNaN(liq)) liquidityStr=`$${liq.toLocaleString('en-US',{maximumFractionDigits:0})}`;
+      let mc = parseFloat(tokenInfo.market_cap??tokenInfo.usd_market_cap);
+      if(isNaN(mc)||mc===0){const p=parseFloat(tokenInfo.price);const s=parseFloat(tokenInfo.circulating_supply??tokenInfo.total_supply);if(!isNaN(p)&&!isNaN(s)&&p>0&&s>0)mc=p*s;}
+      if(!isNaN(mc)&&mc>0) marketCapStr=`$${mc.toLocaleString('en-US',{maximumFractionDigits:0})}`;
+      const ca2 = tokenInfo.dev?.creator_address; if(ca2) devWallet=ca2;
+      const athInfo = tokenInfo.dev?.ath_token_info;
+      if(athInfo?.ath_mc){const p=parseFloat(athInfo.ath_mc);if(!isNaN(p)){const sym=athInfo.symbol?` #${athInfo.symbol}`:'';devAth=p>=1_000_000?`$${(p/1_000_000).toFixed(1)}M${sym}`:`$${p.toLocaleString('en-US',{maximumFractionDigits:0})}${sym}`;}}
+    }
+    const buyerNames = coordWallets ? [...coordWallets].map(a => WALLET_NAMES[a] ?? a.substring(0,8)+'...').join(', ') : 'N/A';
+    const signalTime = new Date().toLocaleTimeString('en-US',{timeZone:'America/Toronto',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
+    sendTelegram(
+      `🚀 <b>Fast Migration Signal</b>\n\n` +
+      `Token: #${symbol}\n` +
+      `Contract: <code>${tokenMint}</code>\n` +
+      `Mint Time: ${mintTimeStr}\n` +
+      `Token Age: ${ageStr}\n` +
+      `Liquidity: ${liquidityStr}\n` +
+      `Market Cap: ${marketCapStr}\n` +
+      `Wallets: ${walletCount} bought within ${elapsed}s of mint\n` +
+      `Buyers: ${buyerNames}\n\n` +
+      `Dev Wallet: ${devWallet?`<code>${devWallet}</code>`:'N/A'}\n` +
+      `Dev ATH: ${devAth}\n\n` +
+      `Signal Time: ${signalTime}\n\n` +
+      `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`,
+      CHAT_ID_FAST
+    );
+    log(`[MIG] Signal sent for #${symbol} — ${walletCount} wallets in ${elapsed}s`);
+  } catch(e) { log(`[ERR] buildMigrationSignal: ${e.message}`); }
 }
 
 function shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc) {
@@ -388,10 +441,43 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
     let notableLine='';
     if(notableHolders.length>0){notableLine=`\n\n💰 <b>Notable Holders (>$50k wallet)</b>\n`+notableHolders.map(h=>`  • <code>${h.addr}</code> — ${h.valStr}${h.pctStr}`).join('\n');}
     const signalTime=new Date().toLocaleTimeString('en-US',{timeZone:'America/Toronto',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
-    sendTelegram(`⚡ <b>3-Wallet Fast Signal (60s)</b>\n\nToken: #${symbol}\nContract: <code>${tokenMint}</code>\nMint Time: ${mintTimeStr}\nToken Age: ${ageStr}\nLiquidity: ${liquidityStr}\nMarket Cap: ${marketCapStr}\nSame-Name Count (5h): ${sameNameCount!==null?sameNameCount:'?'}\nFresh Wallets: ${freshWallets!==null?freshWallets:'N/A'}\nWallets Coordinated: ${walletCount} within ${elapsed}s\n\nDev Wallet: ${devWallet?`<code>${devWallet}</code>`:'N/A'}\nDev ATH: ${devAth}${notableLine}\n\nSignal Time: ${signalTime}\n\n<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`);
+    sendTelegram(`🎯 <b>3-Wallet Signal (60s)</b>\n\nToken: #${symbol}\nContract: <code>${tokenMint}</code>\nMint Time: ${mintTimeStr}\nToken Age: ${ageStr}\nLiquidity: ${liquidityStr}\nMarket Cap: ${marketCapStr}\nSame-Name Count (5h): ${sameNameCount!==null?sameNameCount:'?'}\nFresh Wallets: ${freshWallets!==null?freshWallets:'N/A'}\nWallets Coordinated: ${walletCount} within ${elapsed}s\n\nDev Wallet: ${devWallet?`<code>${devWallet}</code>`:'N/A'}\nDev ATH: ${devAth}${notableLine}\n\nSignal Time: ${signalTime}\n\n<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`, CHAT_ID_SLOW);
     log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0,8)}) | Dev ATH: ${devAth} | Notable: ${notableHolders.length}`);
   } catch(e) { log(`[ERR] buildAndSendSignal: ${e.message}`); }
 }
+
+// ── WALLET NAMES ──────────────────────────────────────────────
+const WALLET_NAMES = {
+  "CzbN6T1gKkKutvuPXcxNmV8FLqzjsDWebWmg9o8e2ZbU":"Income Dev","H8s4GoDcABkvykQSS7mUSHTSKUcxivoULUXgZDkjuoUf":"Elon Dev",
+  "AmNMqM5VbPwtG14gLBdtrqZpQrhSzavLkQPufS8CQ7LB":"VDKH Dev","AMRsSeU5JpqwQWJGNLMpZzRCZSFEwYQYbMnms3dD4311":"Nothing Dev",
+  "2bBRwhGoL4fRZk6g8NnhBZywsF8PdLJnBRfWDCEMogD2":"Maga Dev","Aqje5DsN4u2PHmQxGF9PKfpsDGwQRCBhWeLKHCFhSMXk":"Eva Dev",
+  "HiSo5kykqDPs3EG14Fk9QY4B5RvkuEs8oJTiqPX3EDAn":"CL1 Dev","JDQKDrc1TQgBRvdFh56tkta5sYcDj1SoP52Eiu64rSrT":"ECC Dev",
+  "HyYNVYmnFmi87NsQqWzLJhUTPBKQUfgfhdbBa554nMFF":"Fartcoin Dev","GeUnv1jmtviRbR7Gu1JnXSGkUMUgFVBHuEVQVpTaUX1W":"Nothing Dev",
+  "78N177fzNJpp8pG49xDv1efYcTMSzo9tPTKEA9mAVkh2":"Sheep","8ZN71XTdVo8yRovnGLmNgW3Tgniw6A4J3JGLvPD686FP":"nate91 Dev",
+  "DPNPVvoGdwNBY849ryx2JZzakWuWbDTfSUYr8aNfKLwA":"Life Dev","Hp34goKgAhAYW6sw9iFAZofvDTr3DAhtkSKF1R9bAk2P":"Machi Dev",
+  "95ZCf3jKMHeFYvPXVZW3Ek6AEPDyjebosqnc7eNioVMo":"Win Dev","CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o":"Cented 7",
+  "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6":"Cooker","DAEdBmTPEKM6xkwfzC3d411QUe6coKpkND6UURa4CvHC":"Coinbase Dev",
+  "FSAmbD6jm6SZZQadSJeC1paX3oTtAiY9hTx1UYzVoXqj":"Z(BIOLLM Dev)","DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt":"Doc",
+  "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk":"Jijo","GH9yk8vgFvHnAD8JZqXxr3hBN1Lr1mJ9NPzrP5mVqiJe":"Eagy",
+  "7hkd2kdx4bMyuUDgktZvykDh69r8YkkrX4kf1sW2C8T6":"Lamb Dev","8ghYW6ftL5kUemfsoA9X37rz3ZnvyMSZRAx1kt1CxpoS":"Milady Ai Dev",
+  "GKaJNFDp2W5uCYfNKnTPN63tFXKgXgaDSfnTVfksBeq1":"Cartel Dev","DaKpjVJFxq3y4iZcEu12wzpXGCNBkQE587VNACUj15rT":"Xmas Dev",
+  "C4ARzqpvZ4gR3ta89H5Yz7UyPTpRm22BL5U91e5dHTSf":"Ikun Dev","BSFxyBwsHQsDXULygBpsTu6iUmfHUbCr6j4geZSN6YJG":"Ziggy Dev",
+  "9Zu8AigeXgFAajBTni2VWw6Wmz7XxDqHmY5nQwdCWAyY":"Moss Dev","9dkeTBYaHJzxVgVZqympcHmPeQvHtQv1sArZiZuwmhgp":"Chud Dev",
+  "AQdBYZNy3BZ1vouGUjA1w9Ay7aq7kH5UQSuh4LQWKotY":"Pfp Dev","HTM87R4mgjDdiF6Yfn8duK9vbDmZxiPCTRbGvm7eCAJY":"Priceless Dev",
+  "8i5U2uNBEuTc4zskYP14zbebDg2RSwrrG8REhEnJb97K":"Memeless Dev","7E9jfxCczubz4FXkkVKzUMHXGwzJxyppC4m7y3ew8ATg":"Mia Dev",
+  "8v6ztxZwhPBNmA6aGrBzzrt6UBf2fZZfsWqZ9Lt47Kpv":"Lmeow Dev","6nU2L7MQVUWjtdKHVpuZA9aind73nd3rXC4YFo8KQCy4":"VVM Dev",
+  "5zCkbcD74hFPeBHwYdwJLJAoLVgHX45AFeR7RzC8vFiD":"Charlie","8HeDT75s5g4CtCimH5B5nySqCiQhtWii8UnZhxBtFo38":"Lobstar Dev",
+  "A8Z1ejQGk45EJibBPJviWnM3UvwKSuYun53nSCkWKM52":"Punch Dev","D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA":"Imagine Dev",
+  "BZC7VEj5Y9Ege3cTRGBZW2zW7pjw3hpiSkcAoYKysvue":"Unipcs Dev","FgifQEkRkSSXZjf2cJ4c55BhVts2yrNKzmzBLLyicg8b":"Elephant Dev",
+  "EFaQQTGywnD4CjQQvTugUiyVT4LV9G6MsWqiub8X6unN":"Bob Dev","HUgpmqL6r4Z4iEZiVuNZ6J6QnAsSZpsL8giVyVtz3QhT":"Sparkles Dev",
+  "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp":"Pigeon Dev","bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa":"Copper Inu Dev",
+  "DjM7Tu7whh6P3pGVBfDzwXAx2zaw51GJWrJE3PwtuN7s":"CHILLHOUSE Dev","AvcWA3ngM55sSpjh1FZthmqA7V6BHo4f555a8w3Wv3ij":"Honeypot Dev",
+  "J7nJ35d8EGU3fHCVCUun56C1MKakdoEQ38CFLHAhWDwP":"Together Dev","nazikTJezTC3W2fxXE3wzs495PYzXMiq5o7co6YYACA":"YZY Dev",
+  "BtMBMPkoNbnLF9Xn552guQq528KKXcsNBNNBre3oaQtr":"Letterbomb(horse)","EYfdt8cNFyyTEJKp18dcoVbgUHDnM1SK3bT2uKj9XXHc":"Penguin Dev",
+  "EgQX9R3Qph1dPHE1Ysou1auSYqRGomCNmLDC28Yg77aq":"Smart 8","H5Wh4EDvWQT4mShH746V5VDqxHQkaQZyPWfuhy1PRVBg":"Bonkyo Dev",
+  "EeLjBXRELqrcWAXbnj8T4jQPS9Qh7UGWiKxovsJ36pZY":"LLM Dev","CfkaAru9ArJ2tAStYHvbAyRBJL3EhDzsWYV2KYg9shxB":"67 Dev",
+  "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f":"Cupsey","CtPxvpWo1pk7HtL6KwpCLMMdsXHC6fdqAN1bPiracaQq":"STINKDEX Dev",
+};
 
 async function handleWalletBuy(trackedWallet, tokenMint) {
   if (firedAlerts.has(tokenMint)) { log(`[SKIP] ${tokenMint.substring(0,8)} already signalled`); return; }
@@ -406,6 +492,36 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
   if (age===null) { if(STRICT_AGE_CHECK){log(`[SKIP] ${tokenMint.substring(0,8)} age unknown — strict mode rejects`);return;} log(`[WARN] Age unknown for ${tokenMint.substring(0,8)} — allowing`); }
   else log(`[AGE] ${tokenMint.substring(0,8)} is ${age<60?age+'s':Math.floor(age/60)+'m '+age%60+'s'} old`);
   const now=Math.floor(Date.now()/1000);
+
+  // ── FAST MIGRATION (11am-6pm ET) ──────────────────────────
+  if (isActiveHours() && !migFired.has(tokenMint) && CHAT_ID_FAST) {
+    const mintTs = creationCache[tokenMint] ?? null;
+    if (mintTs) {
+      const secsSinceMint = now - mintTs;
+      if (secsSinceMint <= FAST_MIG_MAX_AGE) {
+        if (!migAlerts[tokenMint]) migAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: mintTs };
+        migAlerts[tokenMint].wallets.add(trackedWallet);
+        const mc = migAlerts[tokenMint].wallets.size;
+        log(`[MIG] ${mc}/${FAST_MIG_MIN_WALLETS} for ${tokenMint.substring(0,8)} within ${secsSinceMint}s`);
+        if (mc >= FAST_MIG_MIN_WALLETS) {
+          const tokenInfo = await getCachedTokenInfo(tokenMint);
+          let tokenMC = parseFloat(tokenInfo?.market_cap ?? tokenInfo?.usd_market_cap ?? 0);
+          if ((isNaN(tokenMC)||tokenMC===0) && tokenInfo?.price && tokenInfo?.circulating_supply) {
+            tokenMC = parseFloat(tokenInfo.price) * parseFloat(tokenInfo.circulating_supply);
+          }
+          if (tokenMC >= FAST_MIG_MIN_MC) {
+            const coordWallets = new Set(migAlerts[tokenMint].wallets);
+            migFired.add(tokenMint);
+            delete migAlerts[tokenMint];
+            await buildMigrationSignal(tokenMint, mc, secsSinceMint, tokenInfo, coordWallets);
+          } else {
+            log(`[MIG] ${tokenMint.substring(0,8)} MC ${tokenMC>0?'$'+Math.round(tokenMC).toLocaleString():'unknown'} — below $${FAST_MIG_MIN_MC.toLocaleString()} threshold`);
+          }
+        }
+      }
+    }
+  }
+
   if (!activeAlerts[tokenMint]) activeAlerts[tokenMint]={wallets:new Set(),firstSeenAt:now};
   const entry=activeAlerts[tokenMint];
   if (now-entry.firstSeenAt>WINDOW_SECS) { log(`[RESET] ${tokenMint.substring(0,8)} window expired`); activeAlerts[tokenMint]={wallets:new Set(),firstSeenAt:now}; }
