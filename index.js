@@ -607,64 +607,6 @@ async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, 
   } catch(e) { log(`[ERR] buildMigrationSignal: ${e.message}`); }
 }
 
-async function buildFastSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
-  try {
-    const now = Math.floor(Date.now()/1000);
-    let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
-    let liquidityStr = 'N/A', marketCapStr = 'N/A';
-    let devWallet = null, devAth = 'N/A';
-    let freshWalletsFromInfo = null;
-
-    if (tokenInfo) {
-      symbol = tokenInfo.symbol ?? 'UNKNOWN';
-      const ca = tokenInfo.creation_timestamp;
-      if (ca) {
-        mintTimeStr = new Date(ca*1000).toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-        const s = now - ca; ageStr = s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
-      }
-      const liq = parseFloat(tokenInfo.liquidity);
-      if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
-      if (isNaN(mc) || mc === 0) { const p = parseFloat(tokenInfo.price); const s = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply); if (!isNaN(p) && !isNaN(s) && p > 0 && s > 0) mc = p*s; }
-      if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      const ca2 = tokenInfo.dev?.creator_address; if (ca2) devWallet = ca2;
-      const athInfo = tokenInfo.dev?.ath_token_info;
-      if (athInfo?.ath_mc) { const p = parseFloat(athInfo.ath_mc); if (!isNaN(p)) { devAth = p >= 1_000_000 ? `$${(p/1_000_000).toFixed(1)}M${athInfo.symbol?' #'+athInfo.symbol:''}` : `$${p.toLocaleString('en-US',{maximumFractionDigits:0})}${athInfo.symbol?' #'+athInfo.symbol:''}`; } }
-      const fw = tokenInfo.wallet_tags_stat?.fresh_wallets; if (fw != null) freshWalletsFromInfo = fw;
-    }
-
-    const freshWallets = freshWalletsFromInfo ?? await fetchFreshWallets(tokenMint);
-    const notableHolders = await fetchNotableHolders(tokenMint, tokenInfo);
-
-    let notableLine = '';
-    if (notableHolders.length > 0) {
-      notableLine = `\n\n💰 <b>Notable Holders (>$50k)</b>\n` +
-        notableHolders.map(h => `  • <code>${h.addr}</code> — ${h.valStr}${h.pctStr}`).join('\n');
-    }
-
-    const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-
-    sendTelegram(CHAT_ID_FAST,
-      `⚡ <b>5-Wallet Fast Signal (30s)</b>\n\n` +
-      `Token: #${symbol}\n` +
-      `Contract: <code>${tokenMint}</code>\n` +
-      `Mint Time: ${mintTimeStr}\n` +
-      `Token Age: ${ageStr}\n` +
-      `Liquidity: ${liquidityStr}\n` +
-      `Market Cap: ${marketCapStr}\n` +
-      `Fresh Wallets: ${freshWallets ?? 'N/A'}\n` +
-      `Wallets Coordinated: ${walletCount} within ${elapsed}s\n` +
-      `Wallets: ${[...coordWallets].map(a => walletName(a)).join(', ')}\n\n` +
-      `Dev Wallet: ${devWallet ? `<code>${devWallet}</code>` : 'N/A'}\n` +
-      `Dev ATH: ${devAth}` +
-      notableLine +
-      `\n\nSignal Time: ${signalTime}\n\n` +
-      `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
-    );
-    log(`[FAST] Signal sent for #${symbol}`);
-  } catch(e) { log(`[ERR] buildFastSignal: ${e.message}`); }
-}
-
 // ── SLOW BOT SIGNAL FILTER ────────────────────────────────────
 function slowShouldFire(symbol, sameNameCount, devWallet, devAthMc) {
   const devIsTracked = devWallet && devWallet !== 'N/A' && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
@@ -753,6 +695,53 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
 
 // ── COORDINATION LOGIC ────────────────────────────────────────
 const processing = new Set(); // synchronous guard against duplicate concurrent signals
+const migResolving = new Set(); // guard — one migration MC-resolver per token at a time
+
+// Resolve migration MC out-of-band so it never blocks the buy handler.
+// GMGN cached → GMGN fresh re-fetch → DexScreener. Fires if any clears the threshold.
+async function resolveMigration(tokenMint, now) {
+  try {
+    if (migFired.has(tokenMint)) return;
+    const tokenInfo = await getCachedTokenInfo(tokenMint);
+    let tokenMC = parseFloat(tokenInfo?.market_cap ?? tokenInfo?.usd_market_cap ?? 0);
+    if ((isNaN(tokenMC) || tokenMC === 0) && tokenInfo?.price && tokenInfo?.circulating_supply) {
+      tokenMC = parseFloat(tokenInfo.price) * parseFloat(tokenInfo.circulating_supply);
+    }
+    // Retry: cached info on a brand-new token often has no MC yet. Re-fetch fresh once.
+    let retryInfo = tokenInfo;
+    if (isNaN(tokenMC) || tokenMC === 0) {
+      log(`[MIG] ${tokenMint.substring(0,8)} MC unknown — retrying fresh fetch in 3s`);
+      await sleep(3000);
+      retryInfo = await fetchTokenInfo(tokenMint);
+      if (retryInfo) {
+        tokenInfoCache[tokenMint] = retryInfo;
+        tokenMC = parseFloat(retryInfo.market_cap ?? retryInfo.usd_market_cap ?? 0);
+        if ((isNaN(tokenMC) || tokenMC === 0) && retryInfo.price && retryInfo.circulating_supply) {
+          tokenMC = parseFloat(retryInfo.price) * parseFloat(retryInfo.circulating_supply);
+        }
+      }
+    }
+    // Fallback: GMGN still has no MC — try DexScreener
+    if (isNaN(tokenMC) || tokenMC === 0) {
+      log(`[MIG] ${tokenMint.substring(0,8)} MC still unknown — trying DexScreener`);
+      const dexMC = await fetchDexMarketCap(tokenMint);
+      if (dexMC > 0) { tokenMC = dexMC; log(`[MIG] ${tokenMint.substring(0,8)} DexScreener MC $${Math.round(dexMC).toLocaleString()}`); }
+    }
+    if (migFired.has(tokenMint)) return;
+    if (tokenMC >= FAST_MIG_MIN_MC) {
+      const entry = migAlerts[tokenMint];
+      const coordWallets = new Set(entry ? entry.wallets : []);
+      const elapsed = now - (entry ? entry.firstSeenAt : now);
+      migFired.add(tokenMint); saveSet('/tmp/sol_mig_fired.json', migFired);
+      delete migAlerts[tokenMint];
+      await buildMigrationSignal(tokenMint, coordWallets.size, elapsed, retryInfo, coordWallets);
+    } else {
+      log(`[MIG] ${tokenMint.substring(0,8)} MC ${tokenMC > 0 ? '$'+Math.round(tokenMC).toLocaleString() : 'unknown'} — below $${FAST_MIG_MIN_MC.toLocaleString()} threshold`);
+    }
+  } finally {
+    migResolving.delete(tokenMint);
+  }
+}
 
 async function handleWalletBuy(trackedWallet, tokenMint) {
   if (firedAlerts.has(tokenMint)) return;
@@ -779,70 +768,18 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
       migAlerts[tokenMint].wallets.add(trackedWallet);
       const mc = migAlerts[tokenMint].wallets.size;
       log(`[MIG] ${mc}/${FAST_MIG_MIN_WALLETS} for ${tokenMint.substring(0,8)} within ${migAge}s`);
-      if (mc >= FAST_MIG_MIN_WALLETS) {
-        const tokenInfo = await getCachedTokenInfo(tokenMint);
-        let tokenMC = parseFloat(tokenInfo?.market_cap ?? tokenInfo?.usd_market_cap ?? 0);
-        if ((isNaN(tokenMC) || tokenMC === 0) && tokenInfo?.price && tokenInfo?.circulating_supply) {
-          tokenMC = parseFloat(tokenInfo.price) * parseFloat(tokenInfo.circulating_supply);
-        }
-        // Retry: cached info on a brand-new token often has no MC yet. Re-fetch fresh once.
-        let retryInfo = tokenInfo;
-        if (isNaN(tokenMC) || tokenMC === 0) {
-          log(`[MIG] ${tokenMint.substring(0,8)} MC unknown — retrying fresh fetch in 3s`);
-          await sleep(3000);
-          retryInfo = await fetchTokenInfo(tokenMint);
-          if (retryInfo) {
-            tokenInfoCache[tokenMint] = retryInfo;
-            tokenMC = parseFloat(retryInfo.market_cap ?? retryInfo.usd_market_cap ?? 0);
-            if ((isNaN(tokenMC) || tokenMC === 0) && retryInfo.price && retryInfo.circulating_supply) {
-              tokenMC = parseFloat(retryInfo.price) * parseFloat(retryInfo.circulating_supply);
-            }
-          }
-        }
-        // Fallback: GMGN still has no MC — try DexScreener
-        if (isNaN(tokenMC) || tokenMC === 0) {
-          log(`[MIG] ${tokenMint.substring(0,8)} MC still unknown — trying DexScreener`);
-          const dexMC = await fetchDexMarketCap(tokenMint);
-          if (dexMC > 0) { tokenMC = dexMC; log(`[MIG] ${tokenMint.substring(0,8)} DexScreener MC $${Math.round(dexMC).toLocaleString()}`); }
-        }
-        if (tokenMC >= FAST_MIG_MIN_MC) {
-          const elapsed = now - migAlerts[tokenMint].firstSeenAt;
-          const coordWallets = new Set(migAlerts[tokenMint].wallets);
-          migFired.add(tokenMint); saveSet('/tmp/sol_mig_fired.json', migFired);
-          delete migAlerts[tokenMint];
-          await buildMigrationSignal(tokenMint, coordWallets.size, elapsed, retryInfo, coordWallets);
-        } else {
-          log(`[MIG] ${tokenMint.substring(0,8)} MC ${tokenMC > 0 ? '$'+Math.round(tokenMC).toLocaleString() : 'unknown'} — below $${FAST_MIG_MIN_MC.toLocaleString()} threshold`);
-        }
+      if (mc >= FAST_MIG_MIN_WALLETS && !migResolving.has(tokenMint)) {
+        migResolving.add(tokenMint); // guard — only one resolver per token, no await before this
+        resolveMigration(tokenMint, now).catch(e => {
+          log(`[ERR] resolveMigration: ${e.message}`);
+          migResolving.delete(tokenMint);
+        });
       }
     }
   }
 
   // ── FAST BOT ────────────────────────────────────────────
-  const fastAge = await getTokenAge(tokenMint, FAST_MAX_TOKEN_AGE, skipCacheFast);
-  if (fastAge !== -1 && fastAge !== null) {
-    if (!fastAlerts[tokenMint]) {
-      const mintTs = creationCache[tokenMint] ?? now;
-      fastAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: mintTs };
-    }
-    const fe = fastAlerts[tokenMint];
-    // Window pinned to mint time — 5 wallets must buy within 30s of mint, no rolling reset
-    const secsSinceMint = now - fe.firstSeenAt;
-    if (secsSinceMint <= FAST_MAX_TOKEN_AGE) {
-      fe.wallets.add(trackedWallet);
-      log(`[FAST] ${fe.wallets.size}/${FAST_MIN_WALLETS} for ${tokenMint.substring(0,8)} — ${secsSinceMint}s since mint`);
-      if (fe.wallets.size >= FAST_MIN_WALLETS) {
-        delete fastAlerts[tokenMint]; // synchronously first
-        firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
-        const coordWallets = new Set(fe.wallets);
-        const tokenInfo = await getCachedTokenInfo(tokenMint);
-        await buildFastSignal(tokenMint, fe.wallets.size, secsSinceMint, tokenInfo, coordWallets);
-        return;
-      }
-    } else {
-      delete fastAlerts[tokenMint]; // mint window expired
-    }
-  }
+  // (removed — only migration + slow signals are active)
 
   // ── SLOW BOT ────────────────────────────────────────────
   const slowAge = await getTokenAge(tokenMint, SLOW_MAX_TOKEN_AGE, skipCacheSlow);
@@ -975,7 +912,6 @@ function connect() {
 // ── CLEANUP ───────────────────────────────────────────────────
 setInterval(() => {
   const now = Math.floor(Date.now()/1000);
-  for (const mint of Object.keys(fastAlerts)) { if (now - fastAlerts[mint].firstSeenAt > FAST_WINDOW_SECS) delete fastAlerts[mint]; }
   for (const mint of Object.keys(migAlerts)) { if (now - migAlerts[mint].firstSeenAt > FAST_MIG_MAX_AGE * 2) delete migAlerts[mint]; }
   for (const mint of Object.keys(slowAlerts)) { if (now - slowAlerts[mint].firstSeenAt > SLOW_WINDOW_SECS) delete slowAlerts[mint]; }
 }, 60000);
@@ -993,7 +929,6 @@ http.createServer((req, res) => {
     `SOLANA COMBINED BOT — LIVE\n` +
     `WS: ${wsReady ? 'connected' : 'reconnecting'}\n` +
     `Subscriptions: ${Object.keys(subIdToWallet).length}/${WALLETS.length}\n` +
-    `Fast alerts: ${Object.keys(fastAlerts).length}\n` +
     `Migration alerts: ${Object.keys(migAlerts).length} | Migration fired: ${migFired.size}\n` +
     `Slow alerts: ${Object.keys(slowAlerts).length}\n` +
     `Fired (coord): ${firedAlerts.size}\n` +
