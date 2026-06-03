@@ -35,7 +35,7 @@ const FAST_MIG_MIN_WALLETS = 2;  // 2 tracked wallets (excluding dev)
 const FAST_MIG_MIN_MC      = 38_000; // $40k market cap threshold
 
 // ── SLOW BOT CONFIG ───────────────────────────────────────────
-const SLOW_WINDOW_SECS    = 300;
+const SLOW_WINDOW_SECS    = 900;
 const SLOW_MAX_TOKEN_AGE  = 3600;
 const SLOW_MIN_WALLETS    = 3;
 const SLOW_SAME_NAME_THRESHOLD = 10;
@@ -435,6 +435,20 @@ async function fetchSameNameCount(mint, symbol) {
   return null;
 }
 
+// Fallback MC source: read marketCap (or fdv) from DexScreener's Solana pair
+async function fetchDexMarketCap(mint) {
+  const r = await dexFetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  if (!r) return 0;
+  const pairs = r.pairs ?? r.data ?? [];
+  const solPairs = pairs.filter(p => (p.chainId ?? p.chain_id) === 'solana');
+  let best = 0;
+  for (const p of solPairs) {
+    const mc = parseFloat(p.marketCap ?? p.fdv ?? 0);
+    if (!isNaN(mc) && mc > best) best = mc;
+  }
+  return best;
+}
+
 // ── TOKEN AGE ─────────────────────────────────────────────────
 async function getTokenAge(mint, maxAge, skipCache) {
   const now = Math.floor(Date.now() / 1000);
@@ -771,12 +785,32 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
         if ((isNaN(tokenMC) || tokenMC === 0) && tokenInfo?.price && tokenInfo?.circulating_supply) {
           tokenMC = parseFloat(tokenInfo.price) * parseFloat(tokenInfo.circulating_supply);
         }
+        // Retry: cached info on a brand-new token often has no MC yet. Re-fetch fresh once.
+        let retryInfo = tokenInfo;
+        if (isNaN(tokenMC) || tokenMC === 0) {
+          log(`[MIG] ${tokenMint.substring(0,8)} MC unknown — retrying fresh fetch in 3s`);
+          await sleep(3000);
+          retryInfo = await fetchTokenInfo(tokenMint);
+          if (retryInfo) {
+            tokenInfoCache[tokenMint] = retryInfo;
+            tokenMC = parseFloat(retryInfo.market_cap ?? retryInfo.usd_market_cap ?? 0);
+            if ((isNaN(tokenMC) || tokenMC === 0) && retryInfo.price && retryInfo.circulating_supply) {
+              tokenMC = parseFloat(retryInfo.price) * parseFloat(retryInfo.circulating_supply);
+            }
+          }
+        }
+        // Fallback: GMGN still has no MC — try DexScreener
+        if (isNaN(tokenMC) || tokenMC === 0) {
+          log(`[MIG] ${tokenMint.substring(0,8)} MC still unknown — trying DexScreener`);
+          const dexMC = await fetchDexMarketCap(tokenMint);
+          if (dexMC > 0) { tokenMC = dexMC; log(`[MIG] ${tokenMint.substring(0,8)} DexScreener MC $${Math.round(dexMC).toLocaleString()}`); }
+        }
         if (tokenMC >= FAST_MIG_MIN_MC) {
           const elapsed = now - migAlerts[tokenMint].firstSeenAt;
           const coordWallets = new Set(migAlerts[tokenMint].wallets);
           migFired.add(tokenMint); saveSet('/tmp/sol_mig_fired.json', migFired);
           delete migAlerts[tokenMint];
-          await buildMigrationSignal(tokenMint, coordWallets.size, elapsed, tokenInfo, coordWallets);
+          await buildMigrationSignal(tokenMint, coordWallets.size, elapsed, retryInfo, coordWallets);
         } else {
           log(`[MIG] ${tokenMint.substring(0,8)} MC ${tokenMC > 0 ? '$'+Math.round(tokenMC).toLocaleString() : 'unknown'} — below $${FAST_MIG_MIN_MC.toLocaleString()} threshold`);
         }
