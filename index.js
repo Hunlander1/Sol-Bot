@@ -35,7 +35,7 @@ const FAST_MIG_MAX_AGE     = 30;   // seconds since mint
 const FAST_MIG_MIN_MC      = 38_000; // $38k market cap
 
 const SOL_MINT         = 'So11111111111111111111111111111111111111112';
-const WINDOW_SECS      = 300;
+const WINDOW_SECS      = 900; // 15 minutes
 const MAX_TOKEN_AGE    = 900; // 15 minutes
 const STRICT_AGE_CHECK = true;
 const NOTABLE_HOLDER_THRESHOLD = 50_000;
@@ -372,15 +372,17 @@ async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, 
 }
 
 function shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc) {
-  const devIsTracked = devWallet&&devWallet!=='unknown'&&WALLET_SET.has(devWallet);
-  const devAthPasses = devWallet&&devWallet!=='unknown'&&devAthMc!==null&&devAthMc>=DEV_ATH_THRESHOLD;
+  const devIsTracked  = devWallet&&devWallet!=='unknown'&&WALLET_SET.has(devWallet);
+  const devAthPasses  = devWallet&&devWallet!=='unknown'&&devAthMc!==null&&devAthMc>=DEV_ATH_THRESHOLD;
   const sameNamePasses = sameNameCount!==null&&sameNameCount>=SAME_NAME_THRESHOLD;
-  const devPasses = devAthPasses||devIsTracked;
-  if (sameNamePasses&&devPasses) { log(`[FILTER] ✅ PASS — same-name ${sameNameCount} AND dev passes`); return true; }
-  const snStr=sameNameCount!==null?sameNameCount:'?'; const athStr=devAthMc!==null?`$${devAthMc.toLocaleString()}`:'N/A';
-  if (!sameNamePasses&&!devPasses) log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${snStr}, dev ATH: ${athStr}`);
-  else if (!sameNamePasses) log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${snStr} (need >=${SAME_NAME_THRESHOLD}), dev would pass`);
-  else log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name passes but dev ATH: ${athStr}`);
+  const devPasses     = devAthPasses||devIsTracked;
+  if (sameNamePasses||devPasses) {
+    const reason = sameNamePasses ? `same-name ${sameNameCount}` : devAthPasses ? `dev ATH ${devAthMc.toLocaleString()}` : 'dev is tracked wallet';
+    log(`[FILTER] ✅ PASS — ${reason}`);
+    return true;
+  }
+  const snStr=sameNameCount!==null?sameNameCount:'?'; const athStr=devAthMc!==null?`${devAthMc.toLocaleString()}`:'N/A';
+  log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${snStr} (need >=${SAME_NAME_THRESHOLD}), dev ATH: ${athStr} (need >=${DEV_ATH_THRESHOLD.toLocaleString()})`);
   return false;
 }
 
