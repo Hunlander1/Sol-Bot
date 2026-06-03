@@ -463,7 +463,7 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
   const now=Math.floor(Date.now()/1000);
 
   // ── FAST MIGRATION (11am-6pm ET) ──────────────────────────
-  if (isActiveHours() && !migFired.has(tokenMint) && CHAT_ID_FAST) {
+  if (!migFired.has(tokenMint) && CHAT_ID_FAST) {
     const mintTs = creationCache[tokenMint] ?? null;
     if (mintTs) {
       const secsSinceMint = now - mintTs;
@@ -511,7 +511,7 @@ async function processLogNotification(params) {
   if (value.err!==null&&value.err!==undefined) return;
   const signature=value.signature; const trackedWallet=subIdToWallet[subId];
   if (!trackedWallet) return;
-  if (!isActiveHours()) return;
+
   log(`[LOG HIT] wallet ${trackedWallet.substring(0,8)} | sig ${signature.substring(0,12)}...`);
   if (pendingSigs.has(signature)) { log(`[DEBOUNCE] ${signature.substring(0,12)} already being processed`); return; }
   pendingSigs.add(signature); setTimeout(()=>pendingSigs.delete(signature),30000);
@@ -522,7 +522,7 @@ async function processLogNotification(params) {
     await new Promise(r=>setTimeout(r,2000));
   }
   if (!tx) { log(`[SKIP] Could not fetch tx ${signature.substring(0,12)}`); return; }
-  if (!isActiveHours()) return;
+
   const mint=extractMint(tx);
   if (!mint) { log(`[SKIP] No token mint in tx for ${trackedWallet.substring(0,8)}`); return; }
   log(`[MINT] ${trackedWallet.substring(0,8)} bought ${mint.substring(0,8)}`);
