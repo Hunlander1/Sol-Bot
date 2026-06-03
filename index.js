@@ -626,7 +626,6 @@ function slowShouldFire(symbol, sameNameCount, devWallet, devAthMc) {
 }
 
 async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
-  if (firedAlerts.has(tokenMint)) { log(`[SLOW] ${tokenMint.substring(0,8)} already fired — skipping duplicate`); return; }
   try {
     const now = Math.floor(Date.now()/1000);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
