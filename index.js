@@ -221,7 +221,7 @@ let slowAlerts  = {};
 
 
 let pendingSigs    = new Set();
-let devSkipPairs   = new Set(); // "wallet:mint" pairs known to be dev-on-own-token — drop silently
+let seenPairs      = new Set(); // "wallet:mint" pairs already processed once — only the first buy matters
 let walletEventTimes = {}; // wallet -> array of recent event timestamps (ms), for flood throttle
 
 // ── WS STATE ──────────────────────────────────────────────────
@@ -758,7 +758,6 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     setTimeout(() => delete devWalletCache[tokenMint], 600000);
   }
   if (devWalletCache[tokenMint] !== 'unknown' && trackedWallet === devWalletCache[tokenMint]) {
-    devSkipPairs.add(`${trackedWallet}:${tokenMint}`);
     log(`[SKIP] ${trackedWallet.substring(0,8)} is dev`); return;
   }
 
@@ -803,7 +802,10 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
       slowAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
     }
     se.wallets.add(trackedWallet);
-    log(`[SLOW] ${se.wallets.size}/${SLOW_MIN_WALLETS} for ${tokenMint.substring(0,8)} within ${now-se.firstSeenAt}s`);
+    if (se.wallets.size >= 2) {
+      const names = [...se.wallets].map(w => walletName(w)).join(', ');
+      log(`[SLOW] ${se.wallets.size}/${SLOW_MIN_WALLETS} for ${tokenMint} within ${now-se.firstSeenAt}s — wallets: ${names}`);
+    }
     if (se.wallets.size >= SLOW_MIN_WALLETS) {
       if (firedAlerts.has(tokenMint) || processing.has(tokenMint)) return;
       processing.add(tokenMint); // synchronous — no await between check and add
@@ -859,8 +861,11 @@ async function processLogNotification(params) {
   const mint = extractMint(tx);
   if (!mint) return;
 
-  // Dev buying its own token is never useful — drop repeats silently (no spam, no work)
-  if (devSkipPairs.has(`${trackedWallet}:${mint}`)) return;
+  // Only the first buy of a token by a given wallet matters (coordination counts distinct
+  // wallets). Drop every repeat of this wallet+token; record on first sight.
+  const pairKey = `${trackedWallet}:${mint}`;
+  if (seenPairs.has(pairKey)) return;
+  seenPairs.add(pairKey);
 
   log(`[MINT] ${trackedWallet.substring(0,8)} bought ${mint.substring(0,8)}`);
   await handleWalletBuy(trackedWallet, mint);
@@ -934,7 +939,7 @@ setInterval(() => {
   const now = Math.floor(Date.now()/1000);
   for (const mint of Object.keys(migAlerts)) { if (now - migAlerts[mint].firstSeenAt > FAST_MIG_MAX_AGE * 2) delete migAlerts[mint]; }
   for (const mint of Object.keys(slowAlerts)) { if (now - slowAlerts[mint].firstSeenAt > SLOW_WINDOW_SECS) delete slowAlerts[mint]; }
-  if (devSkipPairs.size > 5000) { devSkipPairs.clear(); log(`[CLEANUP] devSkipPairs cleared`); }
+  if (seenPairs.size > 20000) { seenPairs.clear(); log(`[CLEANUP] seenPairs cleared`); }
   const cutMs = Date.now() - 10000;
   for (const w of Object.keys(walletEventTimes)) {
     walletEventTimes[w] = walletEventTimes[w].filter(t => t > cutMs);
