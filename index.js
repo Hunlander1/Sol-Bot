@@ -221,6 +221,8 @@ let slowAlerts  = {};
 
 
 let pendingSigs    = new Set();
+let devSkipPairs   = new Set(); // "wallet:mint" pairs known to be dev-on-own-token — drop silently
+let walletEventTimes = {}; // wallet -> array of recent event timestamps (ms), for flood throttle
 
 // ── WS STATE ──────────────────────────────────────────────────
 let ws             = null;
@@ -562,7 +564,7 @@ function extractMint(tx) {
 
 
 // ── FAST BOT SIGNAL ───────────────────────────────────────────
-async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
+async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets, resolvedMC) {
   try {
     const now = Math.floor(Date.now()/1000);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
@@ -580,11 +582,15 @@ async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, 
       if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
       let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
       if (isNaN(mc) || mc === 0) { const p = parseFloat(tokenInfo.price); const s = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply); if (!isNaN(p) && !isNaN(s) && p > 0 && s > 0) mc = p*s; }
+      if ((isNaN(mc) || mc === 0) && resolvedMC > 0) mc = resolvedMC; // fall back to the MC that cleared the threshold (e.g. DexScreener)
       if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
       const ca2 = tokenInfo.dev?.creator_address; if (ca2) devWallet = ca2;
       const athInfo = tokenInfo.dev?.ath_token_info;
       if (athInfo?.ath_mc) { const p = parseFloat(athInfo.ath_mc); if (!isNaN(p)) { devAth = p >= 1_000_000 ? `$${(p/1_000_000).toFixed(1)}M${athInfo.symbol?' #'+athInfo.symbol:''}` : `$${p.toLocaleString('en-US',{maximumFractionDigits:0})}${athInfo.symbol?' #'+athInfo.symbol:''}`; } }
     }
+
+    // If GMGN had no usable token info at all, still show the MC that cleared the threshold
+    if (!tokenInfo && resolvedMC > 0) marketCapStr = `$${resolvedMC.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 
     const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
@@ -734,7 +740,7 @@ async function resolveMigration(tokenMint, now) {
       const elapsed = now - (entry ? entry.firstSeenAt : now);
       migFired.add(tokenMint); saveSet('/tmp/sol_mig_fired.json', migFired);
       delete migAlerts[tokenMint];
-      await buildMigrationSignal(tokenMint, coordWallets.size, elapsed, retryInfo, coordWallets);
+      await buildMigrationSignal(tokenMint, coordWallets.size, elapsed, retryInfo, coordWallets, tokenMC);
     } else {
       log(`[MIG] ${tokenMint.substring(0,8)} MC ${tokenMC > 0 ? '$'+Math.round(tokenMC).toLocaleString() : 'unknown'} — below $${FAST_MIG_MIN_MC.toLocaleString()} threshold`);
     }
@@ -752,6 +758,7 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     setTimeout(() => delete devWalletCache[tokenMint], 600000);
   }
   if (devWalletCache[tokenMint] !== 'unknown' && trackedWallet === devWalletCache[tokenMint]) {
+    devSkipPairs.add(`${trackedWallet}:${tokenMint}`);
     log(`[SKIP] ${trackedWallet.substring(0,8)} is dev`); return;
   }
 
@@ -823,11 +830,23 @@ async function processLogNotification(params) {
   const trackedWallet = subIdToWallet[subId];
   if (!trackedWallet) return;
 
+  // #3: skip everything (including the tx fetch) outside active trading hours
+  if (!isActiveHours()) return;
+
   log(`[LOG HIT] wallet ${trackedWallet.substring(0,8)} | sig ${signature.substring(0,12)}...`);
 
   if (pendingSigs.has(signature)) { log(`[DEBOUNCE] ${signature.substring(0,12)}`); return; }
   pendingSigs.add(signature);
   setTimeout(() => pendingSigs.delete(signature), 30000);
+
+  // #1/#2: per-wallet flood throttle. A wallet firing absurdly fast (e.g. a dev spamming its
+  // own token) only ever counts once toward a coordination signal (Sets dedupe by wallet),
+  // so dropping its excess events here is safe and avoids hundreds of wasted getTransaction calls.
+  const nowMs = Date.now();
+  const times = (walletEventTimes[trackedWallet] ?? []).filter(t => nowMs - t < 10000);
+  times.push(nowMs);
+  walletEventTimes[trackedWallet] = times;
+  if (times.length > 30) return; // >30 events in 10s from one wallet — pathological flood, drop silently
 
   let tx = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -840,7 +859,8 @@ async function processLogNotification(params) {
   const mint = extractMint(tx);
   if (!mint) return;
 
-  if (!isActiveHours()) return;
+  // Dev buying its own token is never useful — drop repeats silently (no spam, no work)
+  if (devSkipPairs.has(`${trackedWallet}:${mint}`)) return;
 
   log(`[MINT] ${trackedWallet.substring(0,8)} bought ${mint.substring(0,8)}`);
   await handleWalletBuy(trackedWallet, mint);
@@ -914,6 +934,12 @@ setInterval(() => {
   const now = Math.floor(Date.now()/1000);
   for (const mint of Object.keys(migAlerts)) { if (now - migAlerts[mint].firstSeenAt > FAST_MIG_MAX_AGE * 2) delete migAlerts[mint]; }
   for (const mint of Object.keys(slowAlerts)) { if (now - slowAlerts[mint].firstSeenAt > SLOW_WINDOW_SECS) delete slowAlerts[mint]; }
+  if (devSkipPairs.size > 5000) { devSkipPairs.clear(); log(`[CLEANUP] devSkipPairs cleared`); }
+  const cutMs = Date.now() - 10000;
+  for (const w of Object.keys(walletEventTimes)) {
+    walletEventTimes[w] = walletEventTimes[w].filter(t => t > cutMs);
+    if (walletEventTimes[w].length === 0) delete walletEventTimes[w];
+  }
 }, 60000);
 
 // ── HEALTH CHECK ──────────────────────────────────────────────
