@@ -551,15 +551,32 @@ async function fetchNotableHolders(mint, tokenInfo) {
 }
 
 // ── MINT EXTRACTION ───────────────────────────────────────────
-function extractMint(tx) {
+// Returns the mint the TRACKED WALLET actually received in this tx (post balance > pre balance).
+// Returns null for sells, transfers out, or tokens that merely passed through other accounts —
+// this is what prevents false "wallet bought X" attributions.
+function extractMint(tx, trackedWallet) {
   const meta = tx?.meta; const msg = tx?.transaction?.message;
   if (!meta || !msg) return null;
   const postBals = meta.postTokenBalances ?? [];
-  const preBals = meta.preTokenBalances ?? [];
-  const preOwned = new Set(preBals.map(b => b.mint));
-  let mint = postBals.find(b => b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint))?.mint;
-  if (!mint) mint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
-  return mint ?? null;
+  const preBals  = meta.preTokenBalances ?? [];
+
+  // pre-balance amounts for the tracked wallet, keyed by mint
+  const preByMint = {};
+  for (const b of preBals) {
+    if (b.owner !== trackedWallet) continue;
+    preByMint[b.mint] = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0;
+  }
+
+  let bestMint = null, bestDelta = 0;
+  for (const b of postBals) {
+    if (b.owner !== trackedWallet) continue;          // only the tracked wallet's own accounts
+    if (!b.mint || b.mint === SOL_MINT) continue;     // ignore SOL/wSOL
+    const postAmt = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0;
+    const preAmt  = preByMint[b.mint] ?? 0;
+    const delta   = postAmt - preAmt;
+    if (delta > 0 && delta > bestDelta) { bestDelta = delta; bestMint = b.mint; } // genuine increase = a buy/receive
+  }
+  return bestMint;
 }
 
 
@@ -857,7 +874,7 @@ async function processLogNotification(params) {
   }
   if (!tx) return;
 
-  const mint = extractMint(tx);
+  const mint = extractMint(tx, trackedWallet);
   if (!mint) return;
 
   // Only the first buy of a token by a given wallet matters (coordination counts distinct
