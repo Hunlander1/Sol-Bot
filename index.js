@@ -229,6 +229,7 @@ let ws             = null;
 let wsReady        = false;
 let reconnectDelay = 5000;
 let usingFallback  = false;
+let intentionalClose = false; // true when we close the WS on purpose (after-hours shutdown)
 let subIdToWallet  = {};
 let reqIdToWallet  = {};
 let lastMessageAt  = Date.now();
@@ -892,6 +893,7 @@ const WATCHDOG_MS = 3 * 60 * 1000;
 
 setInterval(() => {
   if (!wsReady) return;
+  if (!isActiveHours()) return; // off-hours: scheduler handles shutdown, don't fight it
   const silent = Date.now() - lastMessageAt;
   if (silent > WATCHDOG_MS) {
     log(`[WS] Watchdog: ${Math.round(silent/1000)}s silent — reconnecting...`);
@@ -904,6 +906,7 @@ setInterval(() => {
 }, 60000);
 
 function connect() {
+  intentionalClose = false; // fresh connection — normal reconnect behavior applies
   const url = usingFallback ? WSS_FALLBACK : WSS_PRIMARY;
   log(`[WS] Connecting to ${usingFallback ? 'FALLBACK' : 'PRIMARY'}...`);
   ws = new WebSocket(url, { handshakeTimeout: 30000 });
@@ -943,6 +946,10 @@ function connect() {
   ws.on('error', e => log(`[WS] Error: ${e.message}`));
   ws.on('close', (code) => {
     wsReady = false;
+    if (intentionalClose) {
+      log(`[WS] Disconnected (${code}) — after-hours shutdown, will reconnect at 11am ET`);
+      return; // do NOT auto-reconnect; the scheduler will reconnect when active hours resume
+    }
     log(`[WS] Disconnected (${code}). Reconnecting in ${reconnectDelay/1000}s...`);
     if (reconnectDelay >= 30000 && !usingFallback) { usingFallback = true; reconnectDelay = 5000; }
     setTimeout(() => connect(), reconnectDelay);
@@ -992,12 +999,34 @@ https.get('https://api.ipify.org?format=json', (res) => {
   res.on('end', () => { try { log(`[IP] ${JSON.parse(d).ip}`); } catch {} });
 }).on('error', () => {});
 
-// Connect WebSocket
-connect();
+// Connect WebSocket only if we're currently within active hours; otherwise the
+// scheduler below will bring it up when the window opens.
+if (isActiveHours()) {
+  connect();
+} else {
+  log(`[SCHED] Outside active hours (11am–6pm ET) — idle until window opens`);
+}
 
-// Self-ping
+// ── ACTIVE-HOURS SCHEDULER ────────────────────────────────────
+// Brings the WS up at 11am ET and tears it down at 6pm ET so the bot is fully
+// idle after hours (no WS, no RPC, no self-ping → Render can sleep).
+setInterval(() => {
+  const active = isActiveHours();
+  if (active && !wsReady && (!ws || ws.readyState !== WebSocket.OPEN)) {
+    log(`[SCHED] Active hours started — connecting`);
+    usingFallback = false; reconnectDelay = 5000;
+    connect();
+  } else if (!active && (wsReady || (ws && ws.readyState === WebSocket.OPEN))) {
+    log(`[SCHED] Active hours ended — shutting down WS`);
+    intentionalClose = true; wsReady = false;
+    try { ws.close(); } catch(e) { try { ws.terminate(); } catch(e2) {} }
+  }
+}, 60000);
+
+// Self-ping — only during active hours, so Render can sleep after hours
 if (RENDER_URL) {
   setInterval(() => {
+    if (!isActiveHours()) return;
     const mod = RENDER_URL.startsWith('https') ? https : http;
     mod.get(RENDER_URL + '/', res => log(`[PING] ${res.statusCode}`))
       .on('error', e => log(`[PING] ${e.message}`));
