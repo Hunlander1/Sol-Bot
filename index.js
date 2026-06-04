@@ -576,6 +576,20 @@ function extractMint(tx, trackedWallet) {
     const delta   = postAmt - preAmt;
     if (delta > 0 && delta > bestDelta) { bestDelta = delta; bestMint = b.mint; } // genuine increase = a buy/receive
   }
+
+  // TEMP DIAGNOSTIC: if we found no buy but the wallet did have non-SOL token balances in this
+  // tx, log what we saw so we can tell "correct reject of a non-buy" from "missed a real buy".
+  if (!bestMint) {
+    const ownPost = postBals.filter(b => b.owner === trackedWallet && b.mint && b.mint !== SOL_MINT);
+    if (ownPost.length) {
+      const detail = ownPost.map(b => {
+        const post = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0;
+        const pre  = preByMint[b.mint] ?? 0;
+        return `${b.mint.substring(0,8)} pre=${pre} post=${post}`;
+      }).join(' | ');
+      log(`[DIAG] no-buy for ${trackedWallet.substring(0,8)}: ${detail}`);
+    }
+  }
   return bestMint;
 }
 
@@ -674,7 +688,12 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
     let sameNameCount = null;
     if (!devAthPassesAlready && !devIsTrackedAlready) {
       log(`[SLOW] Fetching same-name count for #${symbol} (${tokenMint.substring(0,8)})`);
-      sameNameCount = await fetchSameNameCount(tokenMint, symbol);
+      // Timeout guard: a hung/rate-limited DexScreener call must not freeze the signal.
+      // On timeout, treat same-name as null — the OR filter can still fire on the dev condition.
+      sameNameCount = await Promise.race([
+        fetchSameNameCount(tokenMint, symbol),
+        new Promise(resolve => setTimeout(() => resolve(null), 20000)),
+      ]);
       log(`[SLOW] Same-name result: ${sameNameCount ?? 'null'} for #${symbol}`);
     } else {
       log(`[SLOW FILTER] ✅ Dev passes immediately — skipping DexScreener`);
@@ -851,9 +870,7 @@ async function processLogNotification(params) {
   // #3: skip everything (including the tx fetch) outside active trading hours
   if (!isActiveHours()) return;
 
-  log(`[LOG HIT] wallet ${trackedWallet.substring(0,8)} | sig ${signature.substring(0,12)}...`);
-
-  if (pendingSigs.has(signature)) { log(`[DEBOUNCE] ${signature.substring(0,12)}`); return; }
+  if (pendingSigs.has(signature)) { return; }
   pendingSigs.add(signature);
   setTimeout(() => pendingSigs.delete(signature), 30000);
 
@@ -865,6 +882,8 @@ async function processLogNotification(params) {
   times.push(nowMs);
   walletEventTimes[trackedWallet] = times;
   if (times.length > 30) return; // >30 events in 10s from one wallet — pathological flood, drop silently
+
+  log(`[LOG HIT] wallet ${trackedWallet.substring(0,8)} | sig ${signature.substring(0,12)}...`);
 
   let tx = null;
   for (let attempt = 0; attempt < 3; attempt++) {
