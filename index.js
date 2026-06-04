@@ -576,20 +576,6 @@ function extractMint(tx, trackedWallet) {
     const delta   = postAmt - preAmt;
     if (delta > 0 && delta > bestDelta) { bestDelta = delta; bestMint = b.mint; } // genuine increase = a buy/receive
   }
-
-  // TEMP DIAGNOSTIC: if we found no buy but the wallet did have non-SOL token balances in this
-  // tx, log what we saw so we can tell "correct reject of a non-buy" from "missed a real buy".
-  if (!bestMint) {
-    const ownPost = postBals.filter(b => b.owner === trackedWallet && b.mint && b.mint !== SOL_MINT);
-    if (ownPost.length) {
-      const detail = ownPost.map(b => {
-        const post = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0;
-        const pre  = preByMint[b.mint] ?? 0;
-        return `${b.mint.substring(0,8)} pre=${pre} post=${post}`;
-      }).join(' | ');
-      log(`[DIAG] no-buy for ${trackedWallet.substring(0,8)}: ${detail}`);
-    }
-  }
   return bestMint;
 }
 
@@ -881,7 +867,7 @@ async function processLogNotification(params) {
   const times = (walletEventTimes[trackedWallet] ?? []).filter(t => nowMs - t < 10000);
   times.push(nowMs);
   walletEventTimes[trackedWallet] = times;
-  if (times.length > 30) return; // >30 events in 10s from one wallet — pathological flood, drop silently
+  if (times.length > 15) return; // >15 events in 10s from one wallet — flood/dump, drop silently (a real coordinated buy never bursts this fast on one wallet)
 
   log(`[LOG HIT] wallet ${trackedWallet.substring(0,8)} | sig ${signature.substring(0,12)}...`);
 
