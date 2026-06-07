@@ -414,47 +414,38 @@ async function fetchSameNameCount(mint, symbol) {
   const cutoff = 5 * 3600;
 
   function countMatches(pairs, sym, excludeMint) {
-    return pairs.filter(pair => {
-      if ((pair.chainId ?? pair.chain_id) !== 'solana') return false;
-      if (pair.baseToken?.symbol?.toUpperCase() !== sym.toUpperCase()) return false;
-      if (pair.baseToken?.address === excludeMint) return false;
+    const uniqueMints = new Set();
+    for (const pair of pairs) {
+      if ((pair.chainId ?? pair.chain_id) !== 'solana') continue;
+      if (pair.baseToken?.symbol?.toUpperCase() !== sym.toUpperCase()) continue;
+      const addr = pair.baseToken?.address;
+      if (!addr || addr === excludeMint) continue;
       const createdAt = pair.pairCreatedAt ?? pair.pair_created_at;
-      if (!createdAt) return false;
+      if (!createdAt) continue;
       const ageSecs = nowSecs - Math.floor(createdAt / 1000);
-      return ageSecs >= 0 && ageSecs <= cutoff;
-    }).length;
-  }
-
-  // ── PATH 1: direct mint lookup (primary) ──────────────────────────────
-  await new Promise(r => setTimeout(r, 4000));
-  log(`[Dex] Fetching pairs for mint ${mint.substring(0, 8)}...`);
-  const r1 = await dexFetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-  if (r1) {
-    const pairs = r1.pairs ?? r1.data ?? [];
-    const resolvedSymbol = (symbol && symbol !== 'UNKNOWN') ? symbol : (pairs.find(p => p.chainId === 'solana')?.baseToken?.symbol ?? null);
-    if (resolvedSymbol) {
-      const count = countMatches(pairs, resolvedSymbol, mint);
-      log(`[Dex] Mint lookup: ${resolvedSymbol} — ${count} same-name tokens in last 5h`);
-      return count;
+      if (ageSecs >= 0 && ageSecs <= cutoff) uniqueMints.add(addr); // dedupe: one token can have several pairs
     }
-    log(`[Dex] Mint lookup returned pairs but no symbol for ${mint.substring(0, 8)} — returning 0`);
-    return 0;
+    return uniqueMints.size;
   }
 
-  // ── PATH 2: symbol search fallback ────────────────────────────────────
-  if (symbol && symbol !== 'UNKNOWN') {
-    log(`[Dex] Mint lookup failed — trying symbol search for ${symbol}...`);
-    await new Promise(r => setTimeout(r, 3000));
-    const r2 = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`);
-    if (r2) {
-      const pairs = r2.pairs ?? r2.data ?? [];
-      const count = countMatches(pairs, symbol, mint);
-      log(`[Dex] Symbol search: ${symbol} — ${count} same-name tokens in last 5h`);
-      return count;
-    }
+  // Same-name = how many tokens with this exact symbol launched in the last 5h.
+  // This is a NAME search, independent of the current token — search DexScreener by symbol.
+  if (!symbol || symbol === 'UNKNOWN') {
+    log(`[Dex] No symbol for ${mint.substring(0, 8)} — can't do same-name search, returning null`);
+    return null;
   }
 
-  log(`[Dex] Both paths failed for ${mint.substring(0, 8)} — returning null`);
+  await new Promise(r => setTimeout(r, 1500)); // small breather after GMGN calls
+  log(`[Dex] Searching same-name for ${symbol}...`);
+  const r = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`);
+  if (r) {
+    const pairs = r.pairs ?? r.data ?? [];
+    const count = countMatches(pairs, symbol, mint);
+    log(`[Dex] Same-name search: ${symbol} — ${count} same-name tokens in last 5h`);
+    return count;
+  }
+
+  log(`[Dex] Same-name search failed for ${symbol} — returning null`);
   return null;
 }
 
@@ -699,7 +690,7 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
       // On timeout, treat same-name as null — the OR filter can still fire on the dev condition.
       sameNameCount = await Promise.race([
         fetchSameNameCount(tokenMint, symbol),
-        new Promise(resolve => setTimeout(() => resolve(null), 20000)),
+        new Promise(resolve => setTimeout(() => resolve(null), 30000)),
       ]);
       log(`[SLOW] Same-name result: ${sameNameCount ?? 'null'} for #${symbol}`);
     } else {
