@@ -124,6 +124,11 @@ const WALLETS = [
   "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", // Cupsey
   "CtPxvpWo1pk7HtL6KwpCLMMdsXHC6fdqAN1bPiracaQq", // STINKDEX Dev
   "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt", // Theo
+  "6TbDFs2dkHETrRWVbheiC11bwg7EWLDgszsCADF1ML1b", // Notable 1
+  "3dhwViJnxKhRJcJJznrVt6oYkuD1bULvsUXscuxpNBDs", // Notable 2
+  "5Pr7D2d5WUM7j8fMF36DuzVDDGEHLtYsF7a6ezyzFG19", // Notable 3
+  "2ycurSWTPqY6wcPEboA7ZGRu2xwsZD7b7MxdA74qC3Vo", // Notable 4
+  "FhZmTCs7enzPDN1RpgJPUcZPfX6FKJ9uqj7ch2jtggGW", // Notable 5
 ];
 const WALLET_SET = new Set(WALLETS);
 
@@ -212,6 +217,29 @@ const WALLET_NAMES = {
   "G6fUXjMKPJzCY1rveAE6Qm7wy5U3vZgKDJmN1VPAdiZC": "Clukz",
   // New wallet added
   "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt": "Theo",
+  // More names added from reconciliation
+  "Ar2Y6o1QmrRAskjii1cRfijeKugHH13ycxW5cd7rro1x": "Track 12",
+  "5aLY85pyxiuX3fd4RgM3Yc1e3MAL6b7UgaZz6MS3JUfG": "Track 9",
+  "7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5": "Track 13",
+  "BCnqsPEtA1TkgednYEebRpkmwFRJDCjMQcKZMMtEdArc": "Kreo",
+  "5ZuV8eqkvzYFVEKbLvGBdexL2tFv7E5BCd2HZpjqbdg": "Doji",
+  "FM1YCKED2KaqB8Uat8aB1nsffR1vezr7s6FAEieXJgke": "Pom Dev",
+  "AV7PjXHL5JXZ1YoYRoN9Dsstg1x2UciBupMCXcJP8gUz": "Butthole Dev",
+  "Dzp1SrZ474xwGp6ZEP6cNKo39u9zeXe1YAuTkyZyv3t4": "Distorted Dev",
+  "whamNNP9tHoxLg92yHvJPdYhghEoCg1qYTsh5a2oLbx": "Ziggy Dev",
+  "HdKJM6Lvfp9aV9tvEMC8AD4GnsbFgMUkHLoK923Sn1ET": "Chaos",
+  "5FqUo9aBjsp7QeeyN6Vi2ZmF2fjS4H5EU7wnAQwPy17z": "Aloka Dev",
+  "7hHmfYYR7L8LsCKk5akjtvVu1BbJRgHGJ2n6s7gbeKG4": "Goldcoin",
+  "CjtqWn4toBbJ1feRZBDhz3TwBjbZm5RpES8rvKWTuNtk": "Vibecodoor",
+  "FAX4qRQdiSj2iWDYvkJ21VieVCXGREtwMhEyAHSJ1aqp": "Petah Dev",
+  "9VXuNqqqzniYYW3fRDeaCtUUtqWsEeWWn5umh3aF9h17": "Cancer Dev",
+  "iPUp3qkm39ycMGbywWFMUyvaDhiiPGXeWXaDtmHNe6C": "Runner Dev",
+  // New Notable wallets
+  "6TbDFs2dkHETrRWVbheiC11bwg7EWLDgszsCADF1ML1b": "Notable 1",
+  "3dhwViJnxKhRJcJJznrVt6oYkuD1bULvsUXscuxpNBDs": "Notable 2",
+  "5Pr7D2d5WUM7j8fMF36DuzVDDGEHLtYsF7a6ezyzFG19": "Notable 3",
+  "2ycurSWTPqY6wcPEboA7ZGRu2xwsZD7b7MxdA74qC3Vo": "Notable 4",
+  "FhZmTCs7enzPDN1RpgJPUcZPfX6FKJ9uqj7ch2jtggGW": "Notable 5",
 };
 
 function walletName(addr) {
