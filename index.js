@@ -817,6 +817,11 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     const devInfo = await getCachedTokenInfo(tokenMint);
     devWalletCache[tokenMint] = devInfo?.dev?.creator_address ?? 'unknown';
     setTimeout(() => delete devWalletCache[tokenMint], 600000);
+    // We already have token info here — cache the mint time so the migration
+    // check below works on the FIRST buy (it needs creationCache populated).
+    if (devInfo?.creation_timestamp && !creationCache[tokenMint]) {
+      creationCache[tokenMint] = devInfo.creation_timestamp;
+    }
   }
   if (devWalletCache[tokenMint] !== 'unknown' && trackedWallet === devWalletCache[tokenMint]) {
     log(`[SKIP] ${trackedWallet.substring(0,8)} is dev`); return;
