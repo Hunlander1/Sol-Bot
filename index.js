@@ -977,14 +977,20 @@ function connect() {
   ws = new WebSocket(url, { handshakeTimeout: 30000 });
   subIdToWallet = {}; reqIdToWallet = {}; wsReady = false;
 
-  ws.on('open', () => {
+  ws.on('open', async () => {
     log(`[WS] Connected — subscribing to ${WALLETS.length} wallets...`);
     wsReady = true; reconnectDelay = 5000; lastMessageAt = Date.now();
-    WALLETS.forEach((wallet, i) => {
+    // Send subscriptions PACED, not all at once. A burst of 100+ logsSubscribe
+    // messages the instant the socket opens trips public-RPC rate limits (close 1013).
+    // ~40ms apart spreads 109 subs over ~4-5s, which the server accepts.
+    for (let i = 0; i < WALLETS.length; i++) {
+      if (ws.readyState !== WebSocket.OPEN) { log(`[WS] Socket closed mid-subscribe at ${i}/${WALLETS.length}`); return; }
+      const wallet = WALLETS[i];
       const reqId = i + 1; reqIdToWallet[reqId] = wallet;
       ws.send(JSON.stringify({ jsonrpc: '2.0', id: reqId, method: 'logsSubscribe',
         params: [{ mentions: [wallet] }, { commitment: 'confirmed' }] }));
-    });
+      await sleep(40);
+    }
     log(`[WS] All ${WALLETS.length} subscriptions sent`);
     const pi = setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.ping(); else clearInterval(pi); }, 30000);
   });
