@@ -129,6 +129,15 @@ const WALLETS = [
   "5Pr7D2d5WUM7j8fMF36DuzVDDGEHLtYsF7a6ezyzFG19", // Notable 3
   "2ycurSWTPqY6wcPEboA7ZGRu2xwsZD7b7MxdA74qC3Vo", // Notable 4
   "FhZmTCs7enzPDN1RpgJPUcZPfX6FKJ9uqj7ch2jtggGW", // Notable 5
+  "EM1ZyNA3g4rr9MBzSEA36QqWd7t7cp54zDidm3YskyeU", // Notable 6
+  "PMJA8UQDyWTFw2Smhyp9jGA6aTaP7jKHR7BPudrgyYN", // Notable 7
+  "J2L495ZPcJ6Btuyd4YqXz5uw7hpKiQXGcLvALwumabED", // Notable 8
+  "JDd3hy3gQn2V982mi1zqhNqUw1GfV2UL6g76STojCJPN", // West
+  "2gSzFCwozvNBHH3sDNHAJxwqbAXvL93brVapmSWTExU3", // Notable 9
+  "BLw4fXAc9P7NYhnRH9GyccXKUmvpUSiqc67BGbanxcDp", // Notable 10
+  "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT", // trunoest
+  "AmdAbVa17PbsL8kqPmL4A1PyxnLveRfjM5eLrCMz3nKY", // Notable 11
+  "GdRSPexhxbQz5H2zFQrNN2BAZUqEjAULBigTPvQ6oDMP", // NNC Dev
 ];
 const WALLET_SET = new Set(WALLETS);
 
@@ -240,6 +249,15 @@ const WALLET_NAMES = {
   "5Pr7D2d5WUM7j8fMF36DuzVDDGEHLtYsF7a6ezyzFG19": "Notable 3",
   "2ycurSWTPqY6wcPEboA7ZGRu2xwsZD7b7MxdA74qC3Vo": "Notable 4",
   "FhZmTCs7enzPDN1RpgJPUcZPfX6FKJ9uqj7ch2jtggGW": "Notable 5",
+  "EM1ZyNA3g4rr9MBzSEA36QqWd7t7cp54zDidm3YskyeU": "Notable 6",
+  "PMJA8UQDyWTFw2Smhyp9jGA6aTaP7jKHR7BPudrgyYN": "Notable 7",
+  "J2L495ZPcJ6Btuyd4YqXz5uw7hpKiQXGcLvALwumabED": "Notable 8",
+  "JDd3hy3gQn2V982mi1zqhNqUw1GfV2UL6g76STojCJPN": "West",
+  "2gSzFCwozvNBHH3sDNHAJxwqbAXvL93brVapmSWTExU3": "Notable 9",
+  "BLw4fXAc9P7NYhnRH9GyccXKUmvpUSiqc67BGbanxcDp": "Notable 10",
+  "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT": "trunoest",
+  "AmdAbVa17PbsL8kqPmL4A1PyxnLveRfjM5eLrCMz3nKY": "Notable 11",
+  "GdRSPexhxbQz5H2zFQrNN2BAZUqEjAULBigTPvQ6oDMP": "NNC Dev",
 };
 
 function walletName(addr) {
