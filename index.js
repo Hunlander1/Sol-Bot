@@ -32,7 +32,8 @@ const FAST_MIN_WALLETS    = 5;
 // ── FAST MIGRATION CONFIG ────────────────────────────────────
 const FAST_MIG_MAX_AGE    = 30;  // token must hit MC threshold within 30s of mint
 const FAST_MIG_MIN_WALLETS = 2;  // 2 tracked wallets (excluding dev)
-const FAST_MIG_MIN_MC      = 38_000; // $40k market cap threshold
+const FAST_MIG_MIN_MC      = 38_000; // pump.fun migration ~$38k market cap threshold
+const FAST_MIG_MIN_MC_BAGS = 375_000; // Bags tokens (mint ends 'bags') migrate at ~$375k
 
 // ── SLOW BOT CONFIG ───────────────────────────────────────────
 const SLOW_WINDOW_SECS    = 900;
@@ -793,7 +794,9 @@ async function resolveMigration(tokenMint, now) {
       if (dexMC > 0) { tokenMC = dexMC; log(`[MIG] ${tokenMint.substring(0,8)} DexScreener MC $${Math.round(dexMC).toLocaleString()}`); }
     }
     if (migFired.has(tokenMint)) return;
-    if (tokenMC >= FAST_MIG_MIN_MC) {
+    // Bags tokens migrate at a higher MC (~$375k) than pump.fun (~$38k). Pick threshold by mint suffix.
+    const migThreshold = tokenMint.toLowerCase().endsWith('bags') ? FAST_MIG_MIN_MC_BAGS : FAST_MIG_MIN_MC;
+    if (tokenMC >= migThreshold) {
       const entry = migAlerts[tokenMint];
       const coordWallets = new Set(entry ? entry.wallets : []);
       const elapsed = now - (entry ? entry.firstSeenAt : now);
@@ -801,7 +804,7 @@ async function resolveMigration(tokenMint, now) {
       delete migAlerts[tokenMint];
       await buildMigrationSignal(tokenMint, coordWallets.size, elapsed, retryInfo, coordWallets, tokenMC);
     } else {
-      log(`[MIG] ${tokenMint.substring(0,8)} MC ${tokenMC > 0 ? '$'+Math.round(tokenMC).toLocaleString() : 'unknown'} — below $${FAST_MIG_MIN_MC.toLocaleString()} threshold`);
+      log(`[MIG] ${tokenMint.substring(0,8)} MC ${tokenMC > 0 ? '$'+Math.round(tokenMC).toLocaleString() : 'unknown'} — below $${migThreshold.toLocaleString()} threshold`);
     }
   } finally {
     migResolving.delete(tokenMint);
