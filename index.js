@@ -683,6 +683,8 @@ function slowShouldFire(symbol, sameNameCount, devWallet, devAthMc) {
 
 async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
   try {
+    const t0 = Date.now();
+    log(`[TIMING] buildSlowSignal ENTER ${tokenMint.substring(0,8)} | tokenInfo=${tokenInfo ? 'present' : 'NULL'} | devATH_raw=${tokenInfo?.dev?.ath_token_info?.ath_mc ?? 'none'}`);
     const now = Math.floor(Date.now()/1000);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
     let liquidityStr = 'N/A', marketCapStr = 'N/A';
@@ -709,6 +711,7 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
 
     const devAthPassesAlready = devAthMc !== null && devAthMc >= SLOW_DEV_ATH_THRESHOLD;
     const devIsTrackedAlready = devWallet && devWallet !== 'N/A' && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
+    log(`[TIMING] dev decision ${tokenMint.substring(0,8)} | devAthMc=${devAthMc ?? 'null'} | devAthPasses=${devAthPassesAlready} | devTracked=${devIsTrackedAlready} | will ${(!devAthPassesAlready && !devIsTrackedAlready) ? 'FETCH same-name (slow path)' : 'SKIP same-name (fast path)'}`);
 
     let sameNameCount = null;
     if (!devAthPassesAlready && !devIsTrackedAlready) {
@@ -755,6 +758,7 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
       `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
     );
     log(`[SLOW] Signal sent for #${symbol}`);
+    log(`[TIMING] buildSlowSignal TOTAL ${tokenMint.substring(0,8)} took ${Date.now()-t0}ms`);
   } catch(e) { log(`[ERR] buildSlowSignal: ${e.message}`); }
 }
 
@@ -880,7 +884,10 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
       delete slowAlerts[tokenMint];
       const elapsed = now - se.firstSeenAt;
       const coordWallets = new Set(se.wallets);
+      const tiA = Date.now();
+      log(`[TIMING] 2/2 hit ${tokenMint.substring(0,8)} — fetching tokenInfo before signal`);
       const tokenInfo = await getCachedTokenInfo(tokenMint);
+      log(`[TIMING] tokenInfo fetch took ${Date.now()-tiA}ms for ${tokenMint.substring(0,8)}`);
       await buildSlowSignal(tokenMint, se.wallets.size, elapsed, tokenInfo, coordWallets);
       processing.delete(tokenMint);
     }
