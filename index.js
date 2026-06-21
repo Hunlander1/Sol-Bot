@@ -490,6 +490,22 @@ async function fetchDexMarketCap(mint) {
   return best;
 }
 
+// 5-minute volume from DexScreener. DISPLAY-ONLY — this never gates or delays
+// a signal. It is called only AFTER a signal has already been cleared to fire,
+// and any failure/timeout returns null so the signal still sends with "N/A".
+async function fetchDexVolume5m(mint) {
+  const r = await dexFetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  if (!r) return null;
+  const pairs = r.pairs ?? r.data ?? [];
+  const solPairs = pairs.filter(p => (p.chainId ?? p.chain_id) === 'solana');
+  let best = null;
+  for (const p of solPairs) {
+    const v = parseFloat(p.volume?.m5 ?? 0);
+    if (!isNaN(v) && (best === null || v > best)) best = v;
+  }
+  return best;
+}
+
 // ── TOKEN AGE ─────────────────────────────────────────────────
 async function getTokenAge(mint, maxAge, skipCache) {
   const now = Math.floor(Date.now() / 1000);
@@ -648,6 +664,10 @@ async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, 
     // If GMGN had no usable token info at all, still show the MC that cleared the threshold
     if (!tokenInfo && resolvedMC > 0) marketCapStr = `$${resolvedMC.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 
+    // Display-only 5m volume (DexScreener). Runs after the signal is already cleared to fire.
+    const vol5m = await fetchDexVolume5m(tokenMint).catch(() => null);
+    const vol5mStr = (vol5m === null) ? 'N/A' : fmtUsd(vol5m);
+
     const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
     sendTelegram(CHAT_ID_FAST,
@@ -658,6 +678,7 @@ async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, 
       `Token Age at $40k: ${ageStr}\n` +
       `Liquidity: ${liquidityStr}\n` +
       `Market Cap: ${marketCapStr}\n` +
+      `Vol (5m): ${vol5mStr}\n` +
       `Wallets: ${walletCount} bought within ${elapsed}s of mint\n` +
       `Buyers: ${coordWallets ? [...coordWallets].map(a => walletName(a)).join(', ') : 'N/A'}\n\n` +
       `Dev Wallet: ${devWallet ? `<code>${devWallet}</code>` : 'N/A'}\n` +
@@ -730,6 +751,10 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
     if (!slowShouldFire(symbol, sameNameCount, devWallet, devAthMc)) return;
 
     const freshWallets = freshWalletsFromInfo ?? await fetchFreshWallets(tokenMint);
+    // Display-only 5m volume (DexScreener). Runs only after the signal has already
+    // passed slowShouldFire above, so it cannot affect or delay the fire decision.
+    const vol5m = await fetchDexVolume5m(tokenMint).catch(() => null);
+    const vol5mStr = (vol5m === null) ? 'N/A' : fmtUsd(vol5m);
     const notableHolders = await fetchNotableHolders(tokenMint, tokenInfo);
     let notableLine = '';
     if (notableHolders.length > 0) {
@@ -749,6 +774,7 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
       `Market Cap: ${marketCapStr}\n` +
       `Same-Name Count (5h): ${sameNameCount ?? '?'}\n` +
       `Fresh Wallets: ${freshWallets ?? 'N/A'}\n` +
+      `Vol (5m): ${vol5mStr}\n` +
       `Wallets Coordinated: ${walletCount} within ${elapsed}s\n` +
       `Wallets: ${[...coordWallets].map(a => walletName(a)).join(', ')}\n\n` +
       `Dev Wallet: ${devWallet !== 'N/A' ? `<code>${devWallet}</code>` : 'N/A'}\n` +
