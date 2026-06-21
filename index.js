@@ -1,9 +1,24 @@
 // ============================================================
 //  SOLANA COMBINED BOT
-//  1. Fast Tracker  — 5 wallets within 30s of mint
-//  2. Slow Tracker  — 3 wallets within 5min, token < 60min
-//  3. Whale Tracker — migrated tokens, large trades $5k+
-//  All three run in one process, three Telegram groups
+//  ----------------------------------------------------------
+//  >>> VERSION: 2026-06-21  (VOL DEBUG build) <<<
+//  If the right panel shows this header with this date,
+//  it is the correct/latest file to deploy.
+//  ----------------------------------------------------------
+//  Two active signals, both running in one process:
+//
+//  1. SLOW SIGNAL  (Telegram group CHAT_ID_SLOW)
+//     Fires when 2 tracked wallets buy the same token within
+//     15 min, token under 15 min old. Passes the OR filter:
+//     same-name >=10  OR  dev ATH >=$1M  OR  dev is a tracked wallet.
+//
+//  2. MIGRATION SIGNAL  (Telegram group CHAT_ID_FAST)
+//     Fires when 2 tracked wallets buy + the token hits its MC
+//     threshold within 30s of mint ($38k pump.fun / $375k Bags).
+//
+//  NOTE: This build includes a TEMPORARY [VOL DEBUG] block in
+//  buildSlowSignal to identify GMGN's volume field. Remove once
+//  the real volume source is wired in.
 // ============================================================
 
 const https     = require('https');
@@ -713,6 +728,17 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
     let freshWalletsFromInfo = null;
 
     if (tokenInfo) {
+      // ── TEMP VOL DEBUG ── dumps GMGN's raw volume-ish fields so we can see real field names.
+      // Remove after we identify the volume field. Safe: log-only, changes nothing.
+      try {
+        const vd = {};
+        for (const k of Object.keys(tokenInfo)) {
+          if (/vol|volume|swap|txn|trade|buy|sell/i.test(k)) vd[k] = tokenInfo[k];
+        }
+        log(`[VOL DEBUG] ${tokenMint.substring(0,8)} matched vol fields: ${JSON.stringify(vd)}`);
+        log(`[VOL DEBUG] ${tokenMint.substring(0,8)} all top-level keys: ${JSON.stringify(Object.keys(tokenInfo))}`);
+      } catch(e) { log(`[VOL DEBUG] dump failed: ${e.message}`); }
+
       symbol = tokenInfo.symbol ?? 'UNKNOWN';
       const ca = tokenInfo.creation_timestamp;
       if (ca) {
