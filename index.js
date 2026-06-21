@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-21  (VOL DEBUG build) <<<
+//  >>> VERSION: 2026-06-21c  (DEBUG — stat + wallet_tags_stat dump) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -728,15 +728,13 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
     let freshWalletsFromInfo = null;
 
     if (tokenInfo) {
-      // ── TEMP VOL DEBUG ── dumps GMGN's raw volume-ish fields so we can see real field names.
-      // Remove after we identify the volume field. Safe: log-only, changes nothing.
+      // ── TEMP VOL DEBUG ── GMGN keeps volume nested inside `stat` (and maybe `pool`),
+      // and fresh-wallet data inside `wallet_tags_stat`. Dump all three so we can read
+      // the exact field names for BOTH volume and fresh wallets. Remove after wiring.
       try {
-        const vd = {};
-        for (const k of Object.keys(tokenInfo)) {
-          if (/vol|volume|swap|txn|trade|buy|sell/i.test(k)) vd[k] = tokenInfo[k];
-        }
-        log(`[VOL DEBUG] ${tokenMint.substring(0,8)} matched vol fields: ${JSON.stringify(vd)}`);
-        log(`[VOL DEBUG] ${tokenMint.substring(0,8)} all top-level keys: ${JSON.stringify(Object.keys(tokenInfo))}`);
+        log(`[VOL DEBUG] ${tokenMint.substring(0,8)} stat = ${JSON.stringify(tokenInfo.stat)}`);
+        log(`[VOL DEBUG] ${tokenMint.substring(0,8)} pool = ${JSON.stringify(tokenInfo.pool)}`);
+        log(`[VOL DEBUG] ${tokenMint.substring(0,8)} wallet_tags_stat = ${JSON.stringify(tokenInfo.wallet_tags_stat)}`);
       } catch(e) { log(`[VOL DEBUG] dump failed: ${e.message}`); }
 
       symbol = tokenInfo.symbol ?? 'UNKNOWN';
