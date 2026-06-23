@@ -46,14 +46,14 @@ const FAST_MIN_WALLETS    = 5;
 
 // ── FAST MIGRATION CONFIG ────────────────────────────────────
 const FAST_MIG_MAX_AGE    = 30;  // token must hit MC threshold within 30s of mint
-const FAST_MIG_MIN_WALLETS = 2;  // 2 tracked wallets (excluding dev)
+const FAST_MIG_MIN_WALLETS = 3;  // 2 tracked wallets (excluding dev)
 const FAST_MIG_MIN_MC      = 38_000; // pump.fun migration ~$38k market cap threshold
 const FAST_MIG_MIN_MC_BAGS = 375_000; // Bags tokens (mint ends 'bags') migrate at ~$375k
 
 // ── SLOW BOT CONFIG ───────────────────────────────────────────
 const SLOW_WINDOW_SECS    = 900;
 const SLOW_MAX_TOKEN_AGE  = 900;
-const SLOW_MIN_WALLETS    = 2;
+const SLOW_MIN_WALLETS    = 3;
 const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
