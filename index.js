@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-21c  (DEBUG — stat + wallet_tags_stat dump) <<<
+//  >>> VERSION: 2026-06-23  (Buy Tracker + MC retry, always send) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -37,6 +37,16 @@ const CHAT_ID_FAST        = process.env.CHAT_ID_FAST        || '-5081620734';
 const CHAT_ID_SLOW        = process.env.CHAT_ID_SLOW        || '-1003888330833';
 const RENDER_URL          = process.env.RENDER_EXTERNAL_URL || '';
 
+// ── WALLET BUY TRACKER ─────────────────────────────────────────
+// Sends every FIRST buy (per token) from Theo and Cented to their own
+// dedicated Telegram groups. Independent of slow/migration filters.
+const CHAT_ID_THEO   = process.env.CHAT_ID_THEO   || '-5353363552';
+const CHAT_ID_CENTED = process.env.CHAT_ID_CENTED || '-5305037806';
+const TRACK_BUY_WALLETS = {
+  "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt": { name: "Theo",     chatId: CHAT_ID_THEO },
+  "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o": { name: "Cented 7", chatId: CHAT_ID_CENTED },
+};
+
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 // ── FAST BOT CONFIG ───────────────────────────────────────────
@@ -46,14 +56,14 @@ const FAST_MIN_WALLETS    = 5;
 
 // ── FAST MIGRATION CONFIG ────────────────────────────────────
 const FAST_MIG_MAX_AGE    = 30;  // token must hit MC threshold within 30s of mint
-const FAST_MIG_MIN_WALLETS = 3;  // 2 tracked wallets (excluding dev)
+const FAST_MIG_MIN_WALLETS = 2;  // 2 tracked wallets (excluding dev)
 const FAST_MIG_MIN_MC      = 38_000; // pump.fun migration ~$38k market cap threshold
 const FAST_MIG_MIN_MC_BAGS = 375_000; // Bags tokens (mint ends 'bags') migrate at ~$375k
 
 // ── SLOW BOT CONFIG ───────────────────────────────────────────
 const SLOW_WINDOW_SECS    = 900;
 const SLOW_MAX_TOKEN_AGE  = 900;
-const SLOW_MIN_WALLETS    = 3;
+const SLOW_MIN_WALLETS    = 2;
 const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
@@ -649,6 +659,105 @@ function extractMint(tx, trackedWallet) {
   return bestMint;
 }
 
+// ── BUY TRACKER (Theo / Cented) ───────────────────────────────
+// Reads how many tokens the tracked wallet received in this tx for a given mint.
+// Read-only helper for the buy tracker; does NOT affect signal logic.
+function extractBuyAmount(tx, trackedWallet, mint) {
+  const meta = tx?.meta;
+  if (!meta) return 0;
+  const postBals = meta.postTokenBalances ?? [];
+  const preBals  = meta.preTokenBalances ?? [];
+  let pre = 0, post = 0;
+  for (const b of preBals)  { if (b.owner === trackedWallet && b.mint === mint) pre  = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0; }
+  for (const b of postBals) { if (b.owner === trackedWallet && b.mint === mint) post = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0; }
+  const delta = post - pre;
+  return delta > 0 ? delta : 0;
+}
+
+function fmtTokenAmount(n) {
+  if (!n || isNaN(n)) return 'N/A';
+  if (n >= 1_000_000_000) return `${(n/1_000_000_000).toFixed(2)}B`;
+  if (n >= 1_000_000)     return `${(n/1_000_000).toFixed(2)}M`;
+  if (n >= 1_000)         return `${(n/1_000).toFixed(1)}K`;
+  return `${Math.round(n).toLocaleString()}`;
+}
+
+// Resolves market cap for a mint: GMGN tokenInfo → price×supply → DexScreener.
+// Returns { mc, symbol, tokenPrice } with mc=0 if nothing available this attempt.
+async function resolveBuyTrackerMC(tokenMint) {
+  let symbol = 'UNKNOWN', mc = 0, tokenPrice = 0;
+  // fresh fetch each attempt (not cached) so a late-populating MC can be picked up
+  const info = await fetchTokenInfo(tokenMint);
+  if (info) {
+    tokenInfoCache[tokenMint] = info;
+    symbol = info.symbol ?? 'UNKNOWN';
+    tokenPrice = parseFloat(info.price ?? 0);
+    mc = parseFloat(info.market_cap ?? info.usd_market_cap ?? 0);
+    if ((isNaN(mc) || mc === 0) && tokenPrice > 0) {
+      const supply = parseFloat(info.circulating_supply ?? info.total_supply ?? 0);
+      if (supply > 0) mc = tokenPrice * supply;
+    }
+  }
+  if (isNaN(mc) || mc === 0) {
+    const dexMC = await fetchDexMarketCap(tokenMint);
+    if (dexMC > 0) mc = dexMC;
+  }
+  if (isNaN(mc)) mc = 0;
+  return { mc, symbol, tokenPrice };
+}
+
+// Sends a first-buy alert for Theo / Cented to their dedicated group.
+// MC is the priority: retry every 3s for up to 20s to get it. If MC never
+// resolves, the alert is still sent with "N/A" so a buy is never missed.
+// Independent of slow/migration signals; never touches signal logic.
+async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount) {
+  try {
+    const cfg = TRACK_BUY_WALLETS[trackedWallet];
+    if (!cfg) return;
+
+    // Retry loop: attempt at 0s, 3s, 6s, 9s, 12s, 15s, 18s (≈7 tries within 20s).
+    let mc = 0, symbol = 'UNKNOWN', tokenPrice = 0;
+    const deadline = Date.now() + 20000;
+    let attempt = 0;
+    while (true) {
+      const r = await resolveBuyTrackerMC(tokenMint);
+      if (r.mc > 0) { mc = r.mc; symbol = r.symbol; tokenPrice = r.tokenPrice; break; }
+      symbol = r.symbol !== 'UNKNOWN' ? r.symbol : symbol;
+      tokenPrice = r.tokenPrice || tokenPrice;
+      attempt++;
+      if (Date.now() + 3000 > deadline) break; // no time for another wait
+      await sleep(3000);
+    }
+
+    if (mc <= 0) {
+      log(`[BUY TRACKER] ${cfg.name} #${symbol} (${tokenMint.substring(0,8)}) — MC never resolved after ${attempt} tries, sending with N/A`);
+    }
+
+    const mcStr = (mc > 0) ? fmtUsd(mc) : 'N/A';
+
+    // USD value of the buy, when we have a price
+    let usdStr = '';
+    if (tokenPrice > 0 && buyAmount > 0) {
+      const usd = tokenPrice * buyAmount;
+      usdStr = ` (~${fmtUsd(usd)})`;
+    }
+
+    const amtStr = buyAmount > 0 ? fmtTokenAmount(buyAmount) : 'N/A';
+    const buyTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+
+    sendTelegram(cfg.chatId,
+      `🟢 <b>${cfg.name} BUY</b>\n\n` +
+      `Token: #${symbol}\n` +
+      `Contract: <code>${tokenMint}</code>\n` +
+      `Amount: ${amtStr}${usdStr}\n` +
+      `Market Cap: ${mcStr}\n` +
+      `Time: ${buyTime}\n\n` +
+      `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
+    );
+    log(`[BUY TRACKER] ${cfg.name} bought #${symbol} @ MC ${mcStr} — sent to ${cfg.chatId}`);
+  } catch(e) { log(`[ERR] sendBuyTrackerAlert: ${e.message}`); }
+}
+
 
 // ── FAST BOT SIGNAL ───────────────────────────────────────────
 async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets, resolvedMC) {
@@ -992,6 +1101,15 @@ async function processLogNotification(params) {
   seenPairs.add(pairKey);
 
   log(`[MINT] ${trackedWallet.substring(0,8)} bought ${mint.substring(0,8)}`);
+
+  // ── BUY TRACKER (Theo / Cented) ──
+  // Parallel branch: on a first buy by a tracked-buy wallet, send to its group.
+  // Fire-and-forget so it never delays or affects the signal path below.
+  if (TRACK_BUY_WALLETS[trackedWallet]) {
+    const buyAmount = extractBuyAmount(tx, trackedWallet, mint);
+    sendBuyTrackerAlert(trackedWallet, mint, buyAmount).catch(e => log(`[ERR] buyTracker: ${e.message}`));
+  }
+
   await handleWalletBuy(trackedWallet, mint);
 }
 
