@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24  (Buy Tracker: instant send, no retry; SLOW_MIN_WALLETS=5) <<<
+//  >>> VERSION: 2026-06-24c  (Buy Tracker: POOL DEBUG to build trustworthy fallback) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -722,6 +722,8 @@ async function computeEntryFromTx(tx, trackedWallet, mint, buyAmount) {
   try {
     const solPrice = await getSolPrice();
     let priceUsd = 0;
+    let method = 'none';       // DEBUG: which path produced the price
+    let dbgTokenReserve = 0, dbgSolReserve = 0, dbgSolSpent = 0; // DEBUG raw values
 
     // ── Method A: pool reserves at tx time ──
     // After this swap, the pool/curve holds some SOL and some token.
@@ -746,24 +748,31 @@ async function computeEntryFromTx(tx, trackedWallet, mint, buyAmount) {
         const amt = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0;
         if (amt > solReserve) solReserve = amt;
       }
+      dbgTokenReserve = tokenReserve; dbgSolReserve = solReserve;
       if (tokenReserve > 0 && solReserve > 0) {
         const priceSol = solReserve / tokenReserve;
         priceUsd = priceSol * solPrice;
+        method = 'A-reserves';
       }
     }
 
     // ── Method B fallback: SOL spent / tokens received ──
     if (priceUsd <= 0 && buyAmount > 0) {
       const solSpent = extractSolSpent(tx, trackedWallet);
-      if (solSpent > 0) priceUsd = (solSpent * solPrice) / buyAmount;
+      dbgSolSpent = solSpent;
+      if (solSpent > 0) { priceUsd = (solSpent * solPrice) / buyAmount; method = 'B-solspent'; }
     }
 
-    if (priceUsd <= 0) return { price: 0, mc: 0, symbol: 'UNKNOWN' };
+    if (priceUsd <= 0) {
+      log(`[ENTRY DEBUG] ${mint.substring(0,8)} method=${method} priceUsd=0 (no price) | tokReserve=${dbgTokenReserve} solReserve=${dbgSolReserve} solSpent=${dbgSolSpent} buyAmt=${buyAmount} solPrice=${solPrice}`);
+      return { price: 0, mc: 0, symbol: 'UNKNOWN' };
+    }
 
     // Supply from GMGN (stable for these tokens). MC = price x supply.
     const info = await fetchTokenInfo(mint);
     const supply = parseFloat(info?.circulating_supply ?? info?.total_supply ?? 0);
     const mc = (supply > 0) ? priceUsd * supply : 0;
+    log(`[ENTRY DEBUG] ${mint.substring(0,8)} method=${method} | tokReserve=${dbgTokenReserve} solReserve=${dbgSolReserve} solSpent=${dbgSolSpent} buyAmt=${buyAmount} | priceUsd=${priceUsd} supply=${supply} => mc=${Math.round(mc)} | solPrice=${solPrice}`);
     return { price: priceUsd, mc: mc > 0 ? mc : 0, symbol: info?.symbol ?? 'UNKNOWN' };
   } catch (e) {
     log(`[ERR] computeEntryFromTx: ${e.message}`);
@@ -814,6 +823,15 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
     } catch (e) { log(`[ERR] resolveBuyTrackerMC call: ${e.message}`); }
 
     const mcStr = (mc > 0) ? fmtUsd(mc) : 'N/A';
+
+    // ── TEMP POOL DEBUG ── dump GMGN's pool reserves at buy time + GMGN MC,
+    // so we can build a trustworthy pool-reserve price calc and validate it
+    // against GMGN's own MC on tokens where GMGN has it. Remove after wiring.
+    try {
+      const dbgInfo = await fetchTokenInfo(tokenMint);
+      log(`[POOL DEBUG] ${tokenMint.substring(0,8)} gmgnMC=${mc} | pool = ${JSON.stringify(dbgInfo?.pool)}`);
+      log(`[POOL DEBUG] ${tokenMint.substring(0,8)} supply circ=${dbgInfo?.circulating_supply} total=${dbgInfo?.total_supply} | price=${dbgInfo?.price}`);
+    } catch(e) { log(`[POOL DEBUG] dump failed: ${e.message}`); }
 
     // Exact entry from the swap tx (true market price at buy time) — instant.
     let onchain = { price: 0, mc: 0, symbol: 'UNKNOWN' };
