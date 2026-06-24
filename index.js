@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-23  (Buy Tracker + MC retry, always send) <<<
+//  >>> VERSION: 2026-06-24  (Buy Tracker: instant send, no retry; SLOW_MIN_WALLETS=5) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -63,7 +63,7 @@ const FAST_MIG_MIN_MC_BAGS = 375_000; // Bags tokens (mint ends 'bags') migrate 
 // ── SLOW BOT CONFIG ───────────────────────────────────────────
 const SLOW_WINDOW_SECS    = 900;
 const SLOW_MAX_TOKEN_AGE  = 900;
-const SLOW_MIN_WALLETS    = 4;
+const SLOW_MIN_WALLETS    = 5;
 const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
@@ -682,6 +682,95 @@ function fmtTokenAmount(n) {
   return `${Math.round(n).toLocaleString()}`;
 }
 
+// Net SOL the wallet put into the swap, read from the transaction.
+// Uses native SOL balance delta + wSOL token balance delta.
+// NOTE: this includes gas/priority/tip fees, so it can slightly
+// overstate spend; used only as a fallback when reserve pricing fails.
+function extractSolSpent(tx, trackedWallet) {
+  const meta = tx?.meta;
+  const msg  = tx?.transaction?.message;
+  if (!meta || !msg) return 0;
+
+  const keys = msg.accountKeys ?? [];
+  let idx = -1;
+  for (let i = 0; i < keys.length; i++) {
+    const k = typeof keys[i] === 'string' ? keys[i] : keys[i]?.pubkey;
+    if (k === trackedWallet) { idx = i; break; }
+  }
+
+  let nativeSpent = 0;
+  if (idx >= 0 && Array.isArray(meta.preBalances) && Array.isArray(meta.postBalances)) {
+    const pre  = meta.preBalances[idx]  ?? 0;
+    const post = meta.postBalances[idx] ?? 0;
+    nativeSpent = (pre - post) / 1e9;
+  }
+
+  let preW = 0, postW = 0;
+  for (const b of (meta.preTokenBalances ?? []))  { if (b.owner === trackedWallet && b.mint === SOL_MINT) preW  = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0; }
+  for (const b of (meta.postTokenBalances ?? [])) { if (b.owner === trackedWallet && b.mint === SOL_MINT) postW = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0; }
+  const wsolSpent = preW - postW;
+
+  const total = nativeSpent + (wsolSpent > 0 ? wsolSpent : 0);
+  return total > 0 ? total : 0;
+}
+
+// Computes the token's PRICE from the pool reserves inside this tx
+// (true market price, independent of fees the trader paid), with a
+// fallback to (SOL spent / tokens received) if reserves can't be read.
+// Returns { price, mc, symbol } in USD; mc=0 if supply unavailable.
+async function computeEntryFromTx(tx, trackedWallet, mint, buyAmount) {
+  try {
+    const solPrice = await getSolPrice();
+    let priceUsd = 0;
+
+    // ── Method A: pool reserves at tx time ──
+    // After this swap, the pool/curve holds some SOL and some token.
+    // price (in SOL) = SOL reserve / token reserve. We read the post
+    // balances of the NON-tracked account that gained SOL & holds the token.
+    const meta = tx?.meta;
+    if (meta) {
+      const postTok = meta.postTokenBalances ?? [];
+      // token reserve held by the pool (largest non-wallet holder of this mint)
+      let tokenReserve = 0;
+      for (const b of postTok) {
+        if (b.mint !== mint) continue;
+        if (b.owner === trackedWallet) continue;
+        const amt = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0;
+        if (amt > tokenReserve) tokenReserve = amt;
+      }
+      // SOL reserve held by the pool (largest wSOL holder that isn't the wallet)
+      let solReserve = 0;
+      for (const b of postTok) {
+        if (b.mint !== SOL_MINT) continue;
+        if (b.owner === trackedWallet) continue;
+        const amt = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0;
+        if (amt > solReserve) solReserve = amt;
+      }
+      if (tokenReserve > 0 && solReserve > 0) {
+        const priceSol = solReserve / tokenReserve;
+        priceUsd = priceSol * solPrice;
+      }
+    }
+
+    // ── Method B fallback: SOL spent / tokens received ──
+    if (priceUsd <= 0 && buyAmount > 0) {
+      const solSpent = extractSolSpent(tx, trackedWallet);
+      if (solSpent > 0) priceUsd = (solSpent * solPrice) / buyAmount;
+    }
+
+    if (priceUsd <= 0) return { price: 0, mc: 0, symbol: 'UNKNOWN' };
+
+    // Supply from GMGN (stable for these tokens). MC = price x supply.
+    const info = await fetchTokenInfo(mint);
+    const supply = parseFloat(info?.circulating_supply ?? info?.total_supply ?? 0);
+    const mc = (supply > 0) ? priceUsd * supply : 0;
+    return { price: priceUsd, mc: mc > 0 ? mc : 0, symbol: info?.symbol ?? 'UNKNOWN' };
+  } catch (e) {
+    log(`[ERR] computeEntryFromTx: ${e.message}`);
+    return { price: 0, mc: 0, symbol: 'UNKNOWN' };
+  }
+}
+
 // Resolves market cap for a mint: GMGN tokenInfo → price×supply → DexScreener.
 // Returns { mc, symbol, tokenPrice } with mc=0 if nothing available this attempt.
 async function resolveBuyTrackerMC(tokenMint) {
@@ -710,30 +799,28 @@ async function resolveBuyTrackerMC(tokenMint) {
 // MC is the priority: retry every 3s for up to 20s to get it. If MC never
 // resolves, the alert is still sent with "N/A" so a buy is never missed.
 // Independent of slow/migration signals; never touches signal logic.
-async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount) {
+async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
   try {
     const cfg = TRACK_BUY_WALLETS[trackedWallet];
     if (!cfg) return;
 
-    // Retry loop: attempt at 0s, 3s, 6s, 9s, 12s, 15s, 18s (≈7 tries within 20s).
+    // No waiting. On-chain entry MC (below) is computed instantly from the swap tx.
+    // GMGN MC is a single best-effort attempt for comparison — whatever it has right
+    // now; N/A if not ready. 20s on a fresh token is a lifetime, so we never wait.
     let mc = 0, symbol = 'UNKNOWN', tokenPrice = 0;
-    const deadline = Date.now() + 20000;
-    let attempt = 0;
-    while (true) {
+    try {
       const r = await resolveBuyTrackerMC(tokenMint);
-      if (r.mc > 0) { mc = r.mc; symbol = r.symbol; tokenPrice = r.tokenPrice; break; }
-      symbol = r.symbol !== 'UNKNOWN' ? r.symbol : symbol;
-      tokenPrice = r.tokenPrice || tokenPrice;
-      attempt++;
-      if (Date.now() + 3000 > deadline) break; // no time for another wait
-      await sleep(3000);
-    }
-
-    if (mc <= 0) {
-      log(`[BUY TRACKER] ${cfg.name} #${symbol} (${tokenMint.substring(0,8)}) — MC never resolved after ${attempt} tries, sending with N/A`);
-    }
+      mc = r.mc; symbol = r.symbol; tokenPrice = r.tokenPrice;
+    } catch (e) { log(`[ERR] resolveBuyTrackerMC call: ${e.message}`); }
 
     const mcStr = (mc > 0) ? fmtUsd(mc) : 'N/A';
+
+    // Exact entry from the swap tx (true market price at buy time) — instant.
+    let onchain = { price: 0, mc: 0, symbol: 'UNKNOWN' };
+    try { onchain = await computeEntryFromTx(tx, trackedWallet, tokenMint, buyAmount); }
+    catch (e) { log(`[ERR] computeEntryFromTx call: ${e.message}`); }
+    const onchainMcStr = (onchain.mc > 0) ? fmtUsd(onchain.mc) : 'N/A';
+    if (onchain.symbol && onchain.symbol !== 'UNKNOWN' && symbol === 'UNKNOWN') symbol = onchain.symbol;
 
     // USD value of the buy, when we have a price
     let usdStr = '';
@@ -750,11 +837,12 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount) {
       `Token: #${symbol}\n` +
       `Contract: <code>${tokenMint}</code>\n` +
       `Amount: ${amtStr}${usdStr}\n` +
-      `Market Cap: ${mcStr}\n` +
+      `Entry MC (on-chain): ${onchainMcStr}\n` +
+      `Market Cap (GMGN): ${mcStr}\n` +
       `Time: ${buyTime}\n\n` +
       `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
     );
-    log(`[BUY TRACKER] ${cfg.name} bought #${symbol} @ MC ${mcStr} — sent to ${cfg.chatId}`);
+    log(`[BUY TRACKER] ${cfg.name} bought #${symbol} @ on-chain ${onchainMcStr} / GMGN ${mcStr} — sent to ${cfg.chatId}`);
   } catch(e) { log(`[ERR] sendBuyTrackerAlert: ${e.message}`); }
 }
 
@@ -1107,7 +1195,7 @@ async function processLogNotification(params) {
   // Fire-and-forget so it never delays or affects the signal path below.
   if (TRACK_BUY_WALLETS[trackedWallet]) {
     const buyAmount = extractBuyAmount(tx, trackedWallet, mint);
-    sendBuyTrackerAlert(trackedWallet, mint, buyAmount).catch(e => log(`[ERR] buyTracker: ${e.message}`));
+    sendBuyTrackerAlert(trackedWallet, mint, buyAmount, tx).catch(e => log(`[ERR] buyTracker: ${e.message}`));
   }
 
   await handleWalletBuy(trackedWallet, mint);
