@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24c  (Buy Tracker: POOL DEBUG to build trustworthy fallback) <<<
+//  >>> VERSION: 2026-06-24d  (Buy Tracker: reliable pool-reserve MC) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -714,68 +714,32 @@ function extractSolSpent(tx, trackedWallet) {
   return total > 0 ? total : 0;
 }
 
-// Computes the token's PRICE from the pool reserves inside this tx
-// (true market price, independent of fees the trader paid), with a
-// fallback to (SOL spent / tokens received) if reserves can't be read.
-// Returns { price, mc, symbol } in USD; mc=0 if supply unavailable.
-async function computeEntryFromTx(tx, trackedWallet, mint, buyAmount) {
+// Computes MC from GMGN's pool reserves, which GMGN already identifies and
+// USD-prices correctly across all exchange types (pump, pump_amm, meteora).
+// price/token = quote_reserve_value(USD) / base_reserve(tokens in pool)
+// MC = price/token * circulating_supply.
+// Works even when GMGN's headline market_cap field is missing or wrong.
+// Returns { price, mc, symbol }; mc=0 if reserves/supply unavailable.
+async function computePoolMC(mint, infoMaybe) {
   try {
-    const solPrice = await getSolPrice();
-    let priceUsd = 0;
-    let method = 'none';       // DEBUG: which path produced the price
-    let dbgTokenReserve = 0, dbgSolReserve = 0, dbgSolSpent = 0; // DEBUG raw values
+    const info = infoMaybe || await fetchTokenInfo(mint);
+    if (!info) return { price: 0, mc: 0, symbol: 'UNKNOWN' };
+    const symbol = info.symbol ?? 'UNKNOWN';
+    const pool = info.pool ?? {};
+    const quoteValUsd = parseFloat(pool.quote_reserve_value ?? 0); // SOL side, USD
+    const baseReserve = parseFloat(pool.base_reserve ?? 0);        // tokens in pool
+    const supply = parseFloat(info.circulating_supply ?? info.total_supply ?? 0);
 
-    // ── Method A: pool reserves at tx time ──
-    // After this swap, the pool/curve holds some SOL and some token.
-    // price (in SOL) = SOL reserve / token reserve. We read the post
-    // balances of the NON-tracked account that gained SOL & holds the token.
-    const meta = tx?.meta;
-    if (meta) {
-      const postTok = meta.postTokenBalances ?? [];
-      // token reserve held by the pool (largest non-wallet holder of this mint)
-      let tokenReserve = 0;
-      for (const b of postTok) {
-        if (b.mint !== mint) continue;
-        if (b.owner === trackedWallet) continue;
-        const amt = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0;
-        if (amt > tokenReserve) tokenReserve = amt;
-      }
-      // SOL reserve held by the pool (largest wSOL holder that isn't the wallet)
-      let solReserve = 0;
-      for (const b of postTok) {
-        if (b.mint !== SOL_MINT) continue;
-        if (b.owner === trackedWallet) continue;
-        const amt = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0;
-        if (amt > solReserve) solReserve = amt;
-      }
-      dbgTokenReserve = tokenReserve; dbgSolReserve = solReserve;
-      if (tokenReserve > 0 && solReserve > 0) {
-        const priceSol = solReserve / tokenReserve;
-        priceUsd = priceSol * solPrice;
-        method = 'A-reserves';
-      }
+    if (quoteValUsd > 0 && baseReserve > 0 && supply > 0) {
+      const pricePerToken = quoteValUsd / baseReserve;
+      const mc = pricePerToken * supply;
+      log(`[POOL MC] ${mint.substring(0,8)} quoteVal=${quoteValUsd} baseReserve=${baseReserve} supply=${supply} => price=${pricePerToken} mc=${Math.round(mc)}`);
+      return { price: pricePerToken, mc: mc > 0 ? mc : 0, symbol };
     }
-
-    // ── Method B fallback: SOL spent / tokens received ──
-    if (priceUsd <= 0 && buyAmount > 0) {
-      const solSpent = extractSolSpent(tx, trackedWallet);
-      dbgSolSpent = solSpent;
-      if (solSpent > 0) { priceUsd = (solSpent * solPrice) / buyAmount; method = 'B-solspent'; }
-    }
-
-    if (priceUsd <= 0) {
-      log(`[ENTRY DEBUG] ${mint.substring(0,8)} method=${method} priceUsd=0 (no price) | tokReserve=${dbgTokenReserve} solReserve=${dbgSolReserve} solSpent=${dbgSolSpent} buyAmt=${buyAmount} solPrice=${solPrice}`);
-      return { price: 0, mc: 0, symbol: 'UNKNOWN' };
-    }
-
-    // Supply from GMGN (stable for these tokens). MC = price x supply.
-    const info = await fetchTokenInfo(mint);
-    const supply = parseFloat(info?.circulating_supply ?? info?.total_supply ?? 0);
-    const mc = (supply > 0) ? priceUsd * supply : 0;
-    log(`[ENTRY DEBUG] ${mint.substring(0,8)} method=${method} | tokReserve=${dbgTokenReserve} solReserve=${dbgSolReserve} solSpent=${dbgSolSpent} buyAmt=${buyAmount} | priceUsd=${priceUsd} supply=${supply} => mc=${Math.round(mc)} | solPrice=${solPrice}`);
-    return { price: priceUsd, mc: mc > 0 ? mc : 0, symbol: info?.symbol ?? 'UNKNOWN' };
+    log(`[POOL MC] ${mint.substring(0,8)} insufficient pool data — quoteVal=${quoteValUsd} baseReserve=${baseReserve} supply=${supply}`);
+    return { price: 0, mc: 0, symbol };
   } catch (e) {
-    log(`[ERR] computeEntryFromTx: ${e.message}`);
+    log(`[ERR] computePoolMC: ${e.message}`);
     return { price: 0, mc: 0, symbol: 'UNKNOWN' };
   }
 }
@@ -813,32 +777,38 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
     const cfg = TRACK_BUY_WALLETS[trackedWallet];
     if (!cfg) return;
 
-    // No waiting. On-chain entry MC (below) is computed instantly from the swap tx.
-    // GMGN MC is a single best-effort attempt for comparison — whatever it has right
-    // now; N/A if not ready. 20s on a fresh token is a lifetime, so we never wait.
-    let mc = 0, symbol = 'UNKNOWN', tokenPrice = 0;
+    // Single tokenInfo fetch; compute MC from GMGN's pool reserves (reliable
+    // across exchange types, present even when GMGN's headline MC is missing/wrong).
+    let info = null;
+    try { info = await fetchTokenInfo(tokenMint); }
+    catch (e) { log(`[ERR] buyTracker fetchTokenInfo: ${e.message}`); }
+
+    let symbol = info?.symbol ?? 'UNKNOWN';
+    const tokenPrice = parseFloat(info?.price ?? 0);
+
+    // Pool-reserve MC (primary, trustworthy)
+    let mc = 0;
     try {
-      const r = await resolveBuyTrackerMC(tokenMint);
-      mc = r.mc; symbol = r.symbol; tokenPrice = r.tokenPrice;
-    } catch (e) { log(`[ERR] resolveBuyTrackerMC call: ${e.message}`); }
+      const pm = await computePoolMC(tokenMint, info);
+      mc = pm.mc;
+      if (pm.symbol && pm.symbol !== 'UNKNOWN') symbol = pm.symbol;
+    } catch (e) { log(`[ERR] computePoolMC call: ${e.message}`); }
+
+    // Fallbacks if pool data was incomplete: GMGN headline MC, then DexScreener.
+    if (mc <= 0 && info) {
+      let g = parseFloat(info.market_cap ?? info.usd_market_cap ?? 0);
+      if ((isNaN(g) || g === 0) && tokenPrice > 0) {
+        const supply = parseFloat(info.circulating_supply ?? info.total_supply ?? 0);
+        if (supply > 0) g = tokenPrice * supply;
+      }
+      if (g > 0) { mc = g; log(`[BUY TRACKER] ${tokenMint.substring(0,8)} pool MC unavailable, using GMGN headline ${Math.round(g)}`); }
+    }
+    if (mc <= 0) {
+      try { const dexMC = await fetchDexMarketCap(tokenMint); if (dexMC > 0) { mc = dexMC; log(`[BUY TRACKER] ${tokenMint.substring(0,8)} using DexScreener MC ${Math.round(dexMC)}`); } }
+      catch (e) { log(`[ERR] buyTracker dexMC: ${e.message}`); }
+    }
 
     const mcStr = (mc > 0) ? fmtUsd(mc) : 'N/A';
-
-    // ── TEMP POOL DEBUG ── dump GMGN's pool reserves at buy time + GMGN MC,
-    // so we can build a trustworthy pool-reserve price calc and validate it
-    // against GMGN's own MC on tokens where GMGN has it. Remove after wiring.
-    try {
-      const dbgInfo = await fetchTokenInfo(tokenMint);
-      log(`[POOL DEBUG] ${tokenMint.substring(0,8)} gmgnMC=${mc} | pool = ${JSON.stringify(dbgInfo?.pool)}`);
-      log(`[POOL DEBUG] ${tokenMint.substring(0,8)} supply circ=${dbgInfo?.circulating_supply} total=${dbgInfo?.total_supply} | price=${dbgInfo?.price}`);
-    } catch(e) { log(`[POOL DEBUG] dump failed: ${e.message}`); }
-
-    // Exact entry from the swap tx (true market price at buy time) — instant.
-    let onchain = { price: 0, mc: 0, symbol: 'UNKNOWN' };
-    try { onchain = await computeEntryFromTx(tx, trackedWallet, tokenMint, buyAmount); }
-    catch (e) { log(`[ERR] computeEntryFromTx call: ${e.message}`); }
-    const onchainMcStr = (onchain.mc > 0) ? fmtUsd(onchain.mc) : 'N/A';
-    if (onchain.symbol && onchain.symbol !== 'UNKNOWN' && symbol === 'UNKNOWN') symbol = onchain.symbol;
 
     // USD value of the buy, when we have a price
     let usdStr = '';
@@ -855,12 +825,11 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
       `Token: #${symbol}\n` +
       `Contract: <code>${tokenMint}</code>\n` +
       `Amount: ${amtStr}${usdStr}\n` +
-      `Entry MC (on-chain): ${onchainMcStr}\n` +
-      `Market Cap (GMGN): ${mcStr}\n` +
+      `Market Cap: ${mcStr}\n` +
       `Time: ${buyTime}\n\n` +
       `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
     );
-    log(`[BUY TRACKER] ${cfg.name} bought #${symbol} @ on-chain ${onchainMcStr} / GMGN ${mcStr} — sent to ${cfg.chatId}`);
+    log(`[BUY TRACKER] ${cfg.name} bought #${symbol} @ MC ${mcStr} — sent to ${cfg.chatId}`);
   } catch(e) { log(`[ERR] sendBuyTrackerAlert: ${e.message}`); }
 }
 
