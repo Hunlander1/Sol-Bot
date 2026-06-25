@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24d  (Buy Tracker: reliable pool-reserve MC) <<<
+//  >>> VERSION: 2026-06-24e  (Buy Tracker: GMGN MC first, pool calc fallback, link fixed) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -63,7 +63,7 @@ const FAST_MIG_MIN_MC_BAGS = 375_000; // Bags tokens (mint ends 'bags') migrate 
 // ── SLOW BOT CONFIG ───────────────────────────────────────────
 const SLOW_WINDOW_SECS    = 900;
 const SLOW_MAX_TOKEN_AGE  = 900;
-const SLOW_MIN_WALLETS    = 4;
+const SLOW_MIN_WALLETS    = 5;
 const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
@@ -777,8 +777,7 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
     const cfg = TRACK_BUY_WALLETS[trackedWallet];
     if (!cfg) return;
 
-    // Single tokenInfo fetch; compute MC from GMGN's pool reserves (reliable
-    // across exchange types, present even when GMGN's headline MC is missing/wrong).
+    // Single tokenInfo fetch.
     let info = null;
     try { info = await fetchTokenInfo(tokenMint); }
     catch (e) { log(`[ERR] buyTracker fetchTokenInfo: ${e.message}`); }
@@ -786,25 +785,32 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
     let symbol = info?.symbol ?? 'UNKNOWN';
     const tokenPrice = parseFloat(info?.price ?? 0);
 
-    // Pool-reserve MC (primary, trustworthy)
+    // ── MC SOURCE PRIORITY (per N): GMGN headline FIRST. ──
+    // 1) GMGN's own market_cap / usd_market_cap field (what GMGN displays)
+    // 2) price × supply (still GMGN data)
+    // 3) pool-reserve calc (fallback only — can be unreliable)
+    // 4) DexScreener
     let mc = 0;
-    try {
-      const pm = await computePoolMC(tokenMint, info);
-      mc = pm.mc;
-      if (pm.symbol && pm.symbol !== 'UNKNOWN') symbol = pm.symbol;
-    } catch (e) { log(`[ERR] computePoolMC call: ${e.message}`); }
-
-    // Fallbacks if pool data was incomplete: GMGN headline MC, then DexScreener.
-    if (mc <= 0 && info) {
+    let mcSource = 'none';
+    if (info) {
       let g = parseFloat(info.market_cap ?? info.usd_market_cap ?? 0);
-      if ((isNaN(g) || g === 0) && tokenPrice > 0) {
+      if (!isNaN(g) && g > 0) { mc = g; mcSource = 'gmgn-headline'; }
+      if (mc <= 0 && tokenPrice > 0) {
         const supply = parseFloat(info.circulating_supply ?? info.total_supply ?? 0);
-        if (supply > 0) g = tokenPrice * supply;
+        if (supply > 0) { mc = tokenPrice * supply; mcSource = 'gmgn-price×supply'; }
       }
-      if (g > 0) { mc = g; log(`[BUY TRACKER] ${tokenMint.substring(0,8)} pool MC unavailable, using GMGN headline ${Math.round(g)}`); }
     }
+    // Fallback: pool-reserve calc only if GMGN gave nothing
     if (mc <= 0) {
-      try { const dexMC = await fetchDexMarketCap(tokenMint); if (dexMC > 0) { mc = dexMC; log(`[BUY TRACKER] ${tokenMint.substring(0,8)} using DexScreener MC ${Math.round(dexMC)}`); } }
+      try {
+        const pm = await computePoolMC(tokenMint, info);
+        if (pm.mc > 0) { mc = pm.mc; mcSource = 'pool-calc'; }
+        if (pm.symbol && pm.symbol !== 'UNKNOWN' && symbol === 'UNKNOWN') symbol = pm.symbol;
+      } catch (e) { log(`[ERR] computePoolMC call: ${e.message}`); }
+    }
+    // Last resort: DexScreener
+    if (mc <= 0) {
+      try { const dexMC = await fetchDexMarketCap(tokenMint); if (dexMC > 0) { mc = dexMC; mcSource = 'dexscreener'; } }
       catch (e) { log(`[ERR] buyTracker dexMC: ${e.message}`); }
     }
 
@@ -827,9 +833,9 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
       `Amount: ${amtStr}${usdStr}\n` +
       `Market Cap: ${mcStr}\n` +
       `Time: ${buyTime}\n\n` +
-      `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
+      `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
     );
-    log(`[BUY TRACKER] ${cfg.name} bought #${symbol} @ MC ${mcStr} — sent to ${cfg.chatId}`);
+    log(`[BUY TRACKER] ${cfg.name} bought #${symbol} @ MC ${mcStr} (src=${mcSource}) — sent to ${cfg.chatId}`);
   } catch(e) { log(`[ERR] sendBuyTrackerAlert: ${e.message}`); }
 }
 
