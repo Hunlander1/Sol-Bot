@@ -63,7 +63,7 @@ const FAST_MIG_MIN_MC_BAGS = 375_000; // Bags tokens (mint ends 'bags') migrate 
 // ── SLOW BOT CONFIG ───────────────────────────────────────────
 const SLOW_WINDOW_SECS    = 900;
 const SLOW_MAX_TOKEN_AGE  = 900;
-const SLOW_MIN_WALLETS    = 5;
+const SLOW_MIN_WALLETS    = 4;
 const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
