@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24e  (Buy Tracker: GMGN MC first, pool calc fallback, link fixed) <<<
+//  >>> VERSION: 2026-06-24f  (Buy Tracker: official market rank MC primary) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -63,7 +63,7 @@ const FAST_MIG_MIN_MC_BAGS = 375_000; // Bags tokens (mint ends 'bags') migrate 
 // ── SLOW BOT CONFIG ───────────────────────────────────────────
 const SLOW_WINDOW_SECS    = 900;
 const SLOW_MAX_TOKEN_AGE  = 900;
-const SLOW_MIN_WALLETS    = 5;
+const SLOW_MIN_WALLETS    = 4;
 const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
@@ -407,6 +407,35 @@ async function gmgnGet(path, params = {}, skipAuth = false) {
 
 async function fetchTokenInfo(mint) {
   return await gmgnGet('/v1/token/info', { chain: 'sol', address: mint });
+}
+
+// Pulls MC from GMGN's OFFICIAL market rank route (/v1/market/rank), which
+// returns market_cap directly (curve-aware, no calculation). Brand-new tokens
+// may not yet appear in the rank list — returns null if not found.
+// Logs the raw shape so we can confirm auth works and the token is present.
+async function fetchOfficialMarketCap(mint) {
+  try {
+    // Query the 1m trending rank, large limit, then find this token by address.
+    const data = await gmgnGet('/v1/market/rank', {
+      chain: 'sol', interval: '1m', orderby: 'volume', direction: 'desc', limit: '100',
+    });
+    const rank = data?.rank ?? data?.list ?? (Array.isArray(data) ? data : null);
+    if (!Array.isArray(rank)) {
+      log(`[OFFICIAL MC] ${mint.substring(0,8)} — rank route returned no array (auth/route issue?) raw keys=${data ? Object.keys(data).join(',') : 'null'}`);
+      return null;
+    }
+    const hit = rank.find(t => (t.address ?? t.token_address) === mint);
+    if (!hit) {
+      log(`[OFFICIAL MC] ${mint.substring(0,8)} — not in trending rank (${rank.length} items), no MC`);
+      return null;
+    }
+    const mc = parseFloat(hit.market_cap ?? hit.usd_market_cap ?? 0);
+    log(`[OFFICIAL MC] ${mint.substring(0,8)} — found in rank, market_cap=${mc}`);
+    return (mc > 0) ? mc : null;
+  } catch (e) {
+    log(`[ERR] fetchOfficialMarketCap: ${e.message}`);
+    return null;
+  }
 }
 
 async function fetchFreshWallets(mint) {
@@ -786,13 +815,18 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
     const tokenPrice = parseFloat(info?.price ?? 0);
 
     // ── MC SOURCE PRIORITY (per N): GMGN headline FIRST. ──
+    // 0) OFFICIAL market rank route (curve-aware market_cap, no calc) — primary
     // 1) GMGN's own market_cap / usd_market_cap field (what GMGN displays)
     // 2) price × supply (still GMGN data)
     // 3) pool-reserve calc (fallback only — can be unreliable)
     // 4) DexScreener
     let mc = 0;
     let mcSource = 'none';
-    if (info) {
+    try {
+      const off = await fetchOfficialMarketCap(tokenMint);
+      if (off && off > 0) { mc = off; mcSource = 'official-rank'; }
+    } catch (e) { log(`[ERR] fetchOfficialMarketCap call: ${e.message}`); }
+    if (mc <= 0 && info) {
       let g = parseFloat(info.market_cap ?? info.usd_market_cap ?? 0);
       if (!isNaN(g) && g > 0) { mc = g; mcSource = 'gmgn-headline'; }
       if (mc <= 0 && tokenPrice > 0) {
