@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24f  (Buy Tracker: official market rank MC primary) <<<
+//  >>> VERSION: 2026-06-24g  (Buy Tracker: kline 30s price MC primary; SLOW_MIN_WALLETS=4) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -438,6 +438,40 @@ async function fetchOfficialMarketCap(mint) {
   }
 }
 
+// Pulls the latest USD price from GMGN's OFFICIAL kline route (/v1/market/token_kline)
+// and computes MC = price × supply. This is GMGN's own curve-aware price, works on
+// ANY token (not just trending), and is the most reliable source for fresh tokens.
+// Uses 30s candles (finest resolution) so even very new tokens have a price.
+// Returns { mc, price } or { mc:0 } if no candle/price yet.
+async function fetchKlineMC(mint, supply) {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const from = now - 600; // last 10 minutes of 30s candles
+    const data = await gmgnGet('/v1/market/token_kline', {
+      chain: 'sol', address: mint, resolution: '30s',
+      from: String(from), to: String(now),
+    });
+    const list = data?.list ?? (Array.isArray(data) ? data : null);
+    if (!Array.isArray(list) || list.length === 0) {
+      log(`[KLINE MC] ${mint.substring(0,8)} — no candles returned (auth/route issue or too fresh) raw keys=${data ? Object.keys(data).join(',') : 'null'}`);
+      return { mc: 0, price: 0 };
+    }
+    // candles are chronological (oldest first) — take the most recent close price
+    const last = list[list.length - 1];
+    const price = parseFloat(last.close ?? last.c ?? 0);
+    if (!(price > 0)) {
+      log(`[KLINE MC] ${mint.substring(0,8)} — latest candle has no usable close price`);
+      return { mc: 0, price: 0 };
+    }
+    const mc = (supply > 0) ? price * supply : 0;
+    log(`[KLINE MC] ${mint.substring(0,8)} — close=${price} supply=${supply} => mc=${Math.round(mc)} (${list.length} candles)`);
+    return { mc: mc > 0 ? mc : 0, price };
+  } catch (e) {
+    log(`[ERR] fetchKlineMC: ${e.message}`);
+    return { mc: 0, price: 0 };
+  }
+}
+
 async function fetchFreshWallets(mint) {
   const data = await gmgnGet('/v1/token/security', { chain: 'sol', address: mint });
   if (!data) return null;
@@ -814,27 +848,35 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
     let symbol = info?.symbol ?? 'UNKNOWN';
     const tokenPrice = parseFloat(info?.price ?? 0);
 
-    // ── MC SOURCE PRIORITY (per N): GMGN headline FIRST. ──
-    // 0) OFFICIAL market rank route (curve-aware market_cap, no calc) — primary
-    // 1) GMGN's own market_cap / usd_market_cap field (what GMGN displays)
-    // 2) price × supply (still GMGN data)
-    // 3) pool-reserve calc (fallback only — can be unreliable)
-    // 4) DexScreener
+    // ── MC SOURCE PRIORITY ──
+    // 0) OFFICIAL kline price × supply (curve-aware, works on any token) — primary
+    // 1) OFFICIAL market rank market_cap (only if token is trending)
+    // 2) GMGN headline market_cap field
+    // 3) GMGN price × supply
+    // 4) pool-reserve calc (fallback — can be unreliable)
+    // 5) DexScreener
     let mc = 0;
     let mcSource = 'none';
+    const supplyForMC = parseFloat(info?.circulating_supply ?? info?.total_supply ?? 0);
+    // 0) kline price × supply (best for fresh tokens)
     try {
-      const off = await fetchOfficialMarketCap(tokenMint);
-      if (off && off > 0) { mc = off; mcSource = 'official-rank'; }
-    } catch (e) { log(`[ERR] fetchOfficialMarketCap call: ${e.message}`); }
+      const k = await fetchKlineMC(tokenMint, supplyForMC);
+      if (k.mc > 0) { mc = k.mc; mcSource = 'kline-30s'; }
+    } catch (e) { log(`[ERR] fetchKlineMC call: ${e.message}`); }
+    // 1) official rank route
+    if (mc <= 0) {
+      try {
+        const off = await fetchOfficialMarketCap(tokenMint);
+        if (off && off > 0) { mc = off; mcSource = 'official-rank'; }
+      } catch (e) { log(`[ERR] fetchOfficialMarketCap call: ${e.message}`); }
+    }
+    // 2) / 3) GMGN headline, then price×supply
     if (mc <= 0 && info) {
       let g = parseFloat(info.market_cap ?? info.usd_market_cap ?? 0);
       if (!isNaN(g) && g > 0) { mc = g; mcSource = 'gmgn-headline'; }
-      if (mc <= 0 && tokenPrice > 0) {
-        const supply = parseFloat(info.circulating_supply ?? info.total_supply ?? 0);
-        if (supply > 0) { mc = tokenPrice * supply; mcSource = 'gmgn-price×supply'; }
-      }
+      if (mc <= 0 && tokenPrice > 0 && supplyForMC > 0) { mc = tokenPrice * supplyForMC; mcSource = 'gmgn-price×supply'; }
     }
-    // Fallback: pool-reserve calc only if GMGN gave nothing
+    // 4) pool-reserve calc only if GMGN gave nothing
     if (mc <= 0) {
       try {
         const pm = await computePoolMC(tokenMint, info);
@@ -842,7 +884,7 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
         if (pm.symbol && pm.symbol !== 'UNKNOWN' && symbol === 'UNKNOWN') symbol = pm.symbol;
       } catch (e) { log(`[ERR] computePoolMC call: ${e.message}`); }
     }
-    // Last resort: DexScreener
+    // 5) Last resort: DexScreener
     if (mc <= 0) {
       try { const dexMC = await fetchDexMarketCap(tokenMint); if (dexMC > 0) { mc = dexMC; mcSource = 'dexscreener'; } }
       catch (e) { log(`[ERR] buyTracker dexMC: ${e.message}`); }
