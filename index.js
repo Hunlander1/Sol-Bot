@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24g  (Buy Tracker: kline 30s price MC primary; SLOW_MIN_WALLETS=4) <<<
+//  >>> VERSION: 2026-06-24i  (SLOW BOT REWRITE: 7 wallets within 90s of mint, no filter) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -61,9 +61,11 @@ const FAST_MIG_MIN_MC      = 38_000; // pump.fun migration ~$38k market cap thre
 const FAST_MIG_MIN_MC_BAGS = 375_000; // Bags tokens (mint ends 'bags') migrate at ~$375k
 
 // ── SLOW BOT CONFIG ───────────────────────────────────────────
-const SLOW_WINDOW_SECS    = 900;
-const SLOW_MAX_TOKEN_AGE  = 900;
-const SLOW_MIN_WALLETS    = 5;
+// NEW (2026-06-24): 7 tracked wallets buying within 90s of the token's mint
+// time, NO same-name / dev-ATH filter. Anchored to creation timestamp.
+const SLOW_WINDOW_SECS    = 90;
+const SLOW_MAX_TOKEN_AGE  = 90;
+const SLOW_MIN_WALLETS    = 7;
 const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
@@ -794,6 +796,15 @@ async function computePoolMC(mint, infoMaybe) {
     const supply = parseFloat(info.circulating_supply ?? info.total_supply ?? 0);
 
     if (quoteValUsd > 0 && baseReserve > 0 && supply > 0) {
+      // ── TOO-FRESH GUARD ──
+      // On a brand-new token almost the entire supply is still in the pool and
+      // only a few dollars of SOL have entered. There is no meaningful MC yet —
+      // the ratio produces a near-zero, meaningless number (e.g. $0.12). Reject it.
+      const fractionInPool = baseReserve / supply; // ~1.0 means nothing has sold
+      if (fractionInPool > 0.95 || quoteValUsd < 50) {
+        log(`[POOL MC] ${mint.substring(0,8)} TOO FRESH — pool holds ${(fractionInPool*100).toFixed(1)}% of supply, quoteVal=$${quoteValUsd.toFixed(2)} — no real MC yet`);
+        return { price: 0, mc: 0, symbol };
+      }
       const pricePerToken = quoteValUsd / baseReserve;
       const mc = pricePerToken * supply;
       log(`[POOL MC] ${mint.substring(0,8)} quoteVal=${quoteValUsd} baseReserve=${baseReserve} supply=${supply} => price=${pricePerToken} mc=${Math.round(mc)}`);
@@ -858,25 +869,18 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
     let mc = 0;
     let mcSource = 'none';
     const supplyForMC = parseFloat(info?.circulating_supply ?? info?.total_supply ?? 0);
-    // 0) kline price × supply (best for fresh tokens)
+    // 0) kline price × supply (best, GMGN's own curve-aware price)
     try {
       const k = await fetchKlineMC(tokenMint, supplyForMC);
       if (k.mc > 0) { mc = k.mc; mcSource = 'kline-30s'; }
     } catch (e) { log(`[ERR] fetchKlineMC call: ${e.message}`); }
-    // 1) official rank route
-    if (mc <= 0) {
-      try {
-        const off = await fetchOfficialMarketCap(tokenMint);
-        if (off && off > 0) { mc = off; mcSource = 'official-rank'; }
-      } catch (e) { log(`[ERR] fetchOfficialMarketCap call: ${e.message}`); }
-    }
-    // 2) / 3) GMGN headline, then price×supply
+    // 1) GMGN headline, then price×supply
     if (mc <= 0 && info) {
       let g = parseFloat(info.market_cap ?? info.usd_market_cap ?? 0);
       if (!isNaN(g) && g > 0) { mc = g; mcSource = 'gmgn-headline'; }
       if (mc <= 0 && tokenPrice > 0 && supplyForMC > 0) { mc = tokenPrice * supplyForMC; mcSource = 'gmgn-price×supply'; }
     }
-    // 4) pool-reserve calc only if GMGN gave nothing
+    // 2) pool-reserve calc (rejects near-empty fresh pools internally)
     if (mc <= 0) {
       try {
         const pm = await computePoolMC(tokenMint, info);
@@ -884,13 +888,14 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
         if (pm.symbol && pm.symbol !== 'UNKNOWN' && symbol === 'UNKNOWN') symbol = pm.symbol;
       } catch (e) { log(`[ERR] computePoolMC call: ${e.message}`); }
     }
-    // 5) Last resort: DexScreener
+    // 3) Last resort: DexScreener
     if (mc <= 0) {
       try { const dexMC = await fetchDexMarketCap(tokenMint); if (dexMC > 0) { mc = dexMC; mcSource = 'dexscreener'; } }
       catch (e) { log(`[ERR] buyTracker dexMC: ${e.message}`); }
     }
 
-    const mcStr = (mc > 0) ? fmtUsd(mc) : 'N/A';
+    // No real MC anywhere = token too fresh to have one yet. Show that honestly.
+    const mcStr = (mc > 0) ? fmtUsd(mc) : 'N/A (too fresh)';
 
     // USD value of the buy, when we have a price
     let usdStr = '';
@@ -1020,29 +1025,12 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
       const fw = tokenInfo.wallet_tags_stat?.fresh_wallets; if (fw != null) freshWalletsFromInfo = fw;
     }
 
-    const devAthPassesAlready = devAthMc !== null && devAthMc >= SLOW_DEV_ATH_THRESHOLD;
-    const devIsTrackedAlready = devWallet && devWallet !== 'N/A' && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
-    log(`[TIMING] dev decision ${tokenMint.substring(0,8)} | devAthMc=${devAthMc ?? 'null'} | devAthPasses=${devAthPassesAlready} | devTracked=${devIsTrackedAlready} | will ${(!devAthPassesAlready && !devIsTrackedAlready) ? 'FETCH same-name (slow path)' : 'SKIP same-name (fast path)'}`);
-
+    // Firing already decided in handler (7 wallets within 90s of mint). No filter.
+    // same-name kept as a DISPLAY-only field; not fetched here to avoid delay.
     let sameNameCount = null;
-    if (!devAthPassesAlready && !devIsTrackedAlready) {
-      log(`[SLOW] Fetching same-name count for #${symbol} (${tokenMint.substring(0,8)})`);
-      // Timeout guard: a hung/rate-limited DexScreener call must not freeze the signal.
-      // On timeout, treat same-name as null — the OR filter can still fire on the dev condition.
-      sameNameCount = await Promise.race([
-        fetchSameNameCount(tokenMint, symbol),
-        new Promise(resolve => setTimeout(() => resolve(null), 30000)),
-      ]);
-      log(`[SLOW] Same-name result: ${sameNameCount ?? 'null'} for #${symbol}`);
-    } else {
-      log(`[SLOW FILTER] ✅ Dev passes immediately — skipping DexScreener`);
-    }
-
-    if (!slowShouldFire(symbol, sameNameCount, devWallet, devAthMc)) return;
 
     const freshWallets = freshWalletsFromInfo ?? await fetchFreshWallets(tokenMint);
-    // Display-only 5m volume (DexScreener). Runs only after the signal has already
-    // passed slowShouldFire above, so it cannot affect or delay the fire decision.
+    // Display-only 5m volume (DexScreener).
     const vol5m = await fetchDexVolume5m(tokenMint).catch(() => null);
     const vol5mStr = (vol5m === null) ? 'N/A' : fmtUsd(vol5m);
     const notableHolders = await fetchNotableHolders(tokenMint, tokenInfo);
@@ -1055,18 +1043,17 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
     const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
     sendTelegram(CHAT_ID_SLOW,
-      `🚨 <b>3-Wallet Signal</b>\n\n` +
+      `🚨 <b>7-Wallet Signal (90s of mint)</b>\n\n` +
       `Token: #${symbol}\n` +
       `Contract: <code>${tokenMint}</code>\n` +
       `Mint Time: ${mintTimeStr}\n` +
       `Token Age: ${ageStr}\n` +
       `Liquidity: ${liquidityStr}\n` +
       `Market Cap: ${marketCapStr}\n` +
-      `Same-Name Count (5h): ${sameNameCount ?? '?'}\n` +
       `Fresh Wallets: ${freshWallets ?? 'N/A'}\n` +
       `Vol (5m): ${vol5mStr}\n` +
-      `Wallets Coordinated: ${walletCount} within ${elapsed}s\n` +
-      `Wallets: ${[...coordWallets].map(a => walletName(a)).join(', ')}\n\n` +
+      `Wallets: ${walletCount} bought within ${elapsed}s of mint\n` +
+      `Buyers: ${[...coordWallets].map(a => walletName(a)).join(', ')}\n\n` +
       `Dev Wallet: ${devWallet !== 'N/A' ? `<code>${devWallet}</code>` : 'N/A'}\n` +
       `Dev ATH: ${devAth}` +
       notableLine +
@@ -1174,38 +1161,35 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
   // ── FAST BOT ────────────────────────────────────────────
   // (removed — only migration + slow signals are active)
 
-  // ── SLOW BOT ────────────────────────────────────────────
-  const slowAge = await getTokenAge(tokenMint, SLOW_MAX_TOKEN_AGE, skipCacheSlow);
-  if (slowAge === -1) { log(`[SLOW SKIP] ${tokenMint.substring(0,8)} too old`); }
-  else {
-    // Allow unknown age through — same-name count and dev ATH filters will catch bad tokens
-    if (slowAge === null) { log(`[SLOW] ${tokenMint.substring(0,8)} age unknown — allowing (filtered by same-name/dev ATH)`); }
-    if (!slowAlerts[tokenMint]) {
-      slowAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
-    }
-    const se = slowAlerts[tokenMint];
-    if (now - se.firstSeenAt > SLOW_WINDOW_SECS) {
-      log(`[SLOW RESET] ${tokenMint.substring(0,8)}`);
-      slowAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
-    }
-    se.wallets.add(trackedWallet);
-    if (se.wallets.size >= 2) {
+  // ── SLOW BOT (now: 7 wallets within 90s of MINT TIME, no filter) ──
+  // creationCache[tokenMint] is the token's creation timestamp (populated by the
+  // dev-check fetch above). A buy only counts if the token is <= 90s old right now.
+  {
+    const mintTs = creationCache[tokenMint] ?? null;
+    const tokenAge = (mintTs !== null) ? now - mintTs : null;
+    if (mintTs === null) {
+      log(`[SLOW SKIP] ${tokenMint.substring(0,8)} — mint time unknown, can't measure 90s window`);
+    } else if (tokenAge > SLOW_MAX_TOKEN_AGE) {
+      log(`[SLOW SKIP] ${tokenMint.substring(0,8)} — ${tokenAge}s old, past ${SLOW_MAX_TOKEN_AGE}s mint window`);
+    } else {
+      if (!slowAlerts[tokenMint]) {
+        slowAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: mintTs };
+      }
+      const se = slowAlerts[tokenMint];
+      se.wallets.add(trackedWallet);
       const names = [...se.wallets].map(w => walletName(w)).join(', ');
-      log(`[SLOW] ${se.wallets.size}/${SLOW_MIN_WALLETS} for ${tokenMint} within ${now-se.firstSeenAt}s — wallets: ${names}`);
-    }
-    if (se.wallets.size >= SLOW_MIN_WALLETS) {
-      if (firedAlerts.has(tokenMint) || processing.has(tokenMint)) return;
-      processing.add(tokenMint); // synchronous — no await between check and add
-      firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
-      delete slowAlerts[tokenMint];
-      const elapsed = now - se.firstSeenAt;
-      const coordWallets = new Set(se.wallets);
-      const tiA = Date.now();
-      log(`[TIMING] 2/2 hit ${tokenMint.substring(0,8)} — fetching tokenInfo before signal`);
-      const tokenInfo = await getCachedTokenInfo(tokenMint);
-      log(`[TIMING] tokenInfo fetch took ${Date.now()-tiA}ms for ${tokenMint.substring(0,8)}`);
-      await buildSlowSignal(tokenMint, se.wallets.size, elapsed, tokenInfo, coordWallets);
-      processing.delete(tokenMint);
+      log(`[SLOW] ${se.wallets.size}/${SLOW_MIN_WALLETS} for ${tokenMint} at ${tokenAge}s old — wallets: ${names}`);
+      if (se.wallets.size >= SLOW_MIN_WALLETS) {
+        if (firedAlerts.has(tokenMint) || processing.has(tokenMint)) return;
+        processing.add(tokenMint); // synchronous — no await between check and add
+        firedAlerts.add(tokenMint); saveSet(FIRED_FILE, firedAlerts);
+        delete slowAlerts[tokenMint];
+        const elapsed = tokenAge; // seconds from mint to the 7th qualifying buy
+        const coordWallets = new Set(se.wallets);
+        const tokenInfo = await getCachedTokenInfo(tokenMint);
+        await buildSlowSignal(tokenMint, se.wallets.size, elapsed, tokenInfo, coordWallets);
+        processing.delete(tokenMint);
+      }
     }
   }
 
