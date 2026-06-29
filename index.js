@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24n  (TESTING: 24/7 + dual buy-size methods token×price vs SOL-leg) <<<
+//  >>> VERSION: 2026-06-24p  (TESTING: Big Buy 1-per-token dedup + SOL DEBUG capture) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -72,7 +72,7 @@ const SLOW_MIN_WALLETS    = 7;
 // wallet (not the dev) makes a buy worth more than $500 USD on a token under
 // 60 min old. Fires on EVERY qualifying buy (not just the first).
 const BIG_BUY_MIN_USD     = 500;
-const BIG_BUY_MAX_TOKEN_AGE = 3600; // 60 minutes
+const BIG_BUY_MAX_TOKEN_AGE = 25200; // 7 hours
 const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
@@ -297,6 +297,7 @@ let fastAlerts  = {};
 // ── STATE — FAST MIGRATION BOT ────────────────────────────────
 let migAlerts = {};
 let migFired  = loadSet('/tmp/sol_mig_fired.json');
+let bigBuyFired = new Set(); // tokens that already fired a Big Buy — one alert per contract
 
 // ── STATE — SLOW BOT ──────────────────────────────────────────
 let slowAlerts  = {};
@@ -932,10 +933,13 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
 }
 
 // BIG BUY signal — fires to CHAT_ID_SLOW when any tracked wallet (not the dev)
-// buys > $500 USD on a token under 60 min old. Fires on EVERY qualifying buy.
+// buys > $500 USD on a token under the age cap. ONE alert per token (deduped).
 // Independent of the 7-wallet signal; never touches slow-bot core logic.
 async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
   try {
+    // One signal per contract: if this token already fired a Big Buy, stop.
+    if (bigBuyFired.has(tokenMint)) return;
+
     const info = await getCachedTokenInfo(tokenMint);
 
     // Don't fire for the token's dev. Check the cache AND the freshly-fetched info,
@@ -944,6 +948,17 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
     const devFromInfo = info?.dev?.creator_address ?? null;
     if ((devFromCache && trackedWallet === devFromCache) || (devFromInfo && trackedWallet === devFromInfo)) {
       return;
+    }
+
+    // ── TEMP DEBUG: raw balance arrays for tracked-buy wallets, to diagnose the
+    // SOL-spent double-count. Logs once per buy; remove after the math is fixed.
+    if (TRACK_BUY_WALLETS[trackedWallet]) {
+      try {
+        const meta = tx?.meta; const msg = tx?.transaction?.message;
+        const keys = (msg?.accountKeys ?? []).map(k => typeof k === 'string' ? k : k?.pubkey);
+        const idx = keys.indexOf(trackedWallet);
+        log(`[SOL DEBUG] ${walletName(trackedWallet)} ${tokenMint.substring(0,8)} idx=${idx} preBal=${meta?.preBalances?.[idx]} postBal=${meta?.postBalances?.[idx]} fee=${meta?.fee} | wSOLpre=${JSON.stringify((meta?.preTokenBalances??[]).filter(b=>b.owner===trackedWallet&&b.mint===SOL_MINT).map(b=>b.uiTokenAmount?.uiAmount))} wSOLpost=${JSON.stringify((meta?.postTokenBalances??[]).filter(b=>b.owner===trackedWallet&&b.mint===SOL_MINT).map(b=>b.uiTokenAmount?.uiAmount))}`);
+      } catch(e) { log(`[ERR] SOL DEBUG: ${e.message}`); }
     }
 
     const buyAmount = extractBuyAmount(tx, trackedWallet, tokenMint);
@@ -1006,6 +1021,7 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
     const ageStr = age < 60 ? `${age}s` : `${Math.floor(age/60)}m ${age%60}s`;
     const buyTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
+    bigBuyFired.add(tokenMint); // one alert per contract
     sendTelegram(CHAT_ID_SLOW,
       `💵 <b>Big Buy — ${walletName(trackedWallet)} ${fmtUsd(usdForThreshold)}</b>\n\n` +
       `Token: #${symbol}\n` +
