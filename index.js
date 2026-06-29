@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24k  (Big Buy + BUY SIZE debug log on every valued buy) <<<
+//  >>> VERSION: 2026-06-24n  (TESTING: 24/7 + dual buy-size methods token×price vs SOL-leg) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -333,9 +333,13 @@ function log(msg) {
 }
 
 function isActiveHours() {
-  const eastern = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const val = eastern.getHours() * 60 + eastern.getMinutes();
-  return val >= 660 && val < 1080;
+  // TESTING (2026-06-24): hours gate DISABLED so the bot runs 24/7 for tonight's test.
+  // To restore the 11am–6pm ET window, delete the `return true;` line below and
+  // uncomment the three original lines.
+  return true;
+  // const eastern = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  // const val = eastern.getHours() * 60 + eastern.getMinutes();
+  // return val >= 660 && val < 1080;
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -945,13 +949,44 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
     const buyAmount = extractBuyAmount(tx, trackedWallet, tokenMint);
     if (!(buyAmount > 0)) return;
 
-    const tokenPrice = parseFloat(info?.price ?? 0);
-    if (!(tokenPrice > 0)) return; // can't value the buy without a price
+    // Price for METHOD 1 (token×price): GMGN first, then pool-derived. May be 0 on
+    // very fresh tokens — that's fine, METHOD 2 (SOL leg) below doesn't need it.
+    let tokenPrice = parseFloat(info?.price ?? 0);
+    let priceSource = 'gmgn';
+    if (!(tokenPrice > 0)) {
+      const pool = info?.pool ?? {};
+      const quoteValUsd = parseFloat(pool.quote_reserve_value ?? 0);
+      const baseReserve = parseFloat(pool.base_reserve ?? 0);
+      if (quoteValUsd > 0 && baseReserve > 0) {
+        tokenPrice = quoteValUsd / baseReserve;
+        priceSource = 'pool';
+      } else {
+        priceSource = 'none';
+      }
+    }
 
-    const usd = tokenPrice * buyAmount;
-    // DEBUG: log every evaluated buy size (not just ones over threshold) to verify accuracy.
-    log(`[BUY SIZE] ${walletName(trackedWallet)} ${tokenMint.substring(0,8)} | tokens=${fmtTokenAmount(buyAmount)} price=${tokenPrice} => $${usd.toFixed(2)} (threshold $${BIG_BUY_MIN_USD})`);
-    if (usd <= BIG_BUY_MIN_USD) return; // under threshold, ignore
+    const usd = tokenPrice > 0 ? tokenPrice * buyAmount : 0;
+
+    // ── METHOD 2 (more accurate): value the buy by the SOL leg ──
+    // SOL spent (exact on-chain delta) × SOL/USD price (reliable). Both inputs are
+    // trustworthy, unlike a fresh token's price. Logged alongside Method 1 so we can
+    // compare which is accurate; the SOL-leg value is preferred for the threshold
+    // when available, since token-price valuation is unreliable on fresh tokens.
+    let usdSol = 0;
+    try {
+      const solSpent = extractSolSpent(tx, trackedWallet);
+      if (solSpent > 0) {
+        const solPrice = await getSolPrice();
+        usdSol = solSpent * solPrice;
+      }
+    } catch (e) { log(`[ERR] extractSolSpent: ${e.message}`); }
+
+    // DEBUG: log BOTH methods so we can see which is accurate against GMGN.
+    log(`[BUY SIZE] ${walletName(trackedWallet)} ${tokenMint.substring(0,8)} | tokenMethod=$${usd.toFixed(2)} (price src=${priceSource}) | solMethod=$${usdSol.toFixed(2)} | threshold $${BIG_BUY_MIN_USD}`);
+
+    // Use the SOL-leg value when we have it (more reliable), else fall back to token×price.
+    const usdForThreshold = usdSol > 0 ? usdSol : usd;
+    if (usdForThreshold <= BIG_BUY_MIN_USD) return; // under threshold, ignore
 
     // Token age gate: only tokens under 60 min old
     const createdAt = parseFloat(info?.creation_timestamp ?? creationCache[tokenMint] ?? 0);
@@ -972,17 +1007,17 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
     const buyTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
     sendTelegram(CHAT_ID_SLOW,
-      `💵 <b>Big Buy — ${walletName(trackedWallet)} ${fmtUsd(usd)}</b>\n\n` +
+      `💵 <b>Big Buy — ${walletName(trackedWallet)} ${fmtUsd(usdForThreshold)}</b>\n\n` +
       `Token: #${symbol}\n` +
       `Contract: <code>${tokenMint}</code>\n` +
-      `Buy Size: ${fmtUsd(usd)} (${fmtTokenAmount(buyAmount)} tokens)\n` +
+      `Buy Size: ${fmtUsd(usdForThreshold)} (${fmtTokenAmount(buyAmount)} tokens)\n` +
       `Market Cap: ${mcStr}\n` +
       `Token Age: ${ageStr}\n` +
       `Wallet: ${walletName(trackedWallet)}\n` +
       `Time: ${buyTime}\n\n` +
       `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
     );
-    log(`[BIG BUY] ${walletName(trackedWallet)} bought ${fmtUsd(usd)} of #${symbol} (age ${ageStr}) — sent to slow chat`);
+    log(`[BIG BUY] ${walletName(trackedWallet)} bought ${fmtUsd(usdForThreshold)} of #${symbol} (age ${ageStr}) — sent to slow chat`);
   } catch(e) { log(`[ERR] sendBigBuyAlert: ${e.message}`); }
 }
 
