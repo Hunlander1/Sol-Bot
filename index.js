@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24j  (Big Buy signal: tracked wallet buys >$500 on tokens <60min -> slow chat) <<<
+//  >>> VERSION: 2026-06-24k  (Big Buy + BUY SIZE debug log on every valued buy) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -949,6 +949,8 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
     if (!(tokenPrice > 0)) return; // can't value the buy without a price
 
     const usd = tokenPrice * buyAmount;
+    // DEBUG: log every evaluated buy size (not just ones over threshold) to verify accuracy.
+    log(`[BUY SIZE] ${walletName(trackedWallet)} ${tokenMint.substring(0,8)} | tokens=${fmtTokenAmount(buyAmount)} price=${tokenPrice} => $${usd.toFixed(2)} (threshold $${BIG_BUY_MIN_USD})`);
     if (usd <= BIG_BUY_MIN_USD) return; // under threshold, ignore
 
     // Token age gate: only tokens under 60 min old
