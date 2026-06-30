@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24p  (TESTING: Big Buy 1-per-token dedup + SOL DEBUG capture) <<<
+//  >>> VERSION: 2026-06-24q  (FIX: extractSolSpent 2x double-count — wSOL leg dropped) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -16,9 +16,15 @@
 //     Fires when 2 tracked wallets buy + the token hits its MC
 //     threshold within 30s of mint ($38k pump.fun / $375k Bags).
 //
-//  NOTE: This build includes a TEMPORARY [VOL DEBUG] block in
-//  buildSlowSignal to identify GMGN's volume field. Remove once
-//  the real volume source is wired in.
+//  CHANGE LOG (24q):
+//   - extractSolSpent now uses ONLY the native SOL balance delta.
+//     The previous version ADDED the wSOL token-balance delta on top,
+//     but on a pump.fun buy the native SOL is wrapped into wSOL and
+//     spent within the SAME tx — so both deltas represent the SAME
+//     money. Summing them double-counted, reporting ~2x the real buy
+//     (e.g. $553 for a ~$267 buy). Native-only is the true spend.
+//   - SOL DEBUG capture retained (still useful for verification).
+//   - Slow-bot core logic UNCHANGED.
 // ============================================================
 
 const https     = require('https');
@@ -760,9 +766,18 @@ function fmtTokenAmount(n) {
 }
 
 // Net SOL the wallet put into the swap, read from the transaction.
-// Uses native SOL balance delta + wSOL token balance delta.
-// NOTE: this includes gas/priority/tip fees, so it can slightly
-// overstate spend; used only as a fallback when reserve pricing fails.
+//
+// ── 24q FIX ──
+// Uses ONLY the native SOL balance delta (preBalances[idx] - postBalances[idx]).
+//
+// WHY the wSOL leg was removed: on a pump.fun / AMM buy the wallet's native SOL
+// is wrapped into wSOL and that wSOL is spent on the token — all inside the SAME
+// transaction. So the native-SOL drop and the wSOL-account drop describe the SAME
+// money moving one hop further along. The previous version ADDED them together,
+// which double-counted and reported roughly 2x the real spend (e.g. $553 for a
+// buy that was actually ~$267). Native delta alone is the true SOL spent, and it
+// already includes the (tiny) gas/priority/tip fees — a slight, acceptable
+// overstatement on the order of cents.
 function extractSolSpent(tx, trackedWallet) {
   const meta = tx?.meta;
   const msg  = tx?.transaction?.message;
@@ -774,21 +789,15 @@ function extractSolSpent(tx, trackedWallet) {
     const k = typeof keys[i] === 'string' ? keys[i] : keys[i]?.pubkey;
     if (k === trackedWallet) { idx = i; break; }
   }
+  if (idx < 0) return 0;
+  if (!Array.isArray(meta.preBalances) || !Array.isArray(meta.postBalances)) return 0;
 
-  let nativeSpent = 0;
-  if (idx >= 0 && Array.isArray(meta.preBalances) && Array.isArray(meta.postBalances)) {
-    const pre  = meta.preBalances[idx]  ?? 0;
-    const post = meta.postBalances[idx] ?? 0;
-    nativeSpent = (pre - post) / 1e9;
-  }
+  const pre  = meta.preBalances[idx]  ?? 0;
+  const post = meta.postBalances[idx] ?? 0;
+  const nativeSpent = (pre - post) / 1e9;
 
-  let preW = 0, postW = 0;
-  for (const b of (meta.preTokenBalances ?? []))  { if (b.owner === trackedWallet && b.mint === SOL_MINT) preW  = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0; }
-  for (const b of (meta.postTokenBalances ?? [])) { if (b.owner === trackedWallet && b.mint === SOL_MINT) postW = parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0; }
-  const wsolSpent = preW - postW;
-
-  const total = nativeSpent + (wsolSpent > 0 ? wsolSpent : 0);
-  return total > 0 ? total : 0;
+  // NOTE: wSOL token-balance delta intentionally EXCLUDED — see fix note above.
+  return nativeSpent > 0 ? nativeSpent : 0;
 }
 
 // Computes MC from GMGN's pool reserves, which GMGN already identifies and
@@ -950,8 +959,9 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
       return;
     }
 
-    // ── TEMP DEBUG: raw balance arrays for tracked-buy wallets, to diagnose the
-    // SOL-spent double-count. Logs once per buy; remove after the math is fixed.
+    // ── TEMP DEBUG: raw balance arrays for tracked-buy wallets, to verify the
+    // SOL-spent fix. Logs once per buy; safe to remove once you're satisfied 24q
+    // reads correctly.
     if (TRACK_BUY_WALLETS[trackedWallet]) {
       try {
         const meta = tx?.meta; const msg = tx?.transaction?.message;
@@ -982,11 +992,9 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
 
     const usd = tokenPrice > 0 ? tokenPrice * buyAmount : 0;
 
-    // ── METHOD 2 (more accurate): value the buy by the SOL leg ──
-    // SOL spent (exact on-chain delta) × SOL/USD price (reliable). Both inputs are
-    // trustworthy, unlike a fresh token's price. Logged alongside Method 1 so we can
-    // compare which is accurate; the SOL-leg value is preferred for the threshold
-    // when available, since token-price valuation is unreliable on fresh tokens.
+    // ── METHOD 2 (now accurate after 24q fix): value the buy by the SOL leg ──
+    // SOL spent (native on-chain delta) × SOL/USD price. Both inputs are reliable,
+    // unlike a fresh token's price. Preferred for the threshold when available.
     let usdSol = 0;
     try {
       const solSpent = extractSolSpent(tx, trackedWallet);
