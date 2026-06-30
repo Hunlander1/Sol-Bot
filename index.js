@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24q  (FIX: extractSolSpent 2x double-count — wSOL leg dropped) <<<
+//  >>> VERSION: 2026-06-24r  (REFINE: extractSolSpent prefers wSOL swap leg, native fallback) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -16,13 +16,16 @@
 //     Fires when 2 tracked wallets buy + the token hits its MC
 //     threshold within 30s of mint ($38k pump.fun / $375k Bags).
 //
-//  CHANGE LOG (24q):
-//   - extractSolSpent now uses ONLY the native SOL balance delta.
-//     The previous version ADDED the wSOL token-balance delta on top,
-//     but on a pump.fun buy the native SOL is wrapped into wSOL and
-//     spent within the SAME tx — so both deltas represent the SAME
-//     money. Summing them double-counted, reporting ~2x the real buy
-//     (e.g. $553 for a ~$267 buy). Native-only is the true spend.
+//  CHANGE LOG:
+//   24q — extractSolSpent stopped ADDING native + wSOL legs (that summed the
+//         SAME money twice, reporting ~2x; e.g. $553 for a ~$267 buy). 24q
+//         used native-only, which is correct for pump.fun-style buys.
+//   24r — extractSolSpent now PREFERS the wSOL swap leg when one exists, and
+//         falls back to the native delta only when there's no wSOL account.
+//         The wSOL drop isolates the actual swap input, so a tx that both buys
+//         a token AND sends unrelated native SOL out no longer overstates the
+//         buy. Never sums the two legs. For wallets with no wSOL account
+//         (e.g. Theo's pump.fun buys in testing), behaviour is identical to 24q.
 //   - SOL DEBUG capture retained (still useful for verification).
 //   - Slow-bot core logic UNCHANGED.
 // ============================================================
@@ -767,22 +770,46 @@ function fmtTokenAmount(n) {
 
 // Net SOL the wallet put into the swap, read from the transaction.
 //
-// ── 24q FIX ──
-// Uses ONLY the native SOL balance delta (preBalances[idx] - postBalances[idx]).
+// ── 24q FIX (double-count) → 24r REFINEMENT (overcount guard) ──
+// The actual swap input is ONE of two things, never the sum of both:
 //
-// WHY the wSOL leg was removed: on a pump.fun / AMM buy the wallet's native SOL
-// is wrapped into wSOL and that wSOL is spent on the token — all inside the SAME
-// transaction. So the native-SOL drop and the wSOL-account drop describe the SAME
-// money moving one hop further along. The previous version ADDED them together,
-// which double-counted and reported roughly 2x the real spend (e.g. $553 for a
-// buy that was actually ~$267). Native delta alone is the true SOL spent, and it
-// already includes the (tiny) gas/priority/tip fees — a slight, acceptable
-// overstatement on the order of cents.
+//   (a) wSOL leg: the wallet's wrapped-SOL (wSOL) token account drops by the
+//       amount spent. This is the precise swap input when the wallet uses a
+//       wSOL account (common for trading bots / Jupiter routes).
+//
+//   (b) native SOL leg: on pump.fun-style buys the wallet has no standing wSOL
+//       account; native SOL leaves the wallet directly (preBal - postBal).
+//
+// The OLD bug ADDED (a)+(b), double-counting (~2x). 24q used native-only, which
+// is correct for case (b) but can OVERSTATE in a tx that both buys a token AND
+// sends unrelated SOL out — the native drop then includes that extra outflow.
+//
+// 24r: PREFER the wSOL delta when a wSOL leg exists (it isolates the swap input
+// and ignores unrelated native outflows); fall back to the native delta only
+// when there is no wSOL leg. Never sum them.
 function extractSolSpent(tx, trackedWallet) {
   const meta = tx?.meta;
   const msg  = tx?.transaction?.message;
   if (!meta || !msg) return 0;
 
+  // ── wSOL leg (preferred when present) ──
+  // Sum the wallet's wSOL token-account balances pre/post. A drop = SOL spent
+  // into the swap. Only counts the tracked wallet's own wSOL accounts.
+  let preW = 0, postW = 0, hasWsol = false;
+  for (const b of (meta.preTokenBalances ?? []))  {
+    if (b.owner === trackedWallet && b.mint === SOL_MINT) { preW  += parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0; hasWsol = true; }
+  }
+  for (const b of (meta.postTokenBalances ?? [])) {
+    if (b.owner === trackedWallet && b.mint === SOL_MINT) { postW += parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0; hasWsol = true; }
+  }
+  if (hasWsol) {
+    const wsolSpent = preW - postW;
+    if (wsolSpent > 0) return wsolSpent; // clean swap input, ignores unrelated native outflow
+    // wSOL present but no net drop (e.g. wrap-then-spend nets ~0 in the token
+    // account) — fall through to the native delta below.
+  }
+
+  // ── native SOL leg (fallback: no usable wSOL drop) ──
   const keys = msg.accountKeys ?? [];
   let idx = -1;
   for (let i = 0; i < keys.length; i++) {
@@ -795,8 +822,6 @@ function extractSolSpent(tx, trackedWallet) {
   const pre  = meta.preBalances[idx]  ?? 0;
   const post = meta.postBalances[idx] ?? 0;
   const nativeSpent = (pre - post) / 1e9;
-
-  // NOTE: wSOL token-balance delta intentionally EXCLUDED — see fix note above.
   return nativeSpent > 0 ? nativeSpent : 0;
 }
 
