@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24r  (REFINE: extractSolSpent prefers wSOL swap leg, native fallback) <<<
+//  >>> VERSION: 2026-06-24s  (FIX: market cap — read nested price.price, not info.price) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -26,8 +26,16 @@
 //         a token AND sends unrelated native SOL out no longer overstates the
 //         buy. Never sums the two legs. For wallets with no wSOL account
 //         (e.g. Theo's pump.fun buys in testing), behaviour is identical to 24q.
+//   24s — MARKET CAP FIX. GMGN's /v1/token/info returns NO market_cap field and
+//         price is a NESTED object: the USD price is info.price.price (a string),
+//         not info.price. Every read in the bot used parseFloat(info.price),
+//         which is NaN on an object, so GMGN pricing silently failed everywhere
+//         (MC, Big Buy tokenMethod, even getSolPrice → fell back to $150). Added
+//         tokenPriceUsd() / tokenSupply() / tokenMarketCap() helpers and routed
+//         all price/MC reads through them. GMGN price×supply is now the primary
+//         MC source (correct for any token), with kline / pool-calc / DexScreener
+//         as fallbacks. Slow-bot core logic UNCHANGED.
 //   - SOL DEBUG capture retained (still useful for verification).
-//   - Slow-bot core logic UNCHANGED.
 // ============================================================
 
 const https     = require('https');
@@ -361,6 +369,46 @@ function fmtUsd(n) {
   return `$${n.toFixed(2)}`;
 }
 
+// ── PRICE / MARKET CAP READERS (24s) ──────────────────────────
+// GMGN's /v1/token/info does NOT return a numeric `price` or a `market_cap`
+// field. Per the GMGN docs:
+//   • price is a NESTED object — the current USD price is `info.price.price`
+//     (a string). `info.price` itself is an object, so parseFloat(info.price)
+//     is NaN — which is the bug that silently broke every MC/price read.
+//   • market cap is NOT returned — compute it as price.price × circulating_supply.
+// These two helpers are the single correct way to read price and MC from a
+// token/info object anywhere in the bot.
+
+// Current USD price for a token from its info object. Handles the nested
+// price.price shape and tolerates older/simple shapes just in case.
+function tokenPriceUsd(info) {
+  if (!info) return 0;
+  // Correct GMGN shape: price is an object with a `price` string field.
+  if (info.price && typeof info.price === 'object') {
+    const p = parseFloat(info.price.price ?? 0);
+    return p > 0 ? p : 0;
+  }
+  // Fallback: some responses may expose a flat numeric/string price.
+  const flat = parseFloat(info.price ?? 0);
+  return flat > 0 ? flat : 0;
+}
+
+// Circulating (or total) supply in human-readable units.
+function tokenSupply(info) {
+  if (!info) return 0;
+  const s = parseFloat(info.circulating_supply ?? info.total_supply ?? 0);
+  return s > 0 ? s : 0;
+}
+
+// Market cap = price × supply. GMGN never returns MC directly on token/info,
+// so this is THE way to get it from a token/info object. Returns 0 if either
+// input is missing (caller then falls back to pool-calc / DexScreener).
+function tokenMarketCap(info) {
+  const price = tokenPriceUsd(info);
+  const supply = tokenSupply(info);
+  return (price > 0 && supply > 0) ? price * supply : 0;
+}
+
 // ── HTTP ──────────────────────────────────────────────────────
 function httpsGet(hostname, path, headers = {}) {
   return new Promise((resolve) => {
@@ -663,7 +711,7 @@ async function getSolPrice() {
   const now = Math.floor(Date.now() / 1000);
   if (solPriceCache.price && now - solPriceCache.ts < 300) return solPriceCache.price;
   const info = await getCachedTokenInfo(SOL_MINT);
-  const price = parseFloat(info?.price ?? 0);
+  const price = tokenPriceUsd(info); // nested price.price — see helper
   if (price > 0) solPriceCache = { price, ts: now };
   return solPriceCache.price ?? 150;
 }
@@ -685,8 +733,8 @@ async function fetchNotableHolders(mint, tokenInfo) {
     const accounts = result?.result?.value ?? [];
     if (!accounts.length) return [];
     const solPrice = await getSolPrice();
-    const tokenPrice = parseFloat(tokenInfo?.price ?? 0);
-    const totalSupply = parseFloat(tokenInfo?.circulating_supply ?? tokenInfo?.total_supply ?? 0);
+    const tokenPrice = tokenPriceUsd(tokenInfo);
+    const totalSupply = tokenSupply(tokenInfo);
     const notable = []; const seen = new Set();
     for (const account of accounts.slice(0, 20)) {
       await sleep(200);
@@ -873,12 +921,8 @@ async function resolveBuyTrackerMC(tokenMint) {
   if (info) {
     tokenInfoCache[tokenMint] = info;
     symbol = info.symbol ?? 'UNKNOWN';
-    tokenPrice = parseFloat(info.price ?? 0);
-    mc = parseFloat(info.market_cap ?? info.usd_market_cap ?? 0);
-    if ((isNaN(mc) || mc === 0) && tokenPrice > 0) {
-      const supply = parseFloat(info.circulating_supply ?? info.total_supply ?? 0);
-      if (supply > 0) mc = tokenPrice * supply;
-    }
+    tokenPrice = tokenPriceUsd(info);
+    mc = tokenMarketCap(info); // price.price × circulating_supply
   }
   if (isNaN(mc) || mc === 0) {
     const dexMC = await fetchDexMarketCap(tokenMint);
@@ -903,28 +947,29 @@ async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
     catch (e) { log(`[ERR] buyTracker fetchTokenInfo: ${e.message}`); }
 
     let symbol = info?.symbol ?? 'UNKNOWN';
-    const tokenPrice = parseFloat(info?.price ?? 0);
+    const tokenPrice = tokenPriceUsd(info);
 
-    // ── MC SOURCE PRIORITY ──
-    // 0) OFFICIAL kline price × supply (curve-aware, works on any token) — primary
-    // 1) OFFICIAL market rank market_cap (only if token is trending)
-    // 2) GMGN headline market_cap field
-    // 3) GMGN price × supply
-    // 4) pool-reserve calc (fallback — can be unreliable)
-    // 5) DexScreener
+    // ── MC SOURCE PRIORITY (24s) ──
+    // 0) GMGN price×supply (price.price × circulating_supply) — this is GMGN's
+    //    own curve-aware price and is correct for ANY token, fresh or not. It's
+    //    now primary because the field-access bug that broke it is fixed.
+    // 1) kline price × supply (backup GMGN price; empty on sub-30s tokens)
+    // 2) pool-reserve calc (fallback — can be unreliable)
+    // 3) DexScreener
     let mc = 0;
     let mcSource = 'none';
-    const supplyForMC = parseFloat(info?.circulating_supply ?? info?.total_supply ?? 0);
-    // 0) kline price × supply (best, GMGN's own curve-aware price)
-    try {
-      const k = await fetchKlineMC(tokenMint, supplyForMC);
-      if (k.mc > 0) { mc = k.mc; mcSource = 'kline-30s'; }
-    } catch (e) { log(`[ERR] fetchKlineMC call: ${e.message}`); }
-    // 1) GMGN headline, then price×supply
-    if (mc <= 0 && info) {
-      let g = parseFloat(info.market_cap ?? info.usd_market_cap ?? 0);
-      if (!isNaN(g) && g > 0) { mc = g; mcSource = 'gmgn-headline'; }
-      if (mc <= 0 && tokenPrice > 0 && supplyForMC > 0) { mc = tokenPrice * supplyForMC; mcSource = 'gmgn-price×supply'; }
+    const supplyForMC = tokenSupply(info);
+    // 0) GMGN price × supply (correct primary)
+    {
+      const g = tokenMarketCap(info);
+      if (g > 0) { mc = g; mcSource = 'gmgn-price×supply'; }
+    }
+    // 1) kline price × supply (backup)
+    if (mc <= 0) {
+      try {
+        const k = await fetchKlineMC(tokenMint, supplyForMC);
+        if (k.mc > 0) { mc = k.mc; mcSource = 'kline-30s'; }
+      } catch (e) { log(`[ERR] fetchKlineMC call: ${e.message}`); }
     }
     // 2) pool-reserve calc (rejects near-empty fresh pools internally)
     if (mc <= 0) {
@@ -999,9 +1044,10 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
     const buyAmount = extractBuyAmount(tx, trackedWallet, tokenMint);
     if (!(buyAmount > 0)) return;
 
-    // Price for METHOD 1 (token×price): GMGN first, then pool-derived. May be 0 on
-    // very fresh tokens — that's fine, METHOD 2 (SOL leg) below doesn't need it.
-    let tokenPrice = parseFloat(info?.price ?? 0);
+    // Price for METHOD 1 (token×price): GMGN nested price.price first, then
+    // pool-derived. May be 0 on very fresh tokens — that's fine, METHOD 2
+    // (SOL leg) below doesn't need it.
+    let tokenPrice = tokenPriceUsd(info);
     let priceSource = 'gmgn';
     if (!(tokenPrice > 0)) {
       const pool = info?.pool ?? {};
@@ -1045,10 +1091,10 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
 
     // Build display fields
     let symbol = info?.symbol ?? 'UNKNOWN';
-    let mc = parseFloat(info?.market_cap ?? info?.usd_market_cap ?? 0);
-    if ((isNaN(mc) || mc === 0) && tokenPrice > 0) {
-      const supply = parseFloat(info?.circulating_supply ?? info?.total_supply ?? 0);
-      if (supply > 0) mc = tokenPrice * supply;
+    let mc = tokenMarketCap(info); // price.price × circulating_supply
+    if (mc <= 0 && tokenPrice > 0) {
+      const supply = tokenSupply(info);
+      if (supply > 0) mc = tokenPrice * supply; // pool-derived price fallback
     }
     const mcStr = (mc > 0) ? fmtUsd(mc) : 'N/A';
     const ageStr = age < 60 ? `${age}s` : `${Math.floor(age/60)}m ${age%60}s`;
@@ -1088,8 +1134,7 @@ async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, 
       }
       const liq = parseFloat(tokenInfo.liquidity);
       if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
-      if (isNaN(mc) || mc === 0) { const p = parseFloat(tokenInfo.price); const s = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply); if (!isNaN(p) && !isNaN(s) && p > 0 && s > 0) mc = p*s; }
+      let mc = tokenMarketCap(tokenInfo); // price.price × circulating_supply
       if ((isNaN(mc) || mc === 0) && resolvedMC > 0) mc = resolvedMC; // fall back to the MC that cleared the threshold (e.g. DexScreener)
       if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
       const ca2 = tokenInfo.dev?.creator_address; if (ca2) devWallet = ca2;
@@ -1166,8 +1211,7 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
       }
       const liq = parseFloat(tokenInfo.liquidity);
       if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
-      if (isNaN(mc) || mc === 0) { const p = parseFloat(tokenInfo.price); const s = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply); if (!isNaN(p) && !isNaN(s) && p > 0 && s > 0) mc = p*s; }
+      let mc = tokenMarketCap(tokenInfo); // price.price × circulating_supply
       if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
       const ca2 = tokenInfo.dev?.creator_address; if (ca2) devWallet = ca2;
       const athInfo = tokenInfo.dev?.ath_token_info;
@@ -1226,10 +1270,7 @@ async function resolveMigration(tokenMint, now) {
   try {
     if (migFired.has(tokenMint)) return;
     const tokenInfo = await getCachedTokenInfo(tokenMint);
-    let tokenMC = parseFloat(tokenInfo?.market_cap ?? tokenInfo?.usd_market_cap ?? 0);
-    if ((isNaN(tokenMC) || tokenMC === 0) && tokenInfo?.price && tokenInfo?.circulating_supply) {
-      tokenMC = parseFloat(tokenInfo.price) * parseFloat(tokenInfo.circulating_supply);
-    }
+    let tokenMC = tokenMarketCap(tokenInfo); // price.price × circulating_supply
     // Retry: cached info on a brand-new token often has no MC yet. Re-fetch fresh once.
     let retryInfo = tokenInfo;
     if (isNaN(tokenMC) || tokenMC === 0) {
@@ -1238,10 +1279,7 @@ async function resolveMigration(tokenMint, now) {
       retryInfo = await fetchTokenInfo(tokenMint);
       if (retryInfo) {
         tokenInfoCache[tokenMint] = retryInfo;
-        tokenMC = parseFloat(retryInfo.market_cap ?? retryInfo.usd_market_cap ?? 0);
-        if ((isNaN(tokenMC) || tokenMC === 0) && retryInfo.price && retryInfo.circulating_supply) {
-          tokenMC = parseFloat(retryInfo.price) * parseFloat(retryInfo.circulating_supply);
-        }
+        tokenMC = tokenMarketCap(retryInfo);
       }
     }
     // Fallback: GMGN still has no MC — try DexScreener
