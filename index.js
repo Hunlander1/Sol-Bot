@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24s  (FIX: market cap — read nested price.price, not info.price) <<<
+//  >>> VERSION: 2026-06-24t  (CHANGE: 7-Wallet Signal now routes to CHAT_ID_FAST) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -35,6 +35,11 @@
 //         all price/MC reads through them. GMGN price×supply is now the primary
 //         MC source (correct for any token), with kline / pool-calc / DexScreener
 //         as fallbacks. Slow-bot core logic UNCHANGED.
+//   24t — The 7-Wallet Signal (7 tracked wallets buying the same token within
+//         90s of mint) now sends to CHAT_ID_FAST (the fast/migration group)
+//         instead of CHAT_ID_SLOW. The Big Buy (large single-buy) alerts stay
+//         on CHAT_ID_SLOW, so the two are now cleanly separated by group.
+//         No detection/threshold logic changed — only the destination chat.
 //   - SOL DEBUG capture retained (still useful for verification).
 // ============================================================
 
@@ -1236,7 +1241,7 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
 
     const signalTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
-    sendTelegram(CHAT_ID_SLOW,
+    sendTelegram(CHAT_ID_FAST,
       `🚨 <b>7-Wallet Signal (90s of mint)</b>\n\n` +
       `Token: #${symbol}\n` +
       `Contract: <code>${tokenMint}</code>\n` +
