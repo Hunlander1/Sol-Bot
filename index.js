@@ -1,46 +1,34 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24t  (CHANGE: 7-Wallet Signal now routes to CHAT_ID_FAST) <<<
+//  >>> VERSION: 2026-06-24u  (CLEANUP: removed Theo/Cented buy tracker + dead code) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
-//  Two active signals, both running in one process:
+//  Active signals in one process:
 //
-//  1. SLOW SIGNAL  (Telegram group CHAT_ID_SLOW)
-//     Fires when 2 tracked wallets buy the same token within
-//     15 min, token under 15 min old. Passes the OR filter:
-//     same-name >=10  OR  dev ATH >=$1M  OR  dev is a tracked wallet.
-//
-//  2. MIGRATION SIGNAL  (Telegram group CHAT_ID_FAST)
-//     Fires when 2 tracked wallets buy + the token hits its MC
-//     threshold within 30s of mint ($38k pump.fun / $375k Bags).
+//  1. MIGRATION SIGNAL  (CHAT_ID_FAST)  — 2 tracked wallets buy + token hits
+//     its MC threshold within 30s of mint ($38k pump.fun / $375k Bags).
+//  2. 7-WALLET SIGNAL   (CHAT_ID_FAST)  — 7 tracked wallets buy the same token
+//     within 90s of mint.
+//  3. BIG BUY SIGNAL    (CHAT_ID_SLOW)  — a tracked wallet (not the dev) buys
+//     >$500 of a token under the age cap.
 //
 //  CHANGE LOG:
-//   24q — extractSolSpent stopped ADDING native + wSOL legs (that summed the
-//         SAME money twice, reporting ~2x; e.g. $553 for a ~$267 buy). 24q
-//         used native-only, which is correct for pump.fun-style buys.
-//   24r — extractSolSpent now PREFERS the wSOL swap leg when one exists, and
-//         falls back to the native delta only when there's no wSOL account.
-//         The wSOL drop isolates the actual swap input, so a tx that both buys
-//         a token AND sends unrelated native SOL out no longer overstates the
-//         buy. Never sums the two legs. For wallets with no wSOL account
-//         (e.g. Theo's pump.fun buys in testing), behaviour is identical to 24q.
-//   24s — MARKET CAP FIX. GMGN's /v1/token/info returns NO market_cap field and
-//         price is a NESTED object: the USD price is info.price.price (a string),
-//         not info.price. Every read in the bot used parseFloat(info.price),
-//         which is NaN on an object, so GMGN pricing silently failed everywhere
-//         (MC, Big Buy tokenMethod, even getSolPrice → fell back to $150). Added
-//         tokenPriceUsd() / tokenSupply() / tokenMarketCap() helpers and routed
-//         all price/MC reads through them. GMGN price×supply is now the primary
-//         MC source (correct for any token), with kline / pool-calc / DexScreener
-//         as fallbacks. Slow-bot core logic UNCHANGED.
-//   24t — The 7-Wallet Signal (7 tracked wallets buying the same token within
-//         90s of mint) now sends to CHAT_ID_FAST (the fast/migration group)
-//         instead of CHAT_ID_SLOW. The Big Buy (large single-buy) alerts stay
-//         on CHAT_ID_SLOW, so the two are now cleanly separated by group.
-//         No detection/threshold logic changed — only the destination chat.
-//   - SOL DEBUG capture retained (still useful for verification).
+//   24q — extractSolSpent stopped ADDING native + wSOL legs (double-count ~2x).
+//   24r — extractSolSpent PREFERS the wSOL swap leg, native delta as fallback.
+//   24s — MARKET CAP FIX. GMGN /v1/token/info has no market_cap field and price
+//         is nested (info.price.price). Added tokenPriceUsd/tokenSupply/
+//         tokenMarketCap helpers; routed all price/MC reads through them.
+//   24t — 7-Wallet Signal moved to CHAT_ID_FAST; Big Buy stays on CHAT_ID_SLOW.
+//   24u — CLEANUP. Removed the Theo/Cented buy tracker entirely (config,
+//         sendBuyTrackerAlert, resolveBuyTrackerMC, the [SOL DEBUG] capture, and
+//         its call sites). Removed now-dead code: fetchOfficialMarketCap (the
+//         dropped /v1/market/rank route), fetchKlineMC (only the tracker used
+//         it), slowShouldFire (unused since the 7-wallet rewrite), and the
+//         [VOL DEBUG] dump. Kept the -5305037806 group id as CHAT_ID_DEVBUY for
+//         the planned dev-buy signal. No behaviour change to the three active
+//         signals. Slow-bot core logic UNCHANGED.
 // ============================================================
 
 const https     = require('https');
@@ -59,15 +47,9 @@ const CHAT_ID_FAST        = process.env.CHAT_ID_FAST        || '-5081620734';
 const CHAT_ID_SLOW        = process.env.CHAT_ID_SLOW        || '-1003888330833';
 const RENDER_URL          = process.env.RENDER_EXTERNAL_URL || '';
 
-// ── WALLET BUY TRACKER ─────────────────────────────────────────
-// Sends every FIRST buy (per token) from Theo and Cented to their own
-// dedicated Telegram groups. Independent of slow/migration filters.
-const CHAT_ID_THEO   = process.env.CHAT_ID_THEO   || '-5353363552';
-const CHAT_ID_CENTED = process.env.CHAT_ID_CENTED || '-5305037806';
-const TRACK_BUY_WALLETS = {
-  "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt": { name: "Theo",     chatId: CHAT_ID_THEO },
-  "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o": { name: "Cented 7", chatId: CHAT_ID_CENTED },
-};
+// Group that formerly received the Cented buy-tracker alerts. Kept for the
+// planned dev-buy signal, which will send here.
+const CHAT_ID_DEVBUY = process.env.CHAT_ID_CENTED || '-5305037806';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -485,69 +467,6 @@ async function fetchTokenInfo(mint) {
   return await gmgnGet('/v1/token/info', { chain: 'sol', address: mint });
 }
 
-// Pulls MC from GMGN's OFFICIAL market rank route (/v1/market/rank), which
-// returns market_cap directly (curve-aware, no calculation). Brand-new tokens
-// may not yet appear in the rank list — returns null if not found.
-// Logs the raw shape so we can confirm auth works and the token is present.
-async function fetchOfficialMarketCap(mint) {
-  try {
-    // Query the 1m trending rank, large limit, then find this token by address.
-    const data = await gmgnGet('/v1/market/rank', {
-      chain: 'sol', interval: '1m', orderby: 'volume', direction: 'desc', limit: '100',
-    });
-    const rank = data?.rank ?? data?.list ?? (Array.isArray(data) ? data : null);
-    if (!Array.isArray(rank)) {
-      log(`[OFFICIAL MC] ${mint.substring(0,8)} — rank route returned no array (auth/route issue?) raw keys=${data ? Object.keys(data).join(',') : 'null'}`);
-      return null;
-    }
-    const hit = rank.find(t => (t.address ?? t.token_address) === mint);
-    if (!hit) {
-      log(`[OFFICIAL MC] ${mint.substring(0,8)} — not in trending rank (${rank.length} items), no MC`);
-      return null;
-    }
-    const mc = parseFloat(hit.market_cap ?? hit.usd_market_cap ?? 0);
-    log(`[OFFICIAL MC] ${mint.substring(0,8)} — found in rank, market_cap=${mc}`);
-    return (mc > 0) ? mc : null;
-  } catch (e) {
-    log(`[ERR] fetchOfficialMarketCap: ${e.message}`);
-    return null;
-  }
-}
-
-// Pulls the latest USD price from GMGN's OFFICIAL kline route (/v1/market/token_kline)
-// and computes MC = price × supply. This is GMGN's own curve-aware price, works on
-// ANY token (not just trending), and is the most reliable source for fresh tokens.
-// Uses 30s candles (finest resolution) so even very new tokens have a price.
-// Returns { mc, price } or { mc:0 } if no candle/price yet.
-async function fetchKlineMC(mint, supply) {
-  try {
-    const now = Math.floor(Date.now() / 1000);
-    const from = now - 600; // last 10 minutes of 30s candles
-    const data = await gmgnGet('/v1/market/token_kline', {
-      chain: 'sol', address: mint, resolution: '30s',
-      from: String(from), to: String(now),
-    });
-    const list = data?.list ?? (Array.isArray(data) ? data : null);
-    if (!Array.isArray(list) || list.length === 0) {
-      log(`[KLINE MC] ${mint.substring(0,8)} — no candles returned (auth/route issue or too fresh) raw keys=${data ? Object.keys(data).join(',') : 'null'}`);
-      return { mc: 0, price: 0 };
-    }
-    // candles are chronological (oldest first) — take the most recent close price
-    const last = list[list.length - 1];
-    const price = parseFloat(last.close ?? last.c ?? 0);
-    if (!(price > 0)) {
-      log(`[KLINE MC] ${mint.substring(0,8)} — latest candle has no usable close price`);
-      return { mc: 0, price: 0 };
-    }
-    const mc = (supply > 0) ? price * supply : 0;
-    log(`[KLINE MC] ${mint.substring(0,8)} — close=${price} supply=${supply} => mc=${Math.round(mc)} (${list.length} candles)`);
-    return { mc: mc > 0 ? mc : 0, price };
-  } catch (e) {
-    log(`[ERR] fetchKlineMC: ${e.message}`);
-    return { mc: 0, price: 0 };
-  }
-}
-
 async function fetchFreshWallets(mint) {
   const data = await gmgnGet('/v1/token/security', { chain: 'sol', address: mint });
   if (!data) return null;
@@ -917,104 +836,6 @@ async function computePoolMC(mint, infoMaybe) {
   }
 }
 
-// Resolves market cap for a mint: GMGN tokenInfo → price×supply → DexScreener.
-// Returns { mc, symbol, tokenPrice } with mc=0 if nothing available this attempt.
-async function resolveBuyTrackerMC(tokenMint) {
-  let symbol = 'UNKNOWN', mc = 0, tokenPrice = 0;
-  // fresh fetch each attempt (not cached) so a late-populating MC can be picked up
-  const info = await fetchTokenInfo(tokenMint);
-  if (info) {
-    tokenInfoCache[tokenMint] = info;
-    symbol = info.symbol ?? 'UNKNOWN';
-    tokenPrice = tokenPriceUsd(info);
-    mc = tokenMarketCap(info); // price.price × circulating_supply
-  }
-  if (isNaN(mc) || mc === 0) {
-    const dexMC = await fetchDexMarketCap(tokenMint);
-    if (dexMC > 0) mc = dexMC;
-  }
-  if (isNaN(mc)) mc = 0;
-  return { mc, symbol, tokenPrice };
-}
-
-// Sends a first-buy alert for Theo / Cented to their dedicated group.
-// MC is the priority: retry every 3s for up to 20s to get it. If MC never
-// resolves, the alert is still sent with "N/A" so a buy is never missed.
-// Independent of slow/migration signals; never touches signal logic.
-async function sendBuyTrackerAlert(trackedWallet, tokenMint, buyAmount, tx) {
-  try {
-    const cfg = TRACK_BUY_WALLETS[trackedWallet];
-    if (!cfg) return;
-
-    // Single tokenInfo fetch.
-    let info = null;
-    try { info = await fetchTokenInfo(tokenMint); }
-    catch (e) { log(`[ERR] buyTracker fetchTokenInfo: ${e.message}`); }
-
-    let symbol = info?.symbol ?? 'UNKNOWN';
-    const tokenPrice = tokenPriceUsd(info);
-
-    // ── MC SOURCE PRIORITY (24s) ──
-    // 0) GMGN price×supply (price.price × circulating_supply) — this is GMGN's
-    //    own curve-aware price and is correct for ANY token, fresh or not. It's
-    //    now primary because the field-access bug that broke it is fixed.
-    // 1) kline price × supply (backup GMGN price; empty on sub-30s tokens)
-    // 2) pool-reserve calc (fallback — can be unreliable)
-    // 3) DexScreener
-    let mc = 0;
-    let mcSource = 'none';
-    const supplyForMC = tokenSupply(info);
-    // 0) GMGN price × supply (correct primary)
-    {
-      const g = tokenMarketCap(info);
-      if (g > 0) { mc = g; mcSource = 'gmgn-price×supply'; }
-    }
-    // 1) kline price × supply (backup)
-    if (mc <= 0) {
-      try {
-        const k = await fetchKlineMC(tokenMint, supplyForMC);
-        if (k.mc > 0) { mc = k.mc; mcSource = 'kline-30s'; }
-      } catch (e) { log(`[ERR] fetchKlineMC call: ${e.message}`); }
-    }
-    // 2) pool-reserve calc (rejects near-empty fresh pools internally)
-    if (mc <= 0) {
-      try {
-        const pm = await computePoolMC(tokenMint, info);
-        if (pm.mc > 0) { mc = pm.mc; mcSource = 'pool-calc'; }
-        if (pm.symbol && pm.symbol !== 'UNKNOWN' && symbol === 'UNKNOWN') symbol = pm.symbol;
-      } catch (e) { log(`[ERR] computePoolMC call: ${e.message}`); }
-    }
-    // 3) Last resort: DexScreener
-    if (mc <= 0) {
-      try { const dexMC = await fetchDexMarketCap(tokenMint); if (dexMC > 0) { mc = dexMC; mcSource = 'dexscreener'; } }
-      catch (e) { log(`[ERR] buyTracker dexMC: ${e.message}`); }
-    }
-
-    // No real MC anywhere = token too fresh to have one yet. Show that honestly.
-    const mcStr = (mc > 0) ? fmtUsd(mc) : 'N/A (too fresh)';
-
-    // USD value of the buy, when we have a price
-    let usdStr = '';
-    if (tokenPrice > 0 && buyAmount > 0) {
-      const usd = tokenPrice * buyAmount;
-      usdStr = ` (~${fmtUsd(usd)})`;
-    }
-
-    const amtStr = buyAmount > 0 ? fmtTokenAmount(buyAmount) : 'N/A';
-    const buyTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-
-    sendTelegram(cfg.chatId,
-      `🟢 <b>${cfg.name} BUY</b>\n\n` +
-      `Token: #${symbol}\n` +
-      `Contract: <code>${tokenMint}</code>\n` +
-      `Amount: ${amtStr}${usdStr}\n` +
-      `Market Cap: ${mcStr}\n` +
-      `Time: ${buyTime}\n\n` +
-      `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
-    );
-    log(`[BUY TRACKER] ${cfg.name} bought #${symbol} @ MC ${mcStr} (src=${mcSource}) — sent to ${cfg.chatId}`);
-  } catch(e) { log(`[ERR] sendBuyTrackerAlert: ${e.message}`); }
-}
 
 // BIG BUY signal — fires to CHAT_ID_SLOW when any tracked wallet (not the dev)
 // buys > $500 USD on a token under the age cap. ONE alert per token (deduped).
@@ -1032,18 +853,6 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
     const devFromInfo = info?.dev?.creator_address ?? null;
     if ((devFromCache && trackedWallet === devFromCache) || (devFromInfo && trackedWallet === devFromInfo)) {
       return;
-    }
-
-    // ── TEMP DEBUG: raw balance arrays for tracked-buy wallets, to verify the
-    // SOL-spent fix. Logs once per buy; safe to remove once you're satisfied 24q
-    // reads correctly.
-    if (TRACK_BUY_WALLETS[trackedWallet]) {
-      try {
-        const meta = tx?.meta; const msg = tx?.transaction?.message;
-        const keys = (msg?.accountKeys ?? []).map(k => typeof k === 'string' ? k : k?.pubkey);
-        const idx = keys.indexOf(trackedWallet);
-        log(`[SOL DEBUG] ${walletName(trackedWallet)} ${tokenMint.substring(0,8)} idx=${idx} preBal=${meta?.preBalances?.[idx]} postBal=${meta?.postBalances?.[idx]} fee=${meta?.fee} | wSOLpre=${JSON.stringify((meta?.preTokenBalances??[]).filter(b=>b.owner===trackedWallet&&b.mint===SOL_MINT).map(b=>b.uiTokenAmount?.uiAmount))} wSOLpost=${JSON.stringify((meta?.postTokenBalances??[]).filter(b=>b.owner===trackedWallet&&b.mint===SOL_MINT).map(b=>b.uiTokenAmount?.uiAmount))}`);
-      } catch(e) { log(`[ERR] SOL DEBUG: ${e.message}`); }
     }
 
     const buyAmount = extractBuyAmount(tx, trackedWallet, tokenMint);
@@ -1176,18 +985,6 @@ async function buildMigrationSignal(tokenMint, walletCount, elapsed, tokenInfo, 
   } catch(e) { log(`[ERR] buildMigrationSignal: ${e.message}`); }
 }
 
-// ── SLOW BOT SIGNAL FILTER ────────────────────────────────────
-function slowShouldFire(symbol, sameNameCount, devWallet, devAthMc) {
-  const devIsTracked = devWallet && devWallet !== 'N/A' && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
-  const devAthPasses = devWallet && devWallet !== 'N/A' && devAthMc !== null && devAthMc >= SLOW_DEV_ATH_THRESHOLD;
-  const sameNamePasses = sameNameCount !== null && sameNameCount >= SLOW_SAME_NAME_THRESHOLD;
-  if (sameNamePasses) { log(`[SLOW FILTER] ✅ same-name ${sameNameCount}`); return true; }
-  if (devAthPasses) { log(`[SLOW FILTER] ✅ dev ATH ${fmtUsd(devAthMc)}`); return true; }
-  if (devIsTracked) { log(`[SLOW FILTER] ✅ dev is tracked wallet`); return true; }
-  log(`[SLOW FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${sameNameCount??'?'}, devATH: ${fmtUsd(devAthMc)}`);
-  return false;
-}
-
 async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coordWallets) {
   try {
     const t0 = Date.now();
@@ -1199,15 +996,6 @@ async function buildSlowSignal(tokenMint, walletCount, elapsed, tokenInfo, coord
     let freshWalletsFromInfo = null;
 
     if (tokenInfo) {
-      // ── TEMP VOL DEBUG ── GMGN keeps volume nested inside `stat` (and maybe `pool`),
-      // and fresh-wallet data inside `wallet_tags_stat`. Dump all three so we can read
-      // the exact field names for BOTH volume and fresh wallets. Remove after wiring.
-      try {
-        log(`[VOL DEBUG] ${tokenMint.substring(0,8)} stat = ${JSON.stringify(tokenInfo.stat)}`);
-        log(`[VOL DEBUG] ${tokenMint.substring(0,8)} pool = ${JSON.stringify(tokenInfo.pool)}`);
-        log(`[VOL DEBUG] ${tokenMint.substring(0,8)} wallet_tags_stat = ${JSON.stringify(tokenInfo.wallet_tags_stat)}`);
-      } catch(e) { log(`[VOL DEBUG] dump failed: ${e.message}`); }
-
       symbol = tokenInfo.symbol ?? 'UNKNOWN';
       const ca = tokenInfo.creation_timestamp;
       if (ca) {
@@ -1442,14 +1230,6 @@ async function processLogNotification(params) {
   seenPairs.add(pairKey);
 
   log(`[MINT] ${trackedWallet.substring(0,8)} bought ${mint.substring(0,8)}`);
-
-  // ── BUY TRACKER (Theo / Cented) ──
-  // Parallel branch: on a first buy by a tracked-buy wallet, send to its group.
-  // Fire-and-forget so it never delays or affects the signal path below.
-  if (TRACK_BUY_WALLETS[trackedWallet]) {
-    const buyAmount = extractBuyAmount(tx, trackedWallet, mint);
-    sendBuyTrackerAlert(trackedWallet, mint, buyAmount, tx).catch(e => log(`[ERR] buyTracker: ${e.message}`));
-  }
 
   await handleWalletBuy(trackedWallet, mint);
 }
