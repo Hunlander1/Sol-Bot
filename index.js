@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24u  (CLEANUP: removed Theo/Cented buy tracker + dead code) <<<
+//  >>> VERSION: 2026-06-24v  (MIG: fires on 1 wallet; 100 wallets) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
@@ -60,7 +60,7 @@ const FAST_MIN_WALLETS    = 5;
 
 // ── FAST MIGRATION CONFIG ────────────────────────────────────
 const FAST_MIG_MAX_AGE    = 30;  // token must hit MC threshold within 30s of mint
-const FAST_MIG_MIN_WALLETS = 2;  // 2 tracked wallets (excluding dev)
+const FAST_MIG_MIN_WALLETS = 1;  // 1 tracked wallet (excluding dev)
 const FAST_MIG_MIN_MC      = 38_000; // pump.fun migration ~$38k market cap threshold
 const FAST_MIG_MIN_MC_BAGS = 375_000; // Bags tokens (mint ends 'bags') migrate at ~$375k
 
@@ -138,28 +138,25 @@ const WALLETS = [
   "9VXuNqqqzniYYW3fRDeaCtUUtqWsEeWWn5umh3aF9h17","DAEdBmTPEKM6xkwfzC3d411QUe6coKpkND6UURa4CvHC",
   "iPUp3qkm39ycMGbywWFMUyvaDhiiPGXeWXaDtmHNe6C","CfkaAru9ArJ2tAStYHvbAyRBJL3EhDzsWYV2KYg9shxB",
   "EeLjBXRELqrcWAXbnj8T4jQPS9Qh7UGWiKxovsJ36pZY","H5Wh4EDvWQT4mShH746V5VDqxHQkaQZyPWfuhy1PRVBg",
-  "GH9yk8vgFvHnAD8JZqXxr3hBN1Lr1mJ9NPzrP5mVqiJe","7hkd2kdx4bMyuUDgktZvykDh69r8YkkrX4kf1sW2C8T6",
-  "8ghYW6ftL5kUemfsoA9X37rz3ZnvyMSZRAx1kt1CxpoS","GKaJNFDp2W5uCYfNKnTPN63tFXKgXgaDSfnTVfksBeq1",
-  "DaKpjVJFxq3y4iZcEu12wzpXGCNBkQE587VNACUj15rT","C4ARzqpvZ4gR3ta89H5Yz7UyPTpRm22BL5U91e5dHTSf",
-  "BSFxyBwsHQsDXULygBpsTu6iUmfHUbCr6j4geZSN6YJG","9Zu8AigeXgFAajBTni2VWw6Wmz7XxDqHmY5nQwdCWAyY",
+  "GH9yk8vgFvHnAD8JZqXxr3hBN1Lr1mJ9NPzrP5mVqiJe",
+  "8ghYW6ftL5kUemfsoA9X37rz3ZnvyMSZRAx1kt1CxpoS",
+"9Zu8AigeXgFAajBTni2VWw6Wmz7XxDqHmY5nQwdCWAyY",
   "9dkeTBYaHJzxVgVZqympcHmPeQvHtQv1sArZiZuwmhgp","AQdBYZNy3BZ1vouGUjA1w9Ay7aq7kH5UQSuh4LQWKotY",
   "HTM87R4mgjDdiF6Yfn8duK9vbDmZxiPCTRbGvm7eCAJY","8i5U2uNBEuTc4zskYP14zbebDg2RSwrrG8REhEnJb97K",
   "7E9jfxCczubz4FXkkVKzUMHXGwzJxyppC4m7y3ew8ATg","8v6ztxZwhPBNmA6aGrBzzrt6UBf2fZZfsWqZ9Lt47Kpv",
   "6nU2L7MQVUWjtdKHVpuZA9aind73nd3rXC4YFo8KQCy4","5zCkbcD74hFPeBHwYdwJLJAoLVgHX45AFeR7RzC8vFiD",
   "8HeDT75s5g4CtCimH5B5nySqCiQhtWii8UnZhxBtFo38","A8Z1ejQGk45EJibBPJviWnM3UvwKSuYun53nSCkWKM52",
   "D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA","BZC7VEj5Y9Ege3cTRGBZW2zW7pjw3hpiSkcAoYKysvue",
-  "FgifQEkRkSSXZjf2cJ4c55BhVts2yrNKzmzBLLyicg8b","EFaQQTGywnD4CjQQvTugUiyVT4LV9G6MsWqiub8X6unN",
+"EFaQQTGywnD4CjQQvTugUiyVT4LV9G6MsWqiub8X6unN",
   "HUgpmqL6r4Z4iEZiVuNZ6J6QnAsSZpsL8giVyVtz3QhT","FaBGrHWjcJ8vKnbgUtsdpZjvF7YAAajtQTWmmEHiKtQr",
   "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp","bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa",
   "7moqFjvm2MwAiMtCZoqYoTAPzRBxxMRT2ddyHThQuWjr",
   "DjM7Tu7whh6P3pGVBfDzwXAx2zaw51GJWrJE3PwtuN7s",
   "AvcWA3ngM55sSpjh1FZthmqA7V6BHo4f555a8w3Wv3ij",
-  "J7nJ35d8EGU3fHCVCUun56C1MKakdoEQ38CFLHAhWDwP",
   "6ujZxnphRxTqveaQtLAQHFoWz16xhLWZbTijcgZN4fRp",
   "nazikTJezTC3W2fxXE3wzs495PYzXMiq5o7co6YYACA",
   "BtMBMPkoNbnLF9Xn552guQq528KKXcsNBNNBre3oaQtr",
   "EYfdt8cNFyyTEJKp18dcoVbgUHDnM1SK3bT2uKj9XXHc",
-  "EgQX9R3Qph1dPHE1Ysou1auSYqRGomCNmLDC28Yg77aq",
   "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", // Cupsey
   "CtPxvpWo1pk7HtL6KwpCLMMdsXHC6fdqAN1bPiracaQq", // STINKDEX Dev
   "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt", // Theo
@@ -167,6 +164,15 @@ const WALLETS = [
   "3dhwViJnxKhRJcJJznrVt6oYkuD1bULvsUXscuxpNBDs", // Notable 2
   "5Pr7D2d5WUM7j8fMF36DuzVDDGEHLtYsF7a6ezyzFG19", // Notable 3
   "GdRSPexhxbQz5H2zFQrNN2BAZUqEjAULBigTPvQ6oDMP", // NNC Dev
+  "CEUA7zVoDRqRYoeHTP58UHU6TR8yvtVbeLrX1dppqoXJ", // Notable 13
+  "yHCxHBEaJW5tbndqC8JciSThr7U1cqLpdcsvHcx6PRe", // Ansem Dev
+  "PMJA8UQDyWTFw2Smhyp9jGA6aTaP7jKHR7BPudrgyYN", // Notable 7
+  "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT", // trunoest
+  "8NJ7Ujpji8uMF2675mqaTSEm2DCbfJA7fiRKtiaqkaLN", // Nikita
+  "6HJetMbdHBuk3mLUainxAPpBpWzDgYbHGTS2TqDAUSX2", // ljc
+  "CCCCQCrL6zVjnDeucDzcxJgxAs5ahNmrhw1CDexPhqrd", // GhostTrader
+  "yMBRVpuVm7bgASPEvEhVtKTbz4g4UhNFEDz8kBmHAv1", // Notable 16
+  "HmBmSYwYEgEZuBUYuDs9xofyqBAkw4ywugB1d7R7sTGh", // tobx
 ];
 const WALLET_SET = new Set(WALLETS);
 
@@ -183,12 +189,10 @@ const WALLET_NAMES = {
   "7moqFjvm2MwAiMtCZoqYoTAPzRBxxMRT2ddyHThQuWjr": "Smart 15",
   "DjM7Tu7whh6P3pGVBfDzwXAx2zaw51GJWrJE3PwtuN7s": "CHILLHOUSE Dev",
   "AvcWA3ngM55sSpjh1FZthmqA7V6BHo4f555a8w3Wv3ij": "Honeypot Dev",
-  "J7nJ35d8EGU3fHCVCUun56C1MKakdoEQ38CFLHAhWDwP": "Together Dev",
   "6ujZxnphRxTqveaQtLAQHFoWz16xhLWZbTijcgZN4fRp": "BadBunny Dev",
   "nazikTJezTC3W2fxXE3wzs495PYzXMiq5o7co6YYACA": "YZY Dev",
   "BtMBMPkoNbnLF9Xn552guQq528KKXcsNBNNBre3oaQtr": "Letterbomb(horse)",
   "EYfdt8cNFyyTEJKp18dcoVbgUHDnM1SK3bT2uKj9XXHc": "Penguin Dev",
-  "EgQX9R3Qph1dPHE1Ysou1auSYqRGomCNmLDC28Yg77aq": "Smart 8",
   "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f": "Cupsey",
   "CtPxvpWo1pk7HtL6KwpCLMMdsXHC6fdqAN1bPiracaQq": "STINKDEX Dev",
   // Newly matched from document
@@ -207,7 +211,6 @@ const WALLET_NAMES = {
   "FaBGrHWjcJ8vKnbgUtsdpZjvF7YAAajtQTWmmEHiKtQr": "Dale Dev",
   "HUgpmqL6r4Z4iEZiVuNZ6J6QnAsSZpsL8giVyVtz3QhT": "Sparkles Dev",
   "EFaQQTGywnD4CjQQvTugUiyVT4LV9G6MsWqiub8X6unN": "Bob Dev",
-  "FgifQEkRkSSXZjf2cJ4c55BhVts2yrNKzmzBLLyicg8b": "Elephant Dev",
   "BZC7VEj5Y9Ege3cTRGBZW2zW7pjw3hpiSkcAoYKysvue": "Unipcs Dev",
   "D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA": "Imagine Dev",
   "A8Z1ejQGk45EJibBPJviWnM3UvwKSuYun53nSCkWKM52": "Punch Dev",
@@ -221,12 +224,7 @@ const WALLET_NAMES = {
   "AQdBYZNy3BZ1vouGUjA1w9Ay7aq7kH5UQSuh4LQWKotY": "Pfp Dev",
   "9dkeTBYaHJzxVgVZqympcHmPeQvHtQv1sArZiZuwmhgp": "Chud Dev",
   "9Zu8AigeXgFAajBTni2VWw6Wmz7XxDqHmY5nQwdCWAyY": "Moss Dev",
-  "BSFxyBwsHQsDXULygBpsTu6iUmfHUbCr6j4geZSN6YJG": "Ziggy Dev",
-  "C4ARzqpvZ4gR3ta89H5Yz7UyPTpRm22BL5U91e5dHTSf": "Ikun Dev",
-  "DaKpjVJFxq3y4iZcEu12wzpXGCNBkQE587VNACUj15rT": "Xmas Dev",
-  "GKaJNFDp2W5uCYfNKnTPN63tFXKgXgaDSfnTVfksBeq1": "Cartel Dev",
   "8ghYW6ftL5kUemfsoA9X37rz3ZnvyMSZRAx1kt1CxpoS": "Milady Ai Dev",
-  "7hkd2kdx4bMyuUDgktZvykDh69r8YkkrX4kf1sW2C8T6": "Lamb Dev",
   "GH9yk8vgFvHnAD8JZqXxr3hBN1Lr1mJ9NPzrP5mVqiJe": "Eagy",
   "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk": "Jijo",
   "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6": "Cooker",
@@ -277,6 +275,15 @@ const WALLET_NAMES = {
   "3dhwViJnxKhRJcJJznrVt6oYkuD1bULvsUXscuxpNBDs": "Notable 2",
   "5Pr7D2d5WUM7j8fMF36DuzVDDGEHLtYsF7a6ezyzFG19": "Notable 3",
   "GdRSPexhxbQz5H2zFQrNN2BAZUqEjAULBigTPvQ6oDMP": "NNC Dev",
+  "CEUA7zVoDRqRYoeHTP58UHU6TR8yvtVbeLrX1dppqoXJ": "Notable 13",
+  "yHCxHBEaJW5tbndqC8JciSThr7U1cqLpdcsvHcx6PRe": "Ansem Dev",
+  "PMJA8UQDyWTFw2Smhyp9jGA6aTaP7jKHR7BPudrgyYN": "Notable 7",
+  "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT": "trunoest",
+  "8NJ7Ujpji8uMF2675mqaTSEm2DCbfJA7fiRKtiaqkaLN": "Nikita",
+  "6HJetMbdHBuk3mLUainxAPpBpWzDgYbHGTS2TqDAUSX2": "ljc",
+  "CCCCQCrL6zVjnDeucDzcxJgxAs5ahNmrhw1CDexPhqrd": "GhostTrader",
+  "yMBRVpuVm7bgASPEvEhVtKTbz4g4UhNFEDz8kBmHAv1": "Notable 16",
+  "HmBmSYwYEgEZuBUYuDs9xofyqBAkw4ywugB1d7R7sTGh": "tobx",
 };
 
 function walletName(addr) {
