@@ -1,19 +1,26 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-06-24w  (NEW: post-migration big buy 16-90s window; old Big Buy replaced) <<<
+//  >>> VERSION: 2026-07-05y  (ADD: Large Buy $750/<7hr to slow; slow-chat mutual exclusion) <<<
 //  If the right panel shows this header with this date,
 //  it is the correct/latest file to deploy.
 //  ----------------------------------------------------------
 //  Active signals in one process:
 //
-//  1. MIGRATION SIGNAL  (CHAT_ID_FAST)  — 2 tracked wallets buy + token hits
+//  1. MIGRATION SIGNAL       (CHAT_ID_FAST)  — 1 tracked wallet buys + token hits
 //     its MC threshold within 30s of mint ($38k pump.fun / $375k Bags).
-//  2. 7-WALLET SIGNAL   (CHAT_ID_FAST)  — 7 tracked wallets buy the same token
-//     within 90s of mint.
-//  3. POST-MIGRATION BIG BUY (CHAT_ID_SLOW) — a token fires the fast migration
-//     signal, then a tracked wallet (not the dev) buys >$500 of it in the
-//     16s–90s-after-mint window. Fires once per wallet per token.
+//  2. 7-WALLET SIGNAL        (CHAT_ID_FAST)  — 7 tracked wallets buy the same
+//     token within 90s of mint.
+//  3. POST-MIGRATION BIG BUY (CHAT_ID_SLOW)  — a token fires the fast migration
+//     signal, then a tracked wallet (not dev) buys >$500 of it in the 16s–90s-
+//     after-mint window. Once per wallet per token.
+//  4. GENERAL BIG BUY        (CHAT_ID_FAST)  — any tracked wallet (not dev) buys
+//     >$500 of a token under 60 min old. One alert per contract.
+//  5. LARGE BUY              (CHAT_ID_SLOW)  — any tracked wallet (not dev) buys
+//     >=$750 of a token under 7 hours old. One alert per contract.
+//
+//  NOTE: signals 3 and 5 both go to slow chat but are MUTUALLY EXCLUSIVE per
+//  token — whichever fires first for a token blocks the other (slowChatFired).
 //
 //  CHANGE LOG:
 //   24q — extractSolSpent stopped ADDING native + wSOL legs (double-count ~2x).
@@ -29,6 +36,10 @@
 //         wallet per token. Migration signal now fires on 1 tracked wallet.
 //         Reordered processLogNotification so migFired/creationCache are current
 //         before the big-buy check. Removed dead bigBuyFired + BIG_BUY_MAX_TOKEN_AGE.
+//   24x — Re-added the GENERAL BIG BUY as a separate signal: any tracked wallet
+//         (not dev) buys >$500 of a token under 60 min old, one alert per contract,
+//         to CHAT_ID_FAST. Runs alongside the Post-Migration Big Buy (slow chat).
+//         Restored bigBuyFired + BIG_BUY_MAX_TOKEN_AGE (now 3600s = 60 min).
 //   24u — CLEANUP. Removed the Theo/Cented buy tracker entirely (config,
 //         sendBuyTrackerAlert, resolveBuyTrackerMC, the [SOL DEBUG] capture, and
 //         its call sites). Removed now-dead code: fetchOfficialMarketCap (the
@@ -80,10 +91,19 @@ const SLOW_MAX_TOKEN_AGE  = 90;
 const SLOW_MIN_WALLETS    = 7;
 
 // ── BIG BUY SIGNAL ────────────────────────────────────────────
-// Separate from the 7-wallet signal. Fires to CHAT_ID_SLOW whenever ANY tracked
-// wallet (not the dev) makes a buy worth more than $500 USD on a token under
-// 60 min old. Fires on EVERY qualifying buy (not just the first).
+// General big-buy alert to CHAT_ID_FAST: any tracked wallet (not the dev) buys
+// >$500 of a token under 60 min old. ONE alert per contract (first whale only).
+// Separate from the Post-Migration Big Buy (which is migration-gated, 16–90s,
+// per-wallet, to CHAT_ID_SLOW).
 const BIG_BUY_MIN_USD     = 500;
+const BIG_BUY_MAX_TOKEN_AGE = 3600; // 60 minutes
+
+// ── LARGE BUY SIGNAL (3rd big-buy) ────────────────────────────
+// Fires to CHAT_ID_SLOW: any tracked wallet (not dev) buys >= $750 of a token
+// under 7 hours old. One alert per contract. Separate from the General Big Buy
+// (fast chat, <60min, >$500) and the Post-Migration Big Buy (slow, migration-gated).
+const LARGE_BUY_MIN_USD      = 750;
+const LARGE_BUY_MAX_TOKEN_AGE = 25200; // 7 hours
 const SLOW_SAME_NAME_THRESHOLD = 10;
 const SLOW_DEV_ATH_THRESHOLD   = 1_000_000;
 
@@ -315,6 +335,9 @@ let fastAlerts  = {};
 // ── STATE — FAST MIGRATION BOT ────────────────────────────────
 let migAlerts = {};
 let migFired  = loadSet('/tmp/sol_mig_fired.json');
+let bigBuyFired = new Set(); // tokens that already fired a general Big Buy — one alert per contract
+let largeBuyFired = new Set(); // tokens that already fired a Large Buy ($750/<7hr) — one alert per contract
+let slowChatFired = new Set(); // tokens that already fired ANY slow-chat big-buy (post-mig OR large) — mutual exclusion, one slow alert per token
 
 // ── STATE — SLOW BOT ──────────────────────────────────────────
 let slowAlerts  = {};
@@ -865,6 +888,10 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
     // GATE 1: token must have fired the FAST MIGRATION signal. If not, ignore.
     if (!migFired.has(tokenMint)) return;
 
+    // Slow-chat mutual exclusion: if this token already fired ANY slow-chat
+    // big-buy (this one or the Large Buy), don't fire again.
+    if (slowChatFired.has(tokenMint)) return;
+
     // Per-wallet-per-token dedup: this wallet already fired for this token?
     const pairKey = `${trackedWallet}:${tokenMint}`;
     if (migBuyFired.has(pairKey)) return;
@@ -933,6 +960,7 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
     const buyTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
     migBuyFired.add(pairKey); // one alert per wallet per token
+    slowChatFired.add(tokenMint); // block the other slow-chat signal for this token
     sendTelegram(CHAT_ID_SLOW,
       `💵 <b>Post-Migration Big Buy — ${walletName(trackedWallet)} ${fmtUsd(usdForThreshold)}</b>\n\n` +
       `Token: #${symbol}\n` +
@@ -946,6 +974,181 @@ async function sendBigBuyAlert(trackedWallet, tokenMint, tx) {
     );
     log(`[MIGBUY] ${walletName(trackedWallet)} bought ${fmtUsd(usdForThreshold)} of #${symbol} at ${age}s (post-migration) — sent to slow chat`);
   } catch(e) { log(`[ERR] sendBigBuyAlert: ${e.message}`); }
+}
+
+// GENERAL BIG BUY signal — fires to CHAT_ID_FAST when any tracked wallet (not
+// the dev) buys >$500 of a token under 60 min old. ONE alert per contract (the
+// first qualifying whale; later buys on the same token are suppressed). This is
+// separate from the Post-Migration Big Buy above and is NOT migration-gated.
+async function sendGeneralBigBuyAlert(trackedWallet, tokenMint, tx) {
+  try {
+    // One signal per contract.
+    if (bigBuyFired.has(tokenMint)) return;
+
+    const info = await getCachedTokenInfo(tokenMint);
+
+    // Don't fire for the token's dev.
+    const devFromCache = (devWalletCache[tokenMint] && devWalletCache[tokenMint] !== 'unknown') ? devWalletCache[tokenMint] : null;
+    const devFromInfo = info?.dev?.creator_address ?? null;
+    if ((devFromCache && trackedWallet === devFromCache) || (devFromInfo && trackedWallet === devFromInfo)) {
+      return;
+    }
+
+    const buyAmount = extractBuyAmount(tx, trackedWallet, tokenMint);
+    if (!(buyAmount > 0)) return;
+
+    // Price: GMGN nested price.price first, then pool-derived.
+    let tokenPrice = tokenPriceUsd(info);
+    let priceSource = 'gmgn';
+    if (!(tokenPrice > 0)) {
+      const pool = info?.pool ?? {};
+      const quoteValUsd = parseFloat(pool.quote_reserve_value ?? 0);
+      const baseReserve = parseFloat(pool.base_reserve ?? 0);
+      if (quoteValUsd > 0 && baseReserve > 0) {
+        tokenPrice = quoteValUsd / baseReserve;
+        priceSource = 'pool';
+      } else {
+        priceSource = 'none';
+      }
+    }
+
+    const usd = tokenPrice > 0 ? tokenPrice * buyAmount : 0;
+
+    // SOL-leg value (native delta × SOL price), preferred for the threshold.
+    let usdSol = 0;
+    try {
+      const solSpent = extractSolSpent(tx, trackedWallet);
+      if (solSpent > 0) {
+        const solPrice = await getSolPrice();
+        usdSol = solSpent * solPrice;
+      }
+    } catch (e) { log(`[ERR] extractSolSpent: ${e.message}`); }
+
+    log(`[BIGBUY SIZE] ${walletName(trackedWallet)} ${tokenMint.substring(0,8)} | tokenMethod=$${usd.toFixed(2)} (src=${priceSource}) | solMethod=$${usdSol.toFixed(2)} | threshold $${BIG_BUY_MIN_USD}`);
+
+    const usdForThreshold = usdSol > 0 ? usdSol : usd;
+    if (usdForThreshold <= BIG_BUY_MIN_USD) return; // under threshold
+
+    // Age gate: token under 60 min old.
+    const createdAt = parseFloat(creationCache[tokenMint] ?? info?.creation_timestamp ?? 0);
+    const now = Math.floor(Date.now() / 1000);
+    if (!(createdAt > 0)) return; // unknown age — skip rather than fire on stale tokens
+    const age = now - createdAt;
+    if (age > BIG_BUY_MAX_TOKEN_AGE) return;
+
+    // Build display fields
+    let symbol = info?.symbol ?? 'UNKNOWN';
+    let mc = tokenMarketCap(info);
+    if (mc <= 0 && tokenPrice > 0) {
+      const supply = tokenSupply(info);
+      if (supply > 0) mc = tokenPrice * supply;
+    }
+    const mcStr = (mc > 0) ? fmtUsd(mc) : 'N/A';
+    const ageStr = age < 60 ? `${age}s` : `${Math.floor(age/60)}m ${age%60}s`;
+    const buyTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+
+    bigBuyFired.add(tokenMint); // one alert per contract
+    sendTelegram(CHAT_ID_FAST,
+      `💰 <b>Big Buy — ${walletName(trackedWallet)} ${fmtUsd(usdForThreshold)}</b>\n\n` +
+      `Token: #${symbol}\n` +
+      `Contract: <code>${tokenMint}</code>\n` +
+      `Buy Size: ${fmtUsd(usdForThreshold)} (${fmtTokenAmount(buyAmount)} tokens)\n` +
+      `Market Cap: ${mcStr}\n` +
+      `Token Age: ${ageStr}\n` +
+      `Wallet: ${walletName(trackedWallet)}\n` +
+      `Time: ${buyTime}\n\n` +
+      `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
+    );
+    log(`[BIG BUY] ${walletName(trackedWallet)} bought ${fmtUsd(usdForThreshold)} of #${symbol} (age ${ageStr}) — sent to fast chat`);
+  } catch(e) { log(`[ERR] sendGeneralBigBuyAlert: ${e.message}`); }
+}
+
+// LARGE BUY signal — fires to CHAT_ID_SLOW when any tracked wallet (not the dev)
+// buys >= $750 of a token under 7 hours old. ONE alert per contract. Separate
+// from the General Big Buy (fast, <60min, >$500) and the Post-Migration Big Buy.
+async function sendLargeBuyAlert(trackedWallet, tokenMint, tx) {
+  try {
+    if (largeBuyFired.has(tokenMint)) return;
+
+    // Slow-chat mutual exclusion: if this token already fired ANY slow-chat
+    // big-buy (this one or the Post-Migration Big Buy), don't fire again.
+    if (slowChatFired.has(tokenMint)) return;
+
+    const info = await getCachedTokenInfo(tokenMint);
+
+    // Don't fire for the token's dev.
+    const devFromCache = (devWalletCache[tokenMint] && devWalletCache[tokenMint] !== 'unknown') ? devWalletCache[tokenMint] : null;
+    const devFromInfo = info?.dev?.creator_address ?? null;
+    if ((devFromCache && trackedWallet === devFromCache) || (devFromInfo && trackedWallet === devFromInfo)) {
+      return;
+    }
+
+    const buyAmount = extractBuyAmount(tx, trackedWallet, tokenMint);
+    if (!(buyAmount > 0)) return;
+
+    // Price: GMGN nested price.price first, then pool-derived.
+    let tokenPrice = tokenPriceUsd(info);
+    let priceSource = 'gmgn';
+    if (!(tokenPrice > 0)) {
+      const pool = info?.pool ?? {};
+      const quoteValUsd = parseFloat(pool.quote_reserve_value ?? 0);
+      const baseReserve = parseFloat(pool.base_reserve ?? 0);
+      if (quoteValUsd > 0 && baseReserve > 0) {
+        tokenPrice = quoteValUsd / baseReserve;
+        priceSource = 'pool';
+      } else {
+        priceSource = 'none';
+      }
+    }
+
+    const usd = tokenPrice > 0 ? tokenPrice * buyAmount : 0;
+
+    // SOL-leg value (native delta × SOL price), preferred for the threshold.
+    let usdSol = 0;
+    try {
+      const solSpent = extractSolSpent(tx, trackedWallet);
+      if (solSpent > 0) {
+        const solPrice = await getSolPrice();
+        usdSol = solSpent * solPrice;
+      }
+    } catch (e) { log(`[ERR] extractSolSpent: ${e.message}`); }
+
+    const usdForThreshold = usdSol > 0 ? usdSol : usd;
+    if (usdForThreshold < LARGE_BUY_MIN_USD) return; // under $750
+
+    // Age gate: token under 7 hours old.
+    const createdAt = parseFloat(creationCache[tokenMint] ?? info?.creation_timestamp ?? 0);
+    const now = Math.floor(Date.now() / 1000);
+    if (!(createdAt > 0)) return; // unknown age — skip
+    const age = now - createdAt;
+    if (age > LARGE_BUY_MAX_TOKEN_AGE) return;
+
+    // Build display fields
+    let symbol = info?.symbol ?? 'UNKNOWN';
+    let mc = tokenMarketCap(info);
+    if (mc <= 0 && tokenPrice > 0) {
+      const supply = tokenSupply(info);
+      if (supply > 0) mc = tokenPrice * supply;
+    }
+    const mcStr = (mc > 0) ? fmtUsd(mc) : 'N/A';
+    const ageStr = age < 60 ? `${age}s` : (age < 3600 ? `${Math.floor(age/60)}m ${age%60}s` : `${Math.floor(age/3600)}h ${Math.floor((age%3600)/60)}m`);
+    const buyTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+
+    largeBuyFired.add(tokenMint); // one alert per contract
+    slowChatFired.add(tokenMint); // block the other slow-chat signal for this token
+    sendTelegram(CHAT_ID_SLOW,
+      `🟢 <b>Large Buy — ${walletName(trackedWallet)} ${fmtUsd(usdForThreshold)}</b>\n\n` +
+      `Token: #${symbol}\n` +
+      `Contract: <code>${tokenMint}</code>\n` +
+      `Buy Size: ${fmtUsd(usdForThreshold)} (${fmtTokenAmount(buyAmount)} tokens)\n` +
+      `Market Cap: ${mcStr}\n` +
+      `Token Age: ${ageStr}\n` +
+      `Wallet: ${walletName(trackedWallet)}\n` +
+      `Time: ${buyTime}\n\n` +
+      `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
+    );
+    log(`[LARGE BUY] ${walletName(trackedWallet)} bought ${fmtUsd(usdForThreshold)} of #${symbol} (age ${ageStr}) — sent to slow chat`);
+  } catch(e) { log(`[ERR] sendLargeBuyAlert: ${e.message}`); }
 }
 
 
@@ -1257,6 +1460,16 @@ async function processLogNotification(params) {
   // 16–90s-after-mint window. Sees repeat buys (its own per-wallet dedup handles
   // spam). Fire-and-forget; never touches slow-bot core logic.
   sendBigBuyAlert(trackedWallet, mint, tx).catch(e => log(`[ERR] migBuy: ${e.message}`));
+
+  // ── GENERAL BIG BUY ──
+  // Not migration-gated. Any tracked wallet's >$500 buy on a token under 60 min
+  // old, one alert per contract, to the fast channel. Fire-and-forget.
+  sendGeneralBigBuyAlert(trackedWallet, mint, tx).catch(e => log(`[ERR] bigBuy: ${e.message}`));
+
+  // ── LARGE BUY ──
+  // Any tracked wallet's >=$750 buy on a token under 7 hours old, one alert per
+  // contract, to the slow channel. Fire-and-forget.
+  sendLargeBuyAlert(trackedWallet, mint, tx).catch(e => log(`[ERR] largeBuy: ${e.message}`));
 }
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
@@ -1335,6 +1548,9 @@ setInterval(() => {
   for (const mint of Object.keys(slowAlerts)) { if (now - slowAlerts[mint].firstSeenAt > SLOW_WINDOW_SECS) delete slowAlerts[mint]; }
   if (seenPairs.size > 20000) { seenPairs.clear(); log(`[CLEANUP] seenPairs cleared`); }
   if (migBuyFired.size > 20000) { migBuyFired.clear(); log(`[CLEANUP] migBuyFired cleared`); }
+  if (bigBuyFired.size > 20000) { bigBuyFired.clear(); log(`[CLEANUP] bigBuyFired cleared`); }
+  if (largeBuyFired.size > 20000) { largeBuyFired.clear(); log(`[CLEANUP] largeBuyFired cleared`); }
+  if (slowChatFired.size > 20000) { slowChatFired.clear(); log(`[CLEANUP] slowChatFired cleared`); }
   const cutMs = Date.now() - 10000;
   for (const w of Object.keys(walletEventTimes)) {
     walletEventTimes[w] = walletEventTimes[w].filter(t => t > cutMs);
