@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-14d  (BLUECHIP TRENDING SIGNAL + WSS failover + 94 wallets) <<<
+//  >>> VERSION: 2026-07-14e  (94 wallets + env-selectable WSS order, PUBLIC default) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -15,7 +15,7 @@
 //    Fires once per token.
 //
 //  CHANGE LOG:
-//   2026-07-14d — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
+//   2026-07-14e — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
 //         Migration detection, Post-Migration Big Buy, 10-Wallet coordination,
 //         and Large Buy Cluster. Replaced with the single Bluechip Trending Buy
 //         above. Added a trending poller that pulls the top 10 from all five
@@ -78,12 +78,21 @@ const HTTP_RPCS = [
 // exactly 100 wallets — during a reconnect the old subs may still be open, which
 // briefly doubles the count and trips a 429. Alchemy is a real second tier so we
 // don't have to drop straight to the throttled public endpoint.
-const WSS_ENDPOINTS = [
-  HELIUS_API_KEY  ? { name: 'HELIUS',  url: `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` }  : null,
-  ALCHEMY_API_KEY ? { name: 'ALCHEMY', url: `wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` } : null,
-  SHYFT_API_KEY   ? { name: 'SHYFT',   url: `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}` }              : null,
-  { name: 'PUBLIC', url: 'wss://api.mainnet-beta.solana.com' },
-].filter(Boolean);
+// Endpoint definitions. Which ones are used, and in what ORDER, is controlled by
+// WSS_ORDER (comma-separated names). Default puts PUBLIC first because Helius free
+// credits are exhausted (resets monthly) and Alchemy doesn't honor logsSubscribe.
+// Once Helius credits reset, set WSS_ORDER=HELIUS,PUBLIC to prefer it again — no
+// code change needed.
+const WSS_DEFS = {
+  HELIUS:  HELIUS_API_KEY  ? { name: 'HELIUS',  url: `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` }  : null,
+  ALCHEMY: ALCHEMY_API_KEY ? { name: 'ALCHEMY', url: `wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` } : null,
+  SHYFT:   SHYFT_API_KEY   ? { name: 'SHYFT',   url: `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}` }              : null,
+  PUBLIC:  { name: 'PUBLIC', url: 'wss://api.mainnet-beta.solana.com' },
+};
+const WSS_ORDER = (process.env.WSS_ORDER || 'PUBLIC,HELIUS,ALCHEMY')
+  .split(',').map(s => s.trim().toUpperCase());
+const WSS_ENDPOINTS = WSS_ORDER.map(n => WSS_DEFS[n]).filter(Boolean);
+if (WSS_ENDPOINTS.length === 0) WSS_ENDPOINTS.push(WSS_DEFS.PUBLIC);
 
 // ── FIRED ALERTS ──────────────────────────────────────────────
 const FIRED_FILE = '/tmp/sol_trend_fired.json';
@@ -792,7 +801,7 @@ function connect() {
       log(`[WS] Rotating to ${WSS_ENDPOINTS[wssIndex].name} after repeated failures`);
     }
     setTimeout(() => connect(), reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 60000);
+    reconnectDelay = Math.min(reconnectDelay * 2, 300000);  // cap 5 min — don't torch credits on a persistent outage
   });
 }
 
@@ -854,7 +863,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-14d ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-14e ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
