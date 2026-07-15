@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-14b  (BLUECHIP TRENDING SIGNAL — sole signal) <<<
+//  >>> VERSION: 2026-07-14c  (BLUECHIP TRENDING SIGNAL + WSS failover chain) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -15,7 +15,7 @@
 //    Fires once per token.
 //
 //  CHANGE LOG:
-//   2026-07-14b — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
+//   2026-07-14c — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
 //         Migration detection, Post-Migration Big Buy, 10-Wallet coordination,
 //         and Large Buy Cluster. Replaced with the single Bluechip Trending Buy
 //         above. Added a trending poller that pulls the top 10 from all five
@@ -73,8 +73,17 @@ const HTTP_RPCS = [
   ALCHEMY_API_KEY ? `https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` : null,
   'https://api.mainnet-beta.solana.com',
 ].filter(Boolean);
-const WSS_PRIMARY  = HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : SHYFT_API_KEY ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}` : 'wss://api.mainnet-beta.solana.com';
-const WSS_FALLBACK = 'wss://api.mainnet-beta.solana.com';
+// WebSocket endpoints, tried IN ORDER. On repeated failure the bot rotates to
+// the next one. Helius free tier caps at 100 concurrent subscriptions and we run
+// exactly 100 wallets — during a reconnect the old subs may still be open, which
+// briefly doubles the count and trips a 429. Alchemy is a real second tier so we
+// don't have to drop straight to the throttled public endpoint.
+const WSS_ENDPOINTS = [
+  HELIUS_API_KEY  ? { name: 'HELIUS',  url: `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` }  : null,
+  ALCHEMY_API_KEY ? { name: 'ALCHEMY', url: `wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` } : null,
+  SHYFT_API_KEY   ? { name: 'SHYFT',   url: `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}` }              : null,
+  { name: 'PUBLIC', url: 'wss://api.mainnet-beta.solana.com' },
+].filter(Boolean);
 
 // ── FIRED ALERTS ──────────────────────────────────────────────
 const FIRED_FILE = '/tmp/sol_trend_fired.json';
@@ -289,7 +298,7 @@ let trendRefreshes = 0;
 let ws             = null;
 let wsReady        = false;
 let reconnectDelay = 5000;
-let usingFallback  = false;
+let wssIndex       = 0;   // index into WSS_ENDPOINTS
 let subIdToWallet  = {};
 let reqIdToWallet  = {};
 let lastMessageAt  = Date.now();
@@ -733,15 +742,16 @@ setInterval(() => {
     log(`[WS] Watchdog: ${Math.round(silent/1000)}s silent — reconnecting...`);
     wsReady = false;
     try { ws.terminate(); } catch(e) {}
-    usingFallback = !usingFallback;
+    wssIndex = (wssIndex + 1) % WSS_ENDPOINTS.length;   // rotate to the next provider
     reconnectDelay = 5000;
     connect();
   }
 }, 60000);
 
 function connect() {
-  const url = usingFallback ? WSS_FALLBACK : WSS_PRIMARY;
-  log(`[WS] Connecting to ${usingFallback ? 'FALLBACK' : 'PRIMARY'}...`);
+  const ep = WSS_ENDPOINTS[wssIndex];
+  const url = ep.url;
+  log(`[WS] Connecting to ${ep.name} (${wssIndex + 1}/${WSS_ENDPOINTS.length})...`);
   ws = new WebSocket(url, { handshakeTimeout: 30000 });
   subIdToWallet = {}; reqIdToWallet = {}; wsReady = false;
 
@@ -785,7 +795,12 @@ function connect() {
   ws.on('close', (code) => {
     wsReady = false;
     log(`[WS] Disconnected (${code}). Reconnecting in ${reconnectDelay/1000}s...`);
-    if (reconnectDelay >= 30000 && !usingFallback) { usingFallback = true; reconnectDelay = 5000; }
+    // After ~3 failed attempts on this endpoint, rotate to the next provider.
+    if (reconnectDelay >= 20000) {
+      wssIndex = (wssIndex + 1) % WSS_ENDPOINTS.length;
+      reconnectDelay = 5000;
+      log(`[WS] Rotating to ${WSS_ENDPOINTS[wssIndex].name} after repeated failures`);
+    }
     setTimeout(() => connect(), reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 60000);
   });
@@ -849,10 +864,10 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-14b ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-14c ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
-log(`[START] WSS: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
+log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
 
 https.get('https://api.ipify.org?format=json', (res) => {
   let d = ''; res.on('data', c => d += c);
