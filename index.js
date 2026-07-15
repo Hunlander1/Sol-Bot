@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-14c  (BLUECHIP TRENDING SIGNAL + WSS failover chain) <<<
+//  >>> VERSION: 2026-07-14d  (BLUECHIP TRENDING SIGNAL + WSS failover + 94 wallets) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -15,7 +15,7 @@
 //    Fires once per token.
 //
 //  CHANGE LOG:
-//   2026-07-14c — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
+//   2026-07-14d — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
 //         Migration detection, Post-Migration Big Buy, 10-Wallet coordination,
 //         and Large Buy Cluster. Replaced with the single Bluechip Trending Buy
 //         above. Added a trending poller that pulls the top 10 from all five
@@ -113,7 +113,7 @@ const WALLETS = [
   "BCagckXeMChUKrHEd6fKFA1uiWDtcmCXMsqaheLiUPJd","4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9",
   "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o","8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6",
   "2T5NgDDidkvhJQg8AHDi74uCFwgp25pYFMRZXBaCUNBH","515vh1DrPuwMATt9Zoq9kP4sJL9fyojA1dHJu4DQpNRp",
-  "GpTXmkdvrTajqkzX1fBmC4BUjSboF9dHgfnqPqj8WAc4","2ezv4U5HmPpkt2xLsKnw1FyyGmjFBeW7c166p99Hw2xB",
+  "GpTXmkdvrTajqkzX1fBmC4BUjSboF9dHgfnqPqj8WAc4",
   "EaVboaPxFCYanjoNWdkxTbPvt57nhXGu5i6m9m6ZS2kK","FAicXNV5FVqtfbpn4Zccs71XcfGeyxBSGbqLDyDJZjke",
   "BAr5csYtpWoNpwhUjixX7ZPHXkUciFZzjBp9uNxZXJPh","B32QbbdDAyhvUQzjcaM5j6ZVKwjCxAwGH5Xgvb9SJqnC",
   "8HcYptCBAaPFWkmupiSAmysZ6Z8jB7N1c4YhVjhX7zbg","FFEjC9MHhpQViBPrD2iU6LmV2hEigyhLJaL7MZUZzyD4",
@@ -124,16 +124,12 @@ const WALLETS = [
   "BCnqsPEtA1TkgednYEebRpkmwFRJDCjMQcKZMMtEdArc","4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
   "5ZuV8eqkvzYFVEKbLvGBdexL2tFv7E5BCd2HZpjqbdg","FM1YCKED2KaqB8Uat8aB1nsffR1vezr7s6FAEieXJgke",
   "AV7PjXHL5JXZ1YoYRoN9Dsstg1x2UciBupMCXcJP8gUz","Dzp1SrZ474xwGp6ZEP6cNKo39u9zeXe1YAuTkyZyv3t4",
-  "whamNNP9tHoxLg92yHvJPdYhghEoCg1qYTsh5a2oLbx","HdKJM6Lvfp9aV9tvEMC8AD4GnsbFgMUkHLoK923Sn1ET",
   "5FqUo9aBjsp7QeeyN6Vi2ZmF2fjS4H5EU7wnAQwPy17z","7hHmfYYR7L8LsCKk5akjtvVu1BbJRgHGJ2n6s7gbeKG4",
   "CjtqWn4toBbJ1feRZBDhz3TwBjbZm5RpES8rvKWTuNtk","FAX4qRQdiSj2iWDYvkJ21VieVCXGREtwMhEyAHSJ1aqp",
   "9VXuNqqqzniYYW3fRDeaCtUUtqWsEeWWn5umh3aF9h17","DAEdBmTPEKM6xkwfzC3d411QUe6coKpkND6UURa4CvHC",
   "iPUp3qkm39ycMGbywWFMUyvaDhiiPGXeWXaDtmHNe6C","CfkaAru9ArJ2tAStYHvbAyRBJL3EhDzsWYV2KYg9shxB",
   "EeLjBXRELqrcWAXbnj8T4jQPS9Qh7UGWiKxovsJ36pZY","H5Wh4EDvWQT4mShH746V5VDqxHQkaQZyPWfuhy1PRVBg",
-  "GH9yk8vgFvHnAD8JZqXxr3hBN1Lr1mJ9NPzrP5mVqiJe",
-  "8ghYW6ftL5kUemfsoA9X37rz3ZnvyMSZRAx1kt1CxpoS",
-  "9Zu8AigeXgFAajBTni2VWw6Wmz7XxDqHmY5nQwdCWAyY",
-  "9dkeTBYaHJzxVgVZqympcHmPeQvHtQv1sArZiZuwmhgp","AQdBYZNy3BZ1vouGUjA1w9Ay7aq7kH5UQSuh4LQWKotY",
+  "GH9yk8vgFvHnAD8JZqXxr3hBN1Lr1mJ9NPzrP5mVqiJe","AQdBYZNy3BZ1vouGUjA1w9Ay7aq7kH5UQSuh4LQWKotY",
   "HTM87R4mgjDdiF6Yfn8duK9vbDmZxiPCTRbGvm7eCAJY","8i5U2uNBEuTc4zskYP14zbebDg2RSwrrG8REhEnJb97K",
   "7E9jfxCczubz4FXkkVKzUMHXGwzJxyppC4m7y3ew8ATg","8v6ztxZwhPBNmA6aGrBzzrt6UBf2fZZfsWqZ9Lt47Kpv",
   "6nU2L7MQVUWjtdKHVpuZA9aind73nd3rXC4YFo8KQCy4","5zCkbcD74hFPeBHwYdwJLJAoLVgHX45AFeR7RzC8vFiD",
@@ -212,9 +208,6 @@ const WALLET_NAMES = {
   "8i5U2uNBEuTc4zskYP14zbebDg2RSwrrG8REhEnJb97K": "Memeless Dev",
   "HTM87R4mgjDdiF6Yfn8duK9vbDmZxiPCTRbGvm7eCAJY": "Priceless Dev",
   "AQdBYZNy3BZ1vouGUjA1w9Ay7aq7kH5UQSuh4LQWKotY": "Pfp Dev",
-  "9dkeTBYaHJzxVgVZqympcHmPeQvHtQv1sArZiZuwmhgp": "Chud Dev",
-  "9Zu8AigeXgFAajBTni2VWw6Wmz7XxDqHmY5nQwdCWAyY": "Moss Dev",
-  "8ghYW6ftL5kUemfsoA9X37rz3ZnvyMSZRAx1kt1CxpoS": "Milady Ai Dev",
   "GH9yk8vgFvHnAD8JZqXxr3hBN1Lr1mJ9NPzrP5mVqiJe": "Eagy",
   "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk": "Jijo",
   "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6": "Cooker",
@@ -231,7 +224,6 @@ const WALLET_NAMES = {
   "2T5NgDDidkvhJQg8AHDi74uCFwgp25pYFMRZXBaCUNBH": "idontpaytaxes",
   "515vh1DrPuwMATt9Zoq9kP4sJL9fyojA1dHJu4DQpNRp": "crypto",
   "GpTXmkdvrTajqkzX1fBmC4BUjSboF9dHgfnqPqj8WAc4": "Track 5",
-  "2ezv4U5HmPpkt2xLsKnw1FyyGmjFBeW7c166p99Hw2xB": "Track 7",
   "EaVboaPxFCYanjoNWdkxTbPvt57nhXGu5i6m9m6ZS2kK": "Danny",
   "FAicXNV5FVqtfbpn4Zccs71XcfGeyxBSGbqLDyDJZjke": "Radiance",
   "BAr5csYtpWoNpwhUjixX7ZPHXkUciFZzjBp9uNxZXJPh": "Jack Duval",
@@ -249,8 +241,6 @@ const WALLET_NAMES = {
   "FM1YCKED2KaqB8Uat8aB1nsffR1vezr7s6FAEieXJgke": "Pom Dev",
   "AV7PjXHL5JXZ1YoYRoN9Dsstg1x2UciBupMCXcJP8gUz": "Butthole Dev",
   "Dzp1SrZ474xwGp6ZEP6cNKo39u9zeXe1YAuTkyZyv3t4": "Distorted Dev",
-  "whamNNP9tHoxLg92yHvJPdYhghEoCg1qYTsh5a2oLbx": "Ziggy Dev",
-  "HdKJM6Lvfp9aV9tvEMC8AD4GnsbFgMUkHLoK923Sn1ET": "Chaos",
   "5FqUo9aBjsp7QeeyN6Vi2ZmF2fjS4H5EU7wnAQwPy17z": "Aloka Dev",
   "7hHmfYYR7L8LsCKk5akjtvVu1BbJRgHGJ2n6s7gbeKG4": "Goldcoin",
   "CjtqWn4toBbJ1feRZBDhz3TwBjbZm5RpES8rvKWTuNtk": "Vibecodoor",
@@ -864,7 +854,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-14c ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-14d ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
