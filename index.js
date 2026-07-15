@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-14e  (94 wallets + env-selectable WSS order, PUBLIC default) <<<
+//  >>> VERSION: 2026-07-14f  (2 signals: bluechip trending + 8-wallet cluster) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -15,7 +15,7 @@
 //    Fires once per token.
 //
 //  CHANGE LOG:
-//   2026-07-14e — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
+//   2026-07-14f — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
 //         Migration detection, Post-Migration Big Buy, 10-Wallet coordination,
 //         and Large Buy Cluster. Replaced with the single Bluechip Trending Buy
 //         above. Added a trending poller that pulls the top 10 from all five
@@ -65,6 +65,17 @@ const TREND_TOP_N         = parseInt(process.env.TREND_TOP_N || '10', 10);      
 const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '30', 10);        // refresh every 30s
 // All five intervals — a token counts as trending if it's top-10 in ANY of them.
 const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
+
+// ══════════════════════════════════════════════════════════════
+//  8-WALLET CLUSTER SIGNAL CONFIG
+// ══════════════════════════════════════════════════════════════
+// Fires to CHAT_ID_FAST when 8 DISTINCT tracked wallets buy the same token,
+// and the token's age is between CLUSTER_MIN_AGE and CLUSTER_MAX_AGE.
+// No trending or bluechip requirement. Any buy size. Fires once per token.
+const CLUSTER_SIGNAL_CHAT = process.env.CLUSTER_SIGNAL_CHAT || CHAT_ID_FAST;
+const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '8', 10);
+const CLUSTER_MIN_AGE     = parseInt(process.env.CLUSTER_MIN_AGE || '60', 10);      // >= 60 seconds old
+const CLUSTER_MAX_AGE     = parseInt(process.env.CLUSTER_MAX_AGE || '86400', 10);   // <= 24 hours old
 
 // ── RPC ───────────────────────────────────────────────────────
 const HTTP_RPCS = [
@@ -282,6 +293,8 @@ let tokenInfoInflight = {};
 let devWalletCache  = {};
 let pendingSigs     = new Set();
 let seenPairs       = new Set();  // "wallet:mint" — only the first buy per wallet+token matters
+let clusterBuyers   = {};         // mint -> Set of distinct tracked wallets that bought it (today)
+let clusterFired    = loadSet('/tmp/sol_cluster_fired.json');  // tokens that already fired the cluster signal
 let walletEventTimes = {};        // wallet -> recent event timestamps (ms), flood throttle
 const processing    = new Set();  // synchronous guard against duplicate concurrent signals
 
@@ -629,6 +642,72 @@ async function sendTrendSignal(trackedWallet, tokenMint, tx) {
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+//  8-WALLET CLUSTER SIGNAL
+// ══════════════════════════════════════════════════════════════
+// Called after each detected buy. Tracks how many DISTINCT tracked wallets have
+// bought this token; when that reaches CLUSTER_MIN_WALLETS and the token age is
+// within [CLUSTER_MIN_AGE, CLUSTER_MAX_AGE], fire once to CLUSTER_SIGNAL_CHAT.
+async function checkClusterSignal(trackedWallet, tokenMint) {
+  try {
+    if (clusterFired.has(tokenMint)) return;
+
+    // Record this wallet as a buyer of the token.
+    if (!clusterBuyers[tokenMint]) clusterBuyers[tokenMint] = new Set();
+    clusterBuyers[tokenMint].add(trackedWallet);
+    const count = clusterBuyers[tokenMint].size;
+
+    if (count < CLUSTER_MIN_WALLETS) return;   // not enough distinct wallets yet
+    if (clusterFired.has(tokenMint)) return;
+
+    // Age gate — need creation time. Use token/info's creation_timestamp.
+    const info = await getCachedTokenInfo(tokenMint);
+    const created = parseInt(info?.creation_timestamp ?? 0, 10) || 0;
+    if (!(created > 0)) {
+      log(`[CLUSTER] ${tokenMint.substring(0,8)} — no creation timestamp, can't check age; skipping`);
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const age = now - created;
+    if (age < CLUSTER_MIN_AGE) {
+      log(`[CLUSTER] SKIP ${tokenMint.substring(0,8)} — too new (${age}s < ${CLUSTER_MIN_AGE}s)`);
+      return;
+    }
+    if (age > CLUSTER_MAX_AGE) {
+      log(`[CLUSTER] SKIP ${tokenMint.substring(0,8)} — too old (${fmtAge(age)} > ${CLUSTER_MAX_AGE/3600}h)`);
+      return;
+    }
+
+    // Fire once.
+    if (clusterFired.has(tokenMint)) return;
+    clusterFired.add(tokenMint);
+    saveSet('/tmp/sol_cluster_fired.json', clusterFired);
+
+    const buyers = [...clusterBuyers[tokenMint]].map(walletName);
+    const symbol = info?.symbol ?? 'UNKNOWN';
+    let mc = tokenMarketCap(info);
+    const mcStr = mc > 0 ? fmtUsd(mc) : 'N/A';
+    const buyerList = buyers.map(b => `  • ${b}`).join('\n');
+    const signalTime = new Date().toLocaleTimeString('en-US', {
+      timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+    });
+
+    sendTelegram(CLUSTER_SIGNAL_CHAT,
+      `⚡ <b>${count} Wallet Cluster — ${symbol}</b>\n\n` +
+      `Contract: <code>${tokenMint}</code>\n\n` +
+      `Wallets: <b>${count}</b>\n` +
+      `Token Age: ${fmtAge(age)}\n` +
+      `Market Cap: ${mcStr}\n\n` +
+      `<b>Bought by:</b>\n${buyerList}\n\n` +
+      `Signal Time: ${signalTime}\n\n` +
+      `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
+    );
+    log(`[CLUSTER] 🔥 FIRED ${symbol} ${tokenMint.substring(0,8)} — ${count} wallets | age ${fmtAge(age)}`);
+  } catch (e) {
+    log(`[ERR] checkClusterSignal: ${e.message}`);
+  }
+}
+
 // ── TELEGRAM ──────────────────────────────────────────────────
 function sendTelegram(chatId, message) {
   const body = JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'HTML' });
@@ -727,8 +806,11 @@ async function processLogNotification(params) {
     setTimeout(() => delete devWalletCache[mint], 600000);
   }
 
-  // ── THE ONLY SIGNAL ──
+  // ── SIGNAL 1: Bluechip trending buy ──
   await sendTrendSignal(trackedWallet, mint, tx);
+
+  // ── SIGNAL 2: 8-wallet cluster ──
+  await checkClusterSignal(trackedWallet, mint);
 }
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
@@ -809,6 +891,8 @@ function connect() {
 setInterval(() => {
   if (seenPairs.size > 20000) { seenPairs.clear(); log(`[CLEANUP] seenPairs cleared`); }
   if (trendFired.size > 20000) { trendFired.clear(); saveSet(FIRED_FILE, trendFired); log(`[CLEANUP] trendFired cleared`); }
+  if (clusterFired.size > 20000) { clusterFired.clear(); saveSet('/tmp/sol_cluster_fired.json', clusterFired); log(`[CLEANUP] clusterFired cleared`); }
+  if (Object.keys(clusterBuyers).length > 20000) { clusterBuyers = {}; log(`[CLEANUP] clusterBuyers cleared`); }
   const cutMs = Date.now() - 10000;
   for (const w of Object.keys(walletEventTimes)) {
     walletEventTimes[w] = walletEventTimes[w].filter(t => t > cutMs);
@@ -863,7 +947,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-14e ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-14f ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
