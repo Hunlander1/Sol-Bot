@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-14f  (2 signals: bluechip trending + 8-wallet cluster) <<<
+//  >>> VERSION: 2026-07-15a  (bluechip 2-wallet + 7-wallet cluster w/ trending-or-vol gate, top-5) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -15,7 +15,7 @@
 //    Fires once per token.
 //
 //  CHANGE LOG:
-//   2026-07-14f — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
+//   2026-07-15a — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
 //         Migration detection, Post-Migration Big Buy, 10-Wallet coordination,
 //         and Large Buy Cluster. Replaced with the single Bluechip Trending Buy
 //         above. Added a trending poller that pulls the top 10 from all five
@@ -61,7 +61,7 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const TREND_SIGNAL_CHAT   = process.env.TREND_SIGNAL_CHAT || CHAT_ID_SLOW;
 const TREND_MAX_TOKEN_AGE = parseInt(process.env.TREND_MAX_TOKEN_AGE || '86400', 10); // 24h in seconds
 const TREND_MIN_BLUECHIP  = parseFloat(process.env.TREND_MIN_BLUECHIP || '0.10');     // 10% (0-1 scale)
-const TREND_TOP_N         = parseInt(process.env.TREND_TOP_N || '10', 10);            // top 10
+const TREND_TOP_N         = parseInt(process.env.TREND_TOP_N || '5', 10);             // top 5
 const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '30', 10);        // refresh every 30s
 // All five intervals — a token counts as trending if it's top-10 in ANY of them.
 const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
@@ -73,9 +73,15 @@ const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
 // and the token's age is between CLUSTER_MIN_AGE and CLUSTER_MAX_AGE.
 // No trending or bluechip requirement. Any buy size. Fires once per token.
 const CLUSTER_SIGNAL_CHAT = process.env.CLUSTER_SIGNAL_CHAT || CHAT_ID_FAST;
-const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '8', 10);
+const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '7', 10);
 const CLUSTER_MIN_AGE     = parseInt(process.env.CLUSTER_MIN_AGE || '60', 10);      // >= 60 seconds old
 const CLUSTER_MAX_AGE     = parseInt(process.env.CLUSTER_MAX_AGE || '86400', 10);   // <= 24 hours old
+
+// Bluechip trending signal now needs this many DISTINCT tracked wallets (was 1).
+const TREND_MIN_WALLETS   = parseInt(process.env.TREND_MIN_WALLETS || '2', 10);
+// Volume gate shared by the cluster signal: token qualifies if it is trending
+// (top-N any interval) OR its latest 5-minute candle volume (USD) >= this.
+const VOL_GATE_USD        = parseFloat(process.env.VOL_GATE_USD || '100000');   // $100k 5-min volume
 
 // ── RPC ───────────────────────────────────────────────────────
 const HTTP_RPCS = [
@@ -288,6 +294,7 @@ function walletName(addr) {
 
 // ── STATE ─────────────────────────────────────────────────────
 let trendFired      = loadSet(FIRED_FILE);   // tokens that already fired — one alert per token
+let trendBuyers     = {};         // mint -> Set of distinct tracked wallets that bought it (for TREND_MIN_WALLETS gate)
 let tokenInfoCache  = {};
 let tokenInfoInflight = {};
 let devWalletCache  = {};
@@ -449,6 +456,36 @@ async function fetchTokenInfo(mint) {
   return await gmgnGet('/v1/token/info', { chain: 'sol', address: mint });
 }
 
+// Latest 5-minute candle volume (USD) for any token, via the kline endpoint.
+// GMGN's token_kline needs MILLISECOND timestamps (from/to in ms) — seconds
+// silently returns an empty list. Each candle carries a USD `volume` field.
+// Returns the most recent COMPLETE candle's volume, or 0 on any failure.
+// Cached ~60s per token to avoid hammering the endpoint on every buy.
+let vol5mCache = {};
+async function gmgn5mVolumeUsd(mint) {
+  const cached = vol5mCache[mint];
+  if (cached && (Date.now() - cached.at) < 60000) return cached.v;
+  try {
+    const nowMs = Date.now();
+    const data = await gmgnGet('/v1/market/token_kline', {
+      chain: 'sol', address: mint, resolution: '5m',
+      from: String(nowMs - 3600000), to: String(nowMs),
+    });
+    const list = data?.list || [];
+    let v = 0;
+    if (Array.isArray(list) && list.length) {
+      // Use the last fully-formed candle. The final element may be the current
+      // in-progress 5m bar; prefer the second-to-last if we have >= 2.
+      const idx = list.length >= 2 ? list.length - 2 : list.length - 1;
+      v = parseFloat(list[idx]?.volume ?? 0) || 0;
+    }
+    vol5mCache[mint] = { v, at: Date.now() };
+    return v;
+  } catch (e) {
+    return 0;
+  }
+}
+
 async function getCachedTokenInfo(mint) {
   if (mint in tokenInfoCache) return tokenInfoCache[mint];
   if (tokenInfoInflight[mint]) return tokenInfoInflight[mint];
@@ -560,9 +597,17 @@ async function sendTrendSignal(trackedWallet, tokenMint, tx) {
   try {
     if (trendFired.has(tokenMint) || processing.has(tokenMint)) return;
 
-    // GATE 1: must be in the trending set (top-10 of any interval).
+    // GATE 1: must be in the trending set (top-N of any interval).
     const t = trendingMap.get(tokenMint);
     if (!t) return;   // not trending — silent, this is the common case
+
+    // GATE 1b: require TREND_MIN_WALLETS distinct tracked wallets to have bought.
+    if (!trendBuyers[tokenMint]) trendBuyers[tokenMint] = new Set();
+    trendBuyers[tokenMint].add(trackedWallet);
+    if (trendBuyers[tokenMint].size < TREND_MIN_WALLETS) {
+      log(`[TREND] ${t.symbol} — ${trendBuyers[tokenMint].size}/${TREND_MIN_WALLETS} wallets`);
+      return;
+    }
 
     const now = Math.floor(Date.now() / 1000);
 
@@ -678,10 +723,22 @@ async function checkClusterSignal(trackedWallet, tokenMint) {
       return;
     }
 
+    // GATE: token must be TRENDING (top-N any interval) OR have >= $100k 5-min volume.
+    const isTrending = trendingMap.has(tokenMint);
+    let vol5m = 0;
+    if (!isTrending) {
+      vol5m = await gmgn5mVolumeUsd(tokenMint);
+    }
+    if (!isTrending && !(vol5m >= VOL_GATE_USD)) {
+      log(`[CLUSTER] SKIP ${info?.symbol || tokenMint.substring(0,8)} — not trending & 5m vol ${fmtUsd(vol5m)} < ${fmtUsd(VOL_GATE_USD)}`);
+      return;
+    }
+
     // Fire once.
     if (clusterFired.has(tokenMint)) return;
     clusterFired.add(tokenMint);
     saveSet('/tmp/sol_cluster_fired.json', clusterFired);
+    const gateReason = isTrending ? 'trending' : `5m vol ${fmtUsd(vol5m)}`;
 
     const buyers = [...clusterBuyers[tokenMint]].map(walletName);
     const symbol = info?.symbol ?? 'UNKNOWN';
@@ -697,12 +754,13 @@ async function checkClusterSignal(trackedWallet, tokenMint) {
       `Contract: <code>${tokenMint}</code>\n\n` +
       `Wallets: <b>${count}</b>\n` +
       `Token Age: ${fmtAge(age)}\n` +
-      `Market Cap: ${mcStr}\n\n` +
+      `Market Cap: ${mcStr}\n` +
+      `Qualified: ${gateReason}\n\n` +
       `<b>Bought by:</b>\n${buyerList}\n\n` +
       `Signal Time: ${signalTime}\n\n` +
       `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
     );
-    log(`[CLUSTER] 🔥 FIRED ${symbol} ${tokenMint.substring(0,8)} — ${count} wallets | age ${fmtAge(age)}`);
+    log(`[CLUSTER] 🔥 FIRED ${symbol} ${tokenMint.substring(0,8)} — ${count} wallets | age ${fmtAge(age)} | ${gateReason}`);
   } catch (e) {
     log(`[ERR] checkClusterSignal: ${e.message}`);
   }
@@ -893,6 +951,8 @@ setInterval(() => {
   if (trendFired.size > 20000) { trendFired.clear(); saveSet(FIRED_FILE, trendFired); log(`[CLEANUP] trendFired cleared`); }
   if (clusterFired.size > 20000) { clusterFired.clear(); saveSet('/tmp/sol_cluster_fired.json', clusterFired); log(`[CLEANUP] clusterFired cleared`); }
   if (Object.keys(clusterBuyers).length > 20000) { clusterBuyers = {}; log(`[CLEANUP] clusterBuyers cleared`); }
+  if (Object.keys(trendBuyers).length > 20000) { trendBuyers = {}; log(`[CLEANUP] trendBuyers cleared`); }
+  if (Object.keys(vol5mCache).length > 5000) { vol5mCache = {}; }
   const cutMs = Date.now() - 10000;
   for (const w of Object.keys(walletEventTimes)) {
     walletEventTimes[w] = walletEventTimes[w].filter(t => t > cutMs);
@@ -947,7 +1007,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-14f ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-15a ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
