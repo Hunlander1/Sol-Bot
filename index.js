@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17d  (bluechip single-rule top10+>10%; age-floor; $30k MC) <<<
+//  >>> VERSION: 2026-07-17f  (enriched alerts; no qualified line) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -693,9 +693,11 @@ async function sendTrendSignal(trackedWallet, tokenMint, tx) {
     sendTelegram(TREND_SIGNAL_CHAT,
       `💎 <b>Bluechip Trending Buy — ${(t.bluechip*100).toFixed(1)}% bluechip</b>\n\n` +
       `Token: #${symbol}\n` +
+      `Chain: Solana\n` +
       `Contract: <code>${tokenMint}</code>\n` +
       `Bought by: ${walletName(trackedWallet)}\n\n` +
       `Bluechip Holders: <b>${(t.bluechip*100).toFixed(1)}%</b>\n` +
+      `Trending Rank: <b>#${t.bestRank || '?'}</b> (best across intervals)\n` +
       `Token Age: ${fmtAge(age)}\n` +
       `Market Cap: ${mcStr}\n` +
       `ATH MC: ${athStr}\n` +
@@ -780,6 +782,8 @@ async function checkClusterSignal(trackedWallet, tokenMint) {
     const symbol = info?.symbol ?? 'UNKNOWN';
     let mc = tokenMarketCap(info);
     const mcStr = mc > 0 ? fmtUsd(mc) : 'N/A';
+    const _tt = trendingMap.get(tokenMint);
+    const rankStr = _tt ? `#${_tt.bestRank || '?'}` : 'not trending';
     const buyerList = buyers.map(b => `  • ${b}`).join('\n');
     const signalTime = new Date().toLocaleTimeString('en-US', {
       timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
@@ -789,9 +793,10 @@ async function checkClusterSignal(trackedWallet, tokenMint) {
       `⚡ <b>${count} Wallet Cluster — ${symbol}</b>\n\n` +
       `Contract: <code>${tokenMint}</code>\n\n` +
       `Wallets: <b>${count}</b>\n` +
+      `Chain: Solana\n` +
       `Token Age: ${fmtAge(age)}\n` +
       `Market Cap: ${mcStr}\n` +
-      `Qualified: ${gateReason}\n\n` +
+      `Trending Rank: ${rankStr}\n\n` +
       `<b>Bought by:</b>\n${buyerList}\n\n` +
       `Signal Time: ${signalTime}\n\n` +
       `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
