@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17b  (bluechip 2-tier + age-floor + $30k MC min; both signals) <<<
+//  >>> VERSION: 2026-07-17d  (bluechip single-rule top10+>10%; age-floor; $30k MC) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -15,7 +15,7 @@
 //    Fires once per token.
 //
 //  CHANGE LOG:
-//   2026-07-17b — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
+//   2026-07-17d — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
 //         Migration detection, Post-Migration Big Buy, 10-Wallet coordination,
 //         and Large Buy Cluster. Replaced with the single Bluechip Trending Buy
 //         above. Added a trending poller that pulls the top 10 from all five
@@ -78,7 +78,7 @@ const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
 // and the token's age is between CLUSTER_MIN_AGE and CLUSTER_MAX_AGE.
 // No trending or bluechip requirement. Any buy size. Fires once per token.
 const CLUSTER_SIGNAL_CHAT = process.env.CLUSTER_SIGNAL_CHAT || CHAT_ID_FAST;
-const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '7', 10);
+const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '8', 10);
 const CLUSTER_MIN_AGE     = parseInt(process.env.CLUSTER_MIN_AGE || '60', 10);      // >= 60 seconds old
 const CLUSTER_MAX_AGE     = parseInt(process.env.CLUSTER_MAX_AGE || '86400', 10);   // <= 24 hours old
 
@@ -647,13 +647,12 @@ async function sendTrendSignal(trackedWallet, tokenMint, tx) {
     //   Tier 1: rank <= top-5  AND bluechip > 10%
     //   Tier 2: rank <= top-10 AND bluechip > 20%
     const rank = t.bestRank || 999;
-    const tier1 = (rank <= TREND_TOP_TIGHT) && (t.bluechip > TREND_MIN_BLUECHIP);
-    const tier2 = (rank <= TREND_TOP_WIDE)  && (t.bluechip > TREND_BLUECHIP_HI);
-    if (!tier1 && !tier2) {
-      log(`[TREND] SKIP ${t.symbol} — rank ${rank}, bluechip ${(t.bluechip*100).toFixed(1)}% (need top${TREND_TOP_TIGHT}+>${(TREND_MIN_BLUECHIP*100).toFixed(0)}% or top${TREND_TOP_WIDE}+>${(TREND_BLUECHIP_HI*100).toFixed(0)}%)`);
+    // Single rule: top-10 trending (any interval) AND bluechip > 10%.
+    if (!(rank <= TREND_TOP_WIDE && t.bluechip > TREND_MIN_BLUECHIP)) {
+      log(`[TREND] SKIP ${t.symbol} — rank ${rank}, bluechip ${(t.bluechip*100).toFixed(1)}% (need top${TREND_TOP_WIDE} + >${(TREND_MIN_BLUECHIP*100).toFixed(0)}%)`);
       return;
     }
-    const tierReason = tier1 ? `top${TREND_TOP_TIGHT} +${(t.bluechip*100).toFixed(1)}%bc` : `top${TREND_TOP_WIDE} +${(t.bluechip*100).toFixed(1)}%bc`;
+    const tierReason = `top${TREND_TOP_WIDE} +${(t.bluechip*100).toFixed(1)}%bc`;
 
     // GATE 3b: market cap >= $30k.
     const info = await getCachedTokenInfo(tokenMint);
@@ -1044,7 +1043,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17b ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17d ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
