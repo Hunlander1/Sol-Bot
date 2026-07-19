@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17f  (enriched alerts; no qualified line) <<<
+//  >>> VERSION: 2026-07-17g  (cluster -> top-5 trending) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -761,14 +761,15 @@ async function checkClusterSignal(trackedWallet, tokenMint) {
       return;
     }
 
-    // GATE: token must be TRENDING (top-N any interval) OR have >= $100k 5-min volume.
-    const isTrending = trendingMap.has(tokenMint);
+    // GATE: token must be TOP-5 TRENDING (any interval) OR have >= $100k 5-min volume.
+    const _ct = trendingMap.get(tokenMint);
+    const isTop5 = !!(_ct && (_ct.bestRank || 999) <= TREND_TOP_TIGHT);
     let vol5m = 0;
-    if (!isTrending) {
+    if (!isTop5) {
       vol5m = await gmgn5mVolumeUsd(tokenMint);
     }
-    if (!isTrending && !(vol5m >= VOL_GATE_USD)) {
-      log(`[CLUSTER] SKIP ${info?.symbol || tokenMint.substring(0,8)} — not trending & 5m vol ${fmtUsd(vol5m)} < ${fmtUsd(VOL_GATE_USD)}`);
+    if (!isTop5 && !(vol5m >= VOL_GATE_USD)) {
+      log(`[CLUSTER] SKIP ${info?.symbol || tokenMint.substring(0,8)} — not top-${TREND_TOP_TIGHT} trending & 5m vol ${fmtUsd(vol5m)} < ${fmtUsd(VOL_GATE_USD)}`);
       return;
     }
 
@@ -776,7 +777,7 @@ async function checkClusterSignal(trackedWallet, tokenMint) {
     if (clusterFired.has(tokenMint)) return;
     clusterFired.add(tokenMint);
     saveSet('/tmp/sol_cluster_fired.json', clusterFired);
-    const gateReason = isTrending ? 'trending' : `5m vol ${fmtUsd(vol5m)}`;
+    const gateReason = isTop5 ? `top${TREND_TOP_TIGHT} trending` : `5m vol ${fmtUsd(vol5m)}`;
 
     const buyers = [...clusterBuyers[tokenMint]].map(walletName);
     const symbol = info?.symbol ?? 'UNKNOWN';
