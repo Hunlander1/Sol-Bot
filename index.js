@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17g  (cluster -> top-5 trending) <<<
+//  >>> VERSION: 2026-07-17h  (FABLE bluechip carry-forward fix) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -15,6 +15,27 @@
 //    Fires once per token.
 //
 //  CHANGE LOG:
+//   2026-07-17h — FABLE BLUECHIP BUG FIX (cache staleness, NOT a merge bug).
+//         Symptom: FABLE was rank 1-3 with 6+ tracked wallets buying but never
+//         fired; log showed "bluechip 0.0%" while /trending showed 65.5%.
+//         Root cause: refreshTrending() rebuilds trendingMap from scratch every
+//         30s and commits the partial map whenever ANY interval returns tokens
+//         (next.size > 0). When the 6h interval call blipped (rate limit/timeout)
+//         for a cycle, FABLE landed carrying only the 1m/5m rank rows — which
+//         report bluechip_owner_percentage 0 — so its cached bluechip regressed
+//         to 0.0% and the signal gate skipped it. /trending was viewed on a later
+//         healthy cycle, hence 65.5%. Same map, different moment.
+//         Fix (two parts, display/cache only — signal gate & fire logic untouched):
+//           (1) CARRY-FORWARD: after building the fresh map each cycle, keep the
+//               highest bluechip a token had while it stays in the trending set,
+//               so a partial refresh can't zero out a known value.
+//           (2) INTERVAL RETRY: fetchTrendingInterval retries once (300ms) on a
+//               blank/failed interval before giving up, reducing how often 6h
+//               drops out of a rebuild in the first place.
+//         The gate `rank <= TREND_TOP_WIDE && t.bluechip > TREND_MIN_BLUECHIP`,
+//         all thresholds, the wallet-count/age/MC gates, and the fire decision
+//         are byte-identical to 17g.
+//
 //   2026-07-17d — COMPLETE SIGNAL REWRITE. Removed ALL previous signals:
 //         Migration detection, Post-Migration Big Buy, 10-Wallet coordination,
 //         and Large Buy Cluster. Replaced with the single Bluechip Trending Buy
@@ -523,16 +544,23 @@ function extractRank(data) {
   return [];
 }
 
+// Fetch one interval's top-N. Retries ONCE (300ms) on a blank/failed response
+// before giving up. This reduces how often an interval (esp. 6h) drops out of a
+// rebuild due to a transient GMGN rate-limit/timeout — part of the FABLE fix.
 async function fetchTrendingInterval(interval) {
-  const data = await gmgnGet('/v1/market/rank', {
-    chain: 'sol',
-    interval,
-    order_by: 'volume',
-    direction: 'desc',
-    limit: String(TREND_TOP_N),
-  });
-  const rank = extractRank(data);
-  return rank.slice(0, TREND_TOP_N);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const data = await gmgnGet('/v1/market/rank', {
+      chain: 'sol',
+      interval,
+      order_by: 'volume',
+      direction: 'desc',
+      limit: String(TREND_TOP_N),
+    });
+    const rank = extractRank(data);
+    if (rank.length) return rank.slice(0, TREND_TOP_N);
+    await sleep(300);  // one retry before giving up on this interval
+  }
+  return [];
 }
 
 async function refreshTrending() {
@@ -576,6 +604,23 @@ async function refreshTrending() {
     }
 
     if (next.size > 0) {
+      // ── FABLE BLUECHIP CARRY-FORWARD ──────────────────────────
+      // A partial refresh (e.g. the 6h interval rate-limited this cycle) must NOT
+      // zero out a bluechip value we already knew. The 1m/5m rank rows report
+      // bluechip 0, so if 6h drops out of a rebuild a still-trending token would
+      // regress to 0.0% and the signal gate would skip it — exactly the FABLE
+      // failure. Keep the highest bluechip a token had while it stays trending.
+      // Bounded by design: a token only survives here while it remains in the
+      // top-N of at least one interval; once it falls out of trending entirely
+      // it's absent from `next` and drops from the map (correct — no more fires).
+      for (const [addr, v] of next) {
+        const prev = trendingMap.get(addr);
+        if (prev && prev.bluechip > v.bluechip) {
+          log(`[TREND] carry-forward ${v.symbol} bluechip ${(v.bluechip*100).toFixed(1)}% -> ${(prev.bluechip*100).toFixed(1)}% (partial refresh, kept prior)`);
+          v.bluechip = prev.bluechip;
+        }
+      }
+
       trendingMap = next;
       trendLastOk = Math.floor(Date.now() / 1000);
       trendRefreshes++;
@@ -1049,7 +1094,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17d ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17h ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
