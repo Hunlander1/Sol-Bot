@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17h  (FABLE bluechip carry-forward fix) <<<
+//  >>> VERSION: 2026-07-17i  (cluster: require one >=$500 buy) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -15,6 +15,27 @@
 //    Fires once per token.
 //
 //  CHANGE LOG:
+//   2026-07-17i — CLUSTER BIG-BUY GATE. The 8-wallet cluster signal now also
+//         requires that AT LEAST ONE of the 8 distinct wallets spent >= $500 USD
+//         (CLUSTER_MIN_BIG_BUY_USD). Sub-$500 buys STILL count toward the wallet
+//         count — 7 x $50 + 1 x $500 fires, 8 x $50 does not.
+//         Supporting changes:
+//           - clusterBuyers[mint] changed from a Set of addresses to a Map of
+//             address -> USD spent. Size is captured at buy-time; the tx is not
+//             available later.
+//           - extractSolSpent() REINSTATED (removed in the 17d rewrite). Per the
+//             24q/24r history it PREFERS the wSOL swap leg and falls back to the
+//             native lamport delta (minus fee) — it never adds both legs, which
+//             was the old ~2x double-count bug.
+//           - getSolPriceUsd() (cached 60s) + buyUsdValue() convert to USD.
+//           - FAIL-OPEN on unknown size: if extraction or the price lookup fails,
+//             buyUsdValue returns null and the wallet counts as qualifying, so a
+//             GMGN blip can never silently suppress a real cluster (same failure
+//             class as the FABLE bug). A clean parsed $0 is fail-CLOSED — that's
+//             a transfer-in, not a buy. Unknowns are logged.
+//           - Alert now shows "Largest Buy" and per-wallet sizes, sorted desc.
+//         The bluechip trending signal is UNCHANGED by this version.
+//
 //   2026-07-17h — FABLE BLUECHIP BUG FIX (cache staleness, NOT a merge bug).
 //         Symptom: FABLE was rank 1-3 with 6+ tracked wallets buying but never
 //         fired; log showed "bluechip 0.0%" while /trending showed 65.5%.
@@ -102,6 +123,12 @@ const CLUSTER_SIGNAL_CHAT = process.env.CLUSTER_SIGNAL_CHAT || CHAT_ID_FAST;
 const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '8', 10);
 const CLUSTER_MIN_AGE     = parseInt(process.env.CLUSTER_MIN_AGE || '60', 10);      // >= 60 seconds old
 const CLUSTER_MAX_AGE     = parseInt(process.env.CLUSTER_MAX_AGE || '86400', 10);   // <= 24 hours old
+
+// Cluster signal additionally requires that AT LEAST ONE of the distinct wallets
+// spent >= this much USD on its buy. Sub-threshold buys still count toward the
+// wallet count — this is a "someone had real conviction" filter, not a size floor.
+// 7 x $50 + 1 x $500 fires; 8 x $50 does not.
+const CLUSTER_MIN_BIG_BUY_USD = parseFloat(process.env.CLUSTER_MIN_BIG_BUY_USD || '500');
 
 // Bluechip trending signal now needs this many DISTINCT tracked wallets (was 1).
 const TREND_MIN_WALLETS   = parseInt(process.env.TREND_MIN_WALLETS || '2', 10);
@@ -326,7 +353,12 @@ let tokenInfoInflight = {};
 let devWalletCache  = {};
 let pendingSigs     = new Set();
 let seenPairs       = new Set();  // "wallet:mint" — only the first buy per wallet+token matters
-let clusterBuyers   = {};         // mint -> Set of distinct tracked wallets that bought it (today)
+// mint -> Map of trackedWallet -> USD spent on that wallet's first buy.
+// Was a Set of addresses; became a Map in 17i so the big-buy gate can check
+// whether any one of the distinct wallets spent >= CLUSTER_MIN_BIG_BUY_USD.
+// A value of null means "size unknown" (price lookup or extraction failed) —
+// treated as QUALIFYING (fail-open), see clusterHasBigBuy().
+let clusterBuyers   = {};
 let clusterFired    = loadSet('/tmp/sol_cluster_fired.json');  // tokens that already fired the cluster signal
 let walletEventTimes = {};        // wallet -> recent event timestamps (ms), flood throttle
 const processing    = new Set();  // synchronous guard against duplicate concurrent signals
@@ -768,17 +800,35 @@ async function sendTrendSignal(trackedWallet, tokenMint, tx) {
 // Called after each detected buy. Tracks how many DISTINCT tracked wallets have
 // bought this token; when that reaches CLUSTER_MIN_WALLETS and the token age is
 // within [CLUSTER_MIN_AGE, CLUSTER_MAX_AGE], fire once to CLUSTER_SIGNAL_CHAT.
-async function checkClusterSignal(trackedWallet, tokenMint) {
+async function checkClusterSignal(trackedWallet, tokenMint, tx) {
   try {
     if (clusterFired.has(tokenMint)) return;
 
-    // Record this wallet as a buyer of the token.
-    if (!clusterBuyers[tokenMint]) clusterBuyers[tokenMint] = new Set();
-    clusterBuyers[tokenMint].add(trackedWallet);
+    // Record this wallet as a buyer, WITH the USD size of its buy. Size must be
+    // captured here at buy-time — the tx isn't available later.
+    if (!clusterBuyers[tokenMint]) clusterBuyers[tokenMint] = new Map();
+    if (!clusterBuyers[tokenMint].has(trackedWallet)) {
+      const usd = await buyUsdValue(tx, trackedWallet);
+      clusterBuyers[tokenMint].set(trackedWallet, usd);
+      if (usd === null) {
+        log(`[CLUSTER] ⚠️ ${walletName(trackedWallet)} on ${tokenMint.substring(0,8)} — buy size UNKNOWN (extraction/price failed); counts as qualifying (fail-open)`);
+      }
+    }
     const count = clusterBuyers[tokenMint].size;
 
     if (count < CLUSTER_MIN_WALLETS) return;   // not enough distinct wallets yet
     if (clusterFired.has(tokenMint)) return;
+
+    // GATE: at least ONE of the distinct wallets must have spent >= $500.
+    // Sub-threshold buys still counted toward `count` above — this only requires
+    // that one of them was sizeable. Checked before the age/MC/volume gates so a
+    // failing cluster costs no extra API calls.
+    if (!clusterHasBigBuy(clusterBuyers[tokenMint])) {
+      const sizes = [...clusterBuyers[tokenMint].values()]
+        .map(v => v === null ? '?' : `$${Math.round(v)}`).join(', ');
+      log(`[CLUSTER] SKIP ${tokenMint.substring(0,8)} — ${count} wallets but no buy >= ${fmtUsd(CLUSTER_MIN_BIG_BUY_USD)} [${sizes}]`);
+      return;
+    }
 
     // Age gate — need creation time. Use token/info's creation_timestamp.
     const info = await getCachedTokenInfo(tokenMint);
@@ -824,7 +874,18 @@ async function checkClusterSignal(trackedWallet, tokenMint) {
     saveSet('/tmp/sol_cluster_fired.json', clusterFired);
     const gateReason = isTop5 ? `top${TREND_TOP_TIGHT} trending` : `5m vol ${fmtUsd(vol5m)}`;
 
-    const buyers = [...clusterBuyers[tokenMint]].map(walletName);
+    // Buyer lines carry each wallet's buy size; '?' where size was unknown.
+    // Sorted biggest-first so the conviction buys read at the top.
+    const buyerEntries = [...clusterBuyers[tokenMint].entries()]
+      .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0));
+    const buyers = buyerEntries.map(([w, usd]) =>
+      `${walletName(w)}${usd === null ? ' — size ?' : ` — ${fmtUsd(usd)}`}`);
+    const knownSizes = buyerEntries.map(e => e[1]).filter(v => v !== null);
+    const largestBuy = knownSizes.length ? Math.max(...knownSizes) : null;
+    const anyUnknown = buyerEntries.some(e => e[1] === null);
+    const largestStr = largestBuy !== null
+      ? `${fmtUsd(largestBuy)}${anyUnknown ? ' (some sizes unknown)' : ''}`
+      : 'unknown';
     const symbol = info?.symbol ?? 'UNKNOWN';
     let mc = tokenMarketCap(info);
     const mcStr = mc > 0 ? fmtUsd(mc) : 'N/A';
@@ -842,12 +903,13 @@ async function checkClusterSignal(trackedWallet, tokenMint) {
       `Chain: Solana\n` +
       `Token Age: ${fmtAge(age)}\n` +
       `Market Cap: ${mcStr}\n` +
-      `Trending Rank: ${rankStr}\n\n` +
+      `Trending Rank: ${rankStr}\n` +
+      `Largest Buy: <b>${largestStr}</b>\n\n` +
       `<b>Bought by:</b>\n${buyerList}\n\n` +
       `Signal Time: ${signalTime}\n\n` +
       `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
     );
-    log(`[CLUSTER] 🔥 FIRED ${symbol} ${tokenMint.substring(0,8)} — ${count} wallets | age ${fmtAge(age)} | ${gateReason}`);
+    log(`[CLUSTER] 🔥 FIRED ${symbol} ${tokenMint.substring(0,8)} — ${count} wallets | largest ${largestStr} | age ${fmtAge(age)} | ${gateReason}`);
   } catch (e) {
     log(`[ERR] checkClusterSignal: ${e.message}`);
   }
@@ -870,6 +932,92 @@ function sendTelegram(chatId, message) {
   });
   req.on('error', e => log(`[TG ERR] ${e.message}`));
   req.write(body); req.end();
+}
+
+// ── SOL SPENT / BUY SIZE ──────────────────────────────────────
+// Reinstated in 17i (was removed in the 17d signal rewrite) to support the
+// cluster big-buy gate. Per the 24q/24r history: do NOT add the native and wSOL
+// legs together — that double-counts roughly 2x. PREFER the wSOL swap leg; fall
+// back to the native lamport delta only when there is no wSOL leg.
+// Returns SOL spent (float), or null if it can't be determined.
+function extractSolSpent(tx, trackedWallet) {
+  const meta = tx?.meta;
+  const msg  = tx?.transaction?.message;
+  if (!meta || !msg) return null;
+
+  // ── Preferred: the wSOL token leg for this wallet (pre - post, i.e. spent).
+  const preBals  = meta.preTokenBalances ?? [];
+  const postBals = meta.postTokenBalances ?? [];
+  let wsolPre = null, wsolPost = null;
+  for (const b of preBals) {
+    if (b.owner === trackedWallet && b.mint === SOL_MINT) {
+      wsolPre = (wsolPre ?? 0) + (parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0);
+    }
+  }
+  for (const b of postBals) {
+    if (b.owner === trackedWallet && b.mint === SOL_MINT) {
+      wsolPost = (wsolPost ?? 0) + (parseFloat(b.uiTokenAmount?.uiAmount ?? 0) || 0);
+    }
+  }
+  if (wsolPre !== null || wsolPost !== null) {
+    const spent = (wsolPre ?? 0) - (wsolPost ?? 0);
+    if (spent > 0) return spent;
+    // A wSOL leg that nets <= 0 means this wasn't paid in wSOL — fall through.
+  }
+
+  // ── Fallback: native SOL lamport delta for the wallet's own account.
+  const keys = msg.accountKeys ?? [];
+  let idx = -1;
+  for (let i = 0; i < keys.length; i++) {
+    const k = typeof keys[i] === 'string' ? keys[i] : keys[i]?.pubkey;
+    if (k === trackedWallet) { idx = i; break; }
+  }
+  if (idx < 0) return null;
+  const pre  = meta.preBalances?.[idx];
+  const post = meta.postBalances?.[idx];
+  if (pre == null || post == null) return null;
+  const fee = meta.fee ?? 0;
+  const lamports = pre - post - fee;   // exclude the tx fee from "spent"
+  if (!(lamports > 0)) return 0;       // clean zero — a transfer-in, not a buy
+  return lamports / 1e9;
+}
+
+// SOL/USD price via the existing token/info path, cached ~60s. Returns 0 on
+// failure — callers treat 0 as "unknown", never as a real price.
+let solPriceCache = { v: 0, at: 0 };
+async function getSolPriceUsd() {
+  if (solPriceCache.v > 0 && (Date.now() - solPriceCache.at) < 60000) return solPriceCache.v;
+  try {
+    const info = await fetchTokenInfo(SOL_MINT);
+    const p = tokenPriceUsd(info);
+    if (p > 0) { solPriceCache = { v: p, at: Date.now() }; return p; }
+  } catch (e) {}
+  return 0;
+}
+
+// USD value of a tracked wallet's buy in this tx.
+// Returns a number, or null meaning UNKNOWN (extraction or price failed).
+// null is deliberately distinct from 0: 0 is a real, parsed "spent nothing"
+// (fail-closed, doesn't qualify), null is a lookup failure (fail-open, qualifies).
+async function buyUsdValue(tx, trackedWallet) {
+  const sol = extractSolSpent(tx, trackedWallet);
+  if (sol === null) return null;        // couldn't parse the tx — unknown
+  if (sol === 0) return 0;              // parsed cleanly, genuinely no SOL out
+  const price = await getSolPriceUsd();
+  if (!(price > 0)) return null;        // price lookup failed — unknown
+  return sol * price;
+}
+
+// Does this token's recorded buyer set contain at least one qualifying big buy?
+// FAIL-OPEN: an unknown size (null) counts as qualifying, so a GMGN price blip
+// or an unparseable tx can never silently suppress a real cluster — that's the
+// same failure class as the FABLE bluechip bug. Unknowns are logged.
+function clusterHasBigBuy(sizeMap) {
+  for (const [, usd] of sizeMap) {
+    if (usd === null) return true;                       // unknown -> fail open
+    if (usd >= CLUSTER_MIN_BIG_BUY_USD) return true;
+  }
+  return false;
 }
 
 // ── MINT EXTRACTION ───────────────────────────────────────────
@@ -955,7 +1103,7 @@ async function processLogNotification(params) {
   await sendTrendSignal(trackedWallet, mint, tx);
 
   // ── SIGNAL 2: 8-wallet cluster ──
-  await checkClusterSignal(trackedWallet, mint);
+  await checkClusterSignal(trackedWallet, mint, tx);
 }
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
@@ -1094,7 +1242,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17h ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17i ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
