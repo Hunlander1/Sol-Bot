@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17i  (cluster: require one >=$500 buy) <<<
+//  >>> VERSION: 2026-07-17j  (GMGN load fix: Jupiter price, price-at-fire) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -357,7 +357,7 @@ let seenPairs       = new Set();  // "wallet:mint" — only the first buy per wa
 // Was a Set of addresses; became a Map in 17i so the big-buy gate can check
 // whether any one of the distinct wallets spent >= CLUSTER_MIN_BIG_BUY_USD.
 // A value of null means "size unknown" (price lookup or extraction failed) —
-// treated as QUALIFYING (fail-open), see clusterHasBigBuy().
+// treated as QUALIFYING (fail-open), see clusterHasBigBuySol().
 let clusterBuyers   = {};
 let clusterFired    = loadSet('/tmp/sol_cluster_fired.json');  // tokens that already fired the cluster signal
 let walletEventTimes = {};        // wallet -> recent event timestamps (ms), flood throttle
@@ -804,29 +804,28 @@ async function checkClusterSignal(trackedWallet, tokenMint, tx) {
   try {
     if (clusterFired.has(tokenMint)) return;
 
-    // Record this wallet as a buyer, WITH the USD size of its buy. Size must be
-    // captured here at buy-time — the tx isn't available later.
+    // Record this wallet's buy SIZE IN SOL — extracted from the tx with NO API
+    // call (17j: previously we priced every buy via GMGN, which got the VPS IP
+    // rate-limit-banned). SOL amount is stored now; USD conversion happens ONCE
+    // below, only after the wallet threshold is hit. null = tx couldn't be parsed.
     if (!clusterBuyers[tokenMint]) clusterBuyers[tokenMint] = new Map();
     if (!clusterBuyers[tokenMint].has(trackedWallet)) {
-      const usd = await buyUsdValue(tx, trackedWallet);
-      clusterBuyers[tokenMint].set(trackedWallet, usd);
-      if (usd === null) {
-        log(`[CLUSTER] ⚠️ ${walletName(trackedWallet)} on ${tokenMint.substring(0,8)} — buy size UNKNOWN (extraction/price failed); counts as qualifying (fail-open)`);
-      }
+      const sol = extractSolSpent(tx, trackedWallet);   // free — no network
+      clusterBuyers[tokenMint].set(trackedWallet, sol); // SOL amount, 0, or null
     }
     const count = clusterBuyers[tokenMint].size;
 
     if (count < CLUSTER_MIN_WALLETS) return;   // not enough distinct wallets yet
     if (clusterFired.has(tokenMint)) return;
 
-    // GATE: at least ONE of the distinct wallets must have spent >= $500.
-    // Sub-threshold buys still counted toward `count` above — this only requires
-    // that one of them was sizeable. Checked before the age/MC/volume gates so a
-    // failing cluster costs no extra API calls.
-    if (!clusterHasBigBuy(clusterBuyers[tokenMint])) {
-      const sizes = [...clusterBuyers[tokenMint].values()]
-        .map(v => v === null ? '?' : `$${Math.round(v)}`).join(', ');
-      log(`[CLUSTER] SKIP ${tokenMint.substring(0,8)} — ${count} wallets but no buy >= ${fmtUsd(CLUSTER_MIN_BIG_BUY_USD)} [${sizes}]`);
+    // GATE: at least ONE of the distinct wallets must have spent >= $500 USD.
+    // Sub-threshold buys still counted toward `count` above. We convert SOL->USD
+    // ONCE here (not per buy) — a single price lookup only when a cluster is
+    // actually close to firing. FAIL-OPEN: unknown size (null) or a failed price
+    // lookup counts as qualifying, so a blip can't suppress a real cluster.
+    const bigBuy = await clusterHasBigBuySol(clusterBuyers[tokenMint]);
+    if (!bigBuy.qualifies) {
+      log(`[CLUSTER] SKIP ${tokenMint.substring(0,8)} — ${count} wallets but no buy >= ${fmtUsd(CLUSTER_MIN_BIG_BUY_USD)} [${bigBuy.sizesStr}]`);
       return;
     }
 
@@ -874,9 +873,12 @@ async function checkClusterSignal(trackedWallet, tokenMint, tx) {
     saveSet('/tmp/sol_cluster_fired.json', clusterFired);
     const gateReason = isTop5 ? `top${TREND_TOP_TIGHT} trending` : `5m vol ${fmtUsd(vol5m)}`;
 
-    // Buyer lines carry each wallet's buy size; '?' where size was unknown.
-    // Sorted biggest-first so the conviction buys read at the top.
+    // Buyer lines carry each wallet's buy size in USD (SOL amount x cached price
+    // from getSolPriceUsd — already fetched by the gate, so no new network call).
+    // Sorted biggest-first. '?' where the buy couldn't be parsed or price is down.
+    const _solPrice = await getSolPriceUsd();
     const buyerEntries = [...clusterBuyers[tokenMint].entries()]
+      .map(([w, sol]) => [w, (sol === null || !(_solPrice > 0)) ? null : sol * _solPrice])
       .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0));
     const buyers = buyerEntries.map(([w, usd]) =>
       `${walletName(w)}${usd === null ? ' — size ?' : ` — ${fmtUsd(usd)}`}`);
@@ -982,11 +984,21 @@ function extractSolSpent(tx, trackedWallet) {
   return lamports / 1e9;
 }
 
-// SOL/USD price via the existing token/info path, cached ~60s. Returns 0 on
-// failure — callers treat 0 as "unknown", never as a real price.
+// SOL/USD price via Jupiter's free price API (lite-api.jup.ag) — NOT GMGN.
+// GMGN's rate limit is shared with the trending poller and per-token lookups; a
+// per-buy price call there got the VPS IP banned (17i). Jupiter's price endpoint
+// is free and unmetered for this. Cached 5 min — SOL barely moves intra-window.
+// Returns 0 on failure; callers treat 0 as "unknown", never as a real price.
 let solPriceCache = { v: 0, at: 0 };
 async function getSolPriceUsd() {
-  if (solPriceCache.v > 0 && (Date.now() - solPriceCache.at) < 60000) return solPriceCache.v;
+  if (solPriceCache.v > 0 && (Date.now() - solPriceCache.at) < 300000) return solPriceCache.v;
+  try {
+    const j = await httpsGet('lite-api.jup.ag', `/price/v2?ids=${SOL_MINT}`);
+    const p = parseFloat(j?.data?.[SOL_MINT]?.price ?? 0) || 0;
+    if (p > 0) { solPriceCache = { v: p, at: Date.now() }; return p; }
+  } catch (e) {}
+  // Fallback: GMGN token/info (only if Jupiter fails — rare, and this is one
+  // call every 5 min at most, not per buy).
   try {
     const info = await fetchTokenInfo(SOL_MINT);
     const p = tokenPriceUsd(info);
@@ -995,30 +1007,38 @@ async function getSolPriceUsd() {
   return 0;
 }
 
-// USD value of a tracked wallet's buy in this tx.
-// Returns a number, or null meaning UNKNOWN (extraction or price failed).
-// null is deliberately distinct from 0: 0 is a real, parsed "spent nothing"
-// (fail-closed, doesn't qualify), null is a lookup failure (fail-open, qualifies).
+// Given a Map(wallet -> SOL amount | 0 | null), decide whether the cluster has a
+// qualifying >= $500 buy. Prices ONCE (one getSolPriceUsd call, cached 5 min).
+// FAIL-OPEN: any null (unparseable buy) qualifies; if the price lookup itself
+// fails, the whole cluster qualifies (can't prove it doesn't). Returns
+// { qualifies, sizesStr } — sizesStr is a "$123, $45, ?" display for logs/alert.
+async function clusterHasBigBuySol(solMap) {
+  // null (unknown) always qualifies, no price needed.
+  for (const [, sol] of solMap) { if (sol === null) { /* still need sizesStr */ } }
+  const price = await getSolPriceUsd();
+  const parts = [];
+  let qualifies = false;
+  if (!(price > 0)) qualifies = true;   // price failed -> fail open
+  for (const [, sol] of solMap) {
+    if (sol === null) { parts.push('?'); qualifies = true; continue; }
+    const usd = price > 0 ? sol * price : null;
+    parts.push(usd === null ? '?' : `$${Math.round(usd)}`);
+    if (usd !== null && usd >= CLUSTER_MIN_BIG_BUY_USD) qualifies = true;
+  }
+  return { qualifies, sizesStr: parts.join(', '), price };
+}
+
+// USD value of a single buy, for the alert display. Uses the 5-min-cached price,
+// so calling it per-buyer at fire time costs at most one network call total.
 async function buyUsdValue(tx, trackedWallet) {
   const sol = extractSolSpent(tx, trackedWallet);
-  if (sol === null) return null;        // couldn't parse the tx — unknown
-  if (sol === 0) return 0;              // parsed cleanly, genuinely no SOL out
+  if (sol === null) return null;
+  if (sol === 0) return 0;
   const price = await getSolPriceUsd();
-  if (!(price > 0)) return null;        // price lookup failed — unknown
+  if (!(price > 0)) return null;
   return sol * price;
 }
 
-// Does this token's recorded buyer set contain at least one qualifying big buy?
-// FAIL-OPEN: an unknown size (null) counts as qualifying, so a GMGN price blip
-// or an unparseable tx can never silently suppress a real cluster — that's the
-// same failure class as the FABLE bluechip bug. Unknowns are logged.
-function clusterHasBigBuy(sizeMap) {
-  for (const [, usd] of sizeMap) {
-    if (usd === null) return true;                       // unknown -> fail open
-    if (usd >= CLUSTER_MIN_BIG_BUY_USD) return true;
-  }
-  return false;
-}
 
 // ── MINT EXTRACTION ───────────────────────────────────────────
 // Returns the mint the TRACKED WALLET actually received in this tx (post balance
@@ -1242,7 +1262,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17i ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17j ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
