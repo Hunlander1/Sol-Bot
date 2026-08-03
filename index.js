@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17k  (#1-everywhere signal) <<<
+//  >>> VERSION: 2026-07-17k3  (#1-everywhere + silent prime + 60s poll) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -109,7 +109,7 @@ const TREND_TOP_WIDE      = parseInt(process.env.TREND_TOP_WIDE || '10', 10);   
 const TREND_BLUECHIP_HI   = parseFloat(process.env.TREND_BLUECHIP_HI || '0.20');      // tier-2 bluechip threshold (>20%)
 const TREND_MIN_AGE       = parseInt(process.env.TREND_MIN_AGE || '60', 10);          // >= 60s old
 const MC_MIN_USD          = parseFloat(process.env.MC_MIN_USD || '30000');            // >= $30k market cap (both signals)
-const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '30', 10);        // refresh every 30s
+const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '60', 10);        // refresh every 60s (was 30 — halves GMGN rank load, ban insurance)
 // All five intervals — a token counts as trending if it's top-10 in ANY of them.
 const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
 
@@ -352,6 +352,7 @@ function walletName(addr) {
 // ── STATE ─────────────────────────────────────────────────────
 let trendFired      = loadSet(FIRED_FILE);   // tokens that already fired — one alert per token
 let top1Fired       = loadSet('/tmp/sol_top1_fired.json');  // tokens that already fired the #1-everywhere signal
+let top1Primed      = false;  // first #1-everywhere pass after boot is SILENT — it records what's ALREADY #1 without alerting, so we only fire on tokens that hit #1 AFTER the bot started watching (avoids a stale startup burst)
 let trendBuyers     = {};         // mint -> Set of distinct tracked wallets that bought it (for TREND_MIN_WALLETS gate)
 let tokenInfoCache  = {};
 let tokenInfoInflight = {};
@@ -669,7 +670,10 @@ async function refreshTrending() {
       // (a missing interval isn't a #1). Reads `ranks` already built above; makes
       // NO new GMGN calls.
       if (okIntervals === TREND_INTERVALS.length) {
-        checkTop1Everywhere(next);
+        // First full pass after boot primes SILENTLY (records current #1s without
+        // alerting). Every pass after fires normally.
+        checkTop1Everywhere(next, !top1Primed);
+        top1Primed = true;
       }
       // Log how many of the trending tokens would actually qualify, so it's
       // obvious at a glance whether the thresholds are ever satisfiable.
@@ -698,7 +702,7 @@ async function refreshTrending() {
 // `ranks` map the poller already built — no extra network calls. Caller only
 // invokes this when all five intervals reported (strict), so "#1 in all five"
 // is real, not an artifact of a missing interval.
-function checkTop1Everywhere(map) {
+function checkTop1Everywhere(map, silent) {
   try {
     for (const [addr, v] of map) {
       if (top1Fired.has(addr)) continue;
@@ -709,6 +713,13 @@ function checkTop1Everywhere(map) {
 
       top1Fired.add(addr);
       saveSet('/tmp/sol_top1_fired.json', top1Fired);
+
+      // Silent prime pass: record the token as seen but do NOT alert. This is
+      // what's ALREADY #1 at boot — not news. Fires only on later transitions.
+      if (silent) {
+        log(`[TOP1] prime (silent) ${v.symbol} ${addr.substring(0,8)} — already #1 everywhere at boot, not alerting`);
+        continue;
+      }
 
       const now = Math.floor(Date.now() / 1000);
       const age = v.created > 0 ? now - v.created : null;
@@ -1329,7 +1340,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17k ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17k3 ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
