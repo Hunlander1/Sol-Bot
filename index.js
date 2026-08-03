@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17j  (GMGN load fix: Jupiter price, price-at-fire) <<<
+//  >>> VERSION: 2026-07-17k  (#1-everywhere signal) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -120,6 +120,10 @@ const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
 // and the token's age is between CLUSTER_MIN_AGE and CLUSTER_MAX_AGE.
 // No trending or bluechip requirement. Any buy size. Fires once per token.
 const CLUSTER_SIGNAL_CHAT = process.env.CLUSTER_SIGNAL_CHAT || CHAT_ID_FAST;
+// #1-EVERYWHERE signal: a token that is rank #1 in ALL FIVE intervals in the
+// SAME refresh. Poller-driven (fires from the trending refresh, not a wallet
+// buy). Rare, high-signal. Routes to its own chat.
+const TOP1_SIGNAL_CHAT = process.env.TOP1_SIGNAL_CHAT || "-5305037806";
 const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '8', 10);
 const CLUSTER_MIN_AGE     = parseInt(process.env.CLUSTER_MIN_AGE || '60', 10);      // >= 60 seconds old
 const CLUSTER_MAX_AGE     = parseInt(process.env.CLUSTER_MAX_AGE || '86400', 10);   // <= 24 hours old
@@ -347,6 +351,7 @@ function walletName(addr) {
 
 // ── STATE ─────────────────────────────────────────────────────
 let trendFired      = loadSet(FIRED_FILE);   // tokens that already fired — one alert per token
+let top1Fired       = loadSet('/tmp/sol_top1_fired.json');  // tokens that already fired the #1-everywhere signal
 let trendBuyers     = {};         // mint -> Set of distinct tracked wallets that bought it (for TREND_MIN_WALLETS gate)
 let tokenInfoCache  = {};
 let tokenInfoInflight = {};
@@ -613,6 +618,7 @@ async function refreshTrending() {
         const existing = next.get(addr);
         if (existing) {
           existing.intervals.add(interval);
+          existing.ranks[interval] = rankPos;   // per-interval rank (for #1-everywhere)
           if (rankPos < existing.bestRank) existing.bestRank = rankPos;
           if (bluechip > existing.bluechip) existing.bluechip = bluechip;  // keep highest bluechip seen
         } else {
@@ -620,6 +626,7 @@ async function refreshTrending() {
             symbol:   t.symbol ?? 'UNKNOWN',
             bluechip,                                        // 0-1 scale (highest across intervals)
             bestRank: rankPos,                               // best (lowest) rank across intervals
+            ranks:    { [interval]: rankPos },                // per-interval rank (for #1-everywhere)
             created,                                         // unix secs
             mc:       parseFloat(t.market_cap ?? 0) || 0,
             ath:      parseFloat(t.history_highest_market_cap ?? 0) || 0,
@@ -656,6 +663,14 @@ async function refreshTrending() {
       trendingMap = next;
       trendLastOk = Math.floor(Date.now() / 1000);
       trendRefreshes++;
+
+      // #1-EVERYWHERE: strict — only evaluate when ALL five intervals reported
+      // this cycle, so a partial refresh can never produce a false #1-everywhere
+      // (a missing interval isn't a #1). Reads `ranks` already built above; makes
+      // NO new GMGN calls.
+      if (okIntervals === TREND_INTERVALS.length) {
+        checkTop1Everywhere(next);
+      }
       // Log how many of the trending tokens would actually qualify, so it's
       // obvious at a glance whether the thresholds are ever satisfiable.
       const now = Math.floor(Date.now() / 1000);
@@ -672,6 +687,57 @@ async function refreshTrending() {
     }
   } catch (e) {
     log(`[ERR] refreshTrending: ${e.message}`);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  #1-EVERYWHERE SIGNAL
+// ══════════════════════════════════════════════════════════════
+// Fires when a token is rank #1 in ALL FIVE intervals in the same refresh.
+// Poller-driven (not tied to a wallet buy). Fires once per token. Reads the
+// `ranks` map the poller already built — no extra network calls. Caller only
+// invokes this when all five intervals reported (strict), so "#1 in all five"
+// is real, not an artifact of a missing interval.
+function checkTop1Everywhere(map) {
+  try {
+    for (const [addr, v] of map) {
+      if (top1Fired.has(addr)) continue;
+      const r = v.ranks || {};
+      // Every interval must be present AND equal to 1.
+      const allOne = TREND_INTERVALS.every(iv => r[iv] === 1);
+      if (!allOne) continue;
+
+      top1Fired.add(addr);
+      saveSet('/tmp/sol_top1_fired.json', top1Fired);
+
+      const now = Math.floor(Date.now() / 1000);
+      const age = v.created > 0 ? now - v.created : null;
+      const mcStr  = v.mc > 0 ? fmtUsd(v.mc) : 'N/A';
+      const athStr = v.ath > 0 ? fmtUsd(v.ath) : 'N/A';
+      const volStr = v.volume > 0 ? fmtUsd(v.volume) : 'N/A';
+      const signalTime = new Date().toLocaleTimeString('en-US', {
+        timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+      });
+
+      sendTelegram(TOP1_SIGNAL_CHAT,
+        `\ud83d\udc51 <b>#1 Trending Everywhere — ${v.symbol}</b>\n\n` +
+        `Rank #1 on ALL timeframes: ${TREND_INTERVALS.join(', ')}\n\n` +
+        `Chain: Solana\n` +
+        `Contract: <code>${addr}</code>\n` +
+        `Token Age: ${fmtAge(age)}\n` +
+        `Market Cap: ${mcStr}\n` +
+        `ATH MC: ${athStr}\n` +
+        `Volume: ${volStr}\n` +
+        `Bluechip: ${(v.bluechip*100).toFixed(1)}%\n` +
+        `Holders: ${v.holders || 'N/A'}\n` +
+        `Smart / KOL: ${v.smart} / ${v.kol}\n\n` +
+        `Signal Time: ${signalTime}\n\n` +
+        `\ud83d\udd17 <a href="https://gmgn.ai/sol/token/${addr}">View on GMGN</a>`
+      );
+      log(`[TOP1] \ud83d\udc51 FIRED ${v.symbol} ${addr.substring(0,8)} — #1 on all ${TREND_INTERVALS.length} intervals`);
+    }
+  } catch (e) {
+    log(`[ERR] checkTop1Everywhere: ${e.message}`);
   }
 }
 
@@ -1204,6 +1270,7 @@ function connect() {
 setInterval(() => {
   if (seenPairs.size > 20000) { seenPairs.clear(); log(`[CLEANUP] seenPairs cleared`); }
   if (trendFired.size > 20000) { trendFired.clear(); saveSet(FIRED_FILE, trendFired); log(`[CLEANUP] trendFired cleared`); }
+  if (top1Fired.size > 20000) { top1Fired.clear(); saveSet('/tmp/sol_top1_fired.json', top1Fired); log(`[CLEANUP] top1Fired cleared`); }
   if (clusterFired.size > 20000) { clusterFired.clear(); saveSet('/tmp/sol_cluster_fired.json', clusterFired); log(`[CLEANUP] clusterFired cleared`); }
   if (Object.keys(clusterBuyers).length > 20000) { clusterBuyers = {}; log(`[CLEANUP] clusterBuyers cleared`); }
   if (Object.keys(trendBuyers).length > 20000) { trendBuyers = {}; log(`[CLEANUP] trendBuyers cleared`); }
@@ -1262,7 +1329,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17j ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17k ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
