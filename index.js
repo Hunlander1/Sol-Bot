@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17k3  (#1-everywhere + silent prime + 60s poll) <<<
+//  >>> VERSION: 2026-07-17l  (cluster #1-only/7-wallet; top1 +smart/kol +48h) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -124,7 +124,7 @@ const CLUSTER_SIGNAL_CHAT = process.env.CLUSTER_SIGNAL_CHAT || CHAT_ID_FAST;
 // SAME refresh. Poller-driven (fires from the trending refresh, not a wallet
 // buy). Rare, high-signal. Routes to its own chat.
 const TOP1_SIGNAL_CHAT = process.env.TOP1_SIGNAL_CHAT || "-5305037806";
-const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '8', 10);
+const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '7', 10);
 const CLUSTER_MIN_AGE     = parseInt(process.env.CLUSTER_MIN_AGE || '60', 10);      // >= 60 seconds old
 const CLUSTER_MAX_AGE     = parseInt(process.env.CLUSTER_MAX_AGE || '86400', 10);   // <= 24 hours old
 
@@ -711,6 +711,14 @@ function checkTop1Everywhere(map, silent) {
       const allOne = TREND_INTERVALS.every(iv => r[iv] === 1);
       if (!allOne) continue;
 
+      // FILTER: at least one smart-money or KOL holder (GMGN counts).
+      if (((v.smart || 0) + (v.kol || 0)) < 1) continue;
+
+      // FILTER: token age <= 48h. Fail-CLOSED — no creation timestamp = don't fire.
+      const _now = Math.floor(Date.now() / 1000);
+      if (!(v.created > 0)) continue;
+      if ((_now - v.created) > 48 * 3600) continue;
+
       top1Fired.add(addr);
       saveSet('/tmp/sol_top1_fired.json', top1Fired);
 
@@ -932,15 +940,13 @@ async function checkClusterSignal(trackedWallet, tokenMint, tx) {
       return;
     }
 
-    // GATE: token must be TOP-5 TRENDING (any interval) OR have >= $100k 5-min volume.
+    // GATE: token must be #1 TRENDING in ANY interval. (Was top-5 OR $100k 5m
+    // volume; tightened — the volume path is gone, and top-5 is now strictly #1.)
     const _ct = trendingMap.get(tokenMint);
-    const isTop5 = !!(_ct && (_ct.bestRank || 999) <= TREND_TOP_TIGHT);
-    let vol5m = 0;
-    if (!isTop5) {
-      vol5m = await gmgn5mVolumeUsd(tokenMint);
-    }
-    if (!isTop5 && !(vol5m >= VOL_GATE_USD)) {
-      log(`[CLUSTER] SKIP ${info?.symbol || tokenMint.substring(0,8)} — not top-${TREND_TOP_TIGHT} trending & 5m vol ${fmtUsd(vol5m)} < ${fmtUsd(VOL_GATE_USD)}`);
+    const isNum1 = !!(_ct && (_ct.bestRank || 999) === 1);
+    if (!isNum1) {
+      const _r = _ct ? (_ct.bestRank || '?') : 'not trending';
+      log(`[CLUSTER] SKIP ${info?.symbol || tokenMint.substring(0,8)} — rank ${_r}, need #1 trending`);
       return;
     }
 
@@ -948,7 +954,7 @@ async function checkClusterSignal(trackedWallet, tokenMint, tx) {
     if (clusterFired.has(tokenMint)) return;
     clusterFired.add(tokenMint);
     saveSet('/tmp/sol_cluster_fired.json', clusterFired);
-    const gateReason = isTop5 ? `top${TREND_TOP_TIGHT} trending` : `5m vol ${fmtUsd(vol5m)}`;
+    const gateReason = `#1 trending`;
 
     // Buyer lines carry each wallet's buy size in USD (SOL amount x cached price
     // from getSolPriceUsd — already fetched by the gate, so no new network call).
@@ -1340,7 +1346,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17k3 ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17l ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
