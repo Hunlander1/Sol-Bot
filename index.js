@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17l  (cluster #1-only/7-wallet; top1 +smart/kol +48h) <<<
+//  >>> VERSION: 2026-07-17n  (cluster OFF by default; bluechip + #1 only) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -109,7 +109,7 @@ const TREND_TOP_WIDE      = parseInt(process.env.TREND_TOP_WIDE || '10', 10);   
 const TREND_BLUECHIP_HI   = parseFloat(process.env.TREND_BLUECHIP_HI || '0.20');      // tier-2 bluechip threshold (>20%)
 const TREND_MIN_AGE       = parseInt(process.env.TREND_MIN_AGE || '60', 10);          // >= 60s old
 const MC_MIN_USD          = parseFloat(process.env.MC_MIN_USD || '30000');            // >= $30k market cap (both signals)
-const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '60', 10);        // refresh every 60s (was 30 — halves GMGN rank load, ban insurance)
+const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '120', 10);        // refresh every 120s (was 60 — cut GMGN rank load further after 2nd ban)
 // All five intervals — a token counts as trending if it's top-10 in ANY of them.
 const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
 
@@ -124,6 +124,10 @@ const CLUSTER_SIGNAL_CHAT = process.env.CLUSTER_SIGNAL_CHAT || CHAT_ID_FAST;
 // SAME refresh. Poller-driven (fires from the trending refresh, not a wallet
 // buy). Rare, high-signal. Routes to its own chat.
 const TOP1_SIGNAL_CHAT = process.env.TOP1_SIGNAL_CHAT || "-5305037806";
+// MASTER SWITCH: cluster signal. Default OFF (2026-08-05) to cut GMGN load while
+// isolating the rate-limit bans — bluechip + #1-everywhere stay on. Set
+// ENABLE_CLUSTER=1 in .env-vars to turn it back on (no code change needed).
+const ENABLE_CLUSTER = (process.env.ENABLE_CLUSTER || '0') === '1';
 const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '7', 10);
 const CLUSTER_MIN_AGE     = parseInt(process.env.CLUSTER_MIN_AGE || '60', 10);      // >= 60 seconds old
 const CLUSTER_MAX_AGE     = parseInt(process.env.CLUSTER_MAX_AGE || '86400', 10);   // <= 24 hours old
@@ -1206,7 +1210,7 @@ async function processLogNotification(params) {
   await sendTrendSignal(trackedWallet, mint, tx);
 
   // ── SIGNAL 2: 8-wallet cluster ──
-  await checkClusterSignal(trackedWallet, mint, tx);
+  if (ENABLE_CLUSTER) await checkClusterSignal(trackedWallet, mint, tx);
 }
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
@@ -1346,10 +1350,11 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17l ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17n ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
+log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster=${ENABLE_CLUSTER ? 'ON' : 'OFF'}`);
 
 https.get('https://api.ipify.org?format=json', (res) => {
   let d = ''; res.on('data', c => d += c);
