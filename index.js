@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17n  (cluster OFF by default; bluechip + #1 only) <<<
+//  >>> VERSION: 2026-07-17o  (#1 age: token/info fallback for missing rank timestamp) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -676,7 +676,7 @@ async function refreshTrending() {
       if (okIntervals === TREND_INTERVALS.length) {
         // First full pass after boot primes SILENTLY (records current #1s without
         // alerting). Every pass after fires normally.
-        checkTop1Everywhere(next, !top1Primed);
+        await checkTop1Everywhere(next, !top1Primed);
         top1Primed = true;
       }
       // Log how many of the trending tokens would actually qualify, so it's
@@ -706,7 +706,7 @@ async function refreshTrending() {
 // `ranks` map the poller already built — no extra network calls. Caller only
 // invokes this when all five intervals reported (strict), so "#1 in all five"
 // is real, not an artifact of a missing interval.
-function checkTop1Everywhere(map, silent) {
+async function checkTop1Everywhere(map, silent) {
   try {
     for (const [addr, v] of map) {
       if (top1Fired.has(addr)) continue;
@@ -718,10 +718,19 @@ function checkTop1Everywhere(map, silent) {
       // FILTER: at least one smart-money or KOL holder (GMGN counts).
       if (((v.smart || 0) + (v.kol || 0)) < 1) continue;
 
-      // FILTER: token age <= 48h. Fail-CLOSED — no creation timestamp = don't fire.
+      // FILTER: token age <= 48h. The trending/rank row often omits
+      // creation_timestamp (common on some tokens), so when it's missing, fall
+      // back to a token/info lookup which DOES carry it — same data GMGN has, the
+      // rank row is just lean. Only fail-closed if BOTH sources lack it.
       const _now = Math.floor(Date.now() / 1000);
-      if (!(v.created > 0)) continue;
-      if ((_now - v.created) > 48 * 3600) continue;
+      let _created = v.created;
+      if (!(_created > 0)) {
+        const _info = await getCachedTokenInfo(addr);
+        _created = parseInt(_info?.creation_timestamp ?? 0, 10) || 0;
+      }
+      if (!(_created > 0)) continue;                       // truly unknown -> skip
+      if ((_now - _created) > 48 * 3600) continue;         // too old
+      v.created = _created;                                // cache for the alert
 
       top1Fired.add(addr);
       saveSet('/tmp/sol_top1_fired.json', top1Fired);
@@ -1350,7 +1359,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17n ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17o ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
