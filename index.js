@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17o  (#1 age: token/info fallback for missing rank timestamp) <<<
+//  >>> VERSION: 2026-07-17q  (429 circuit breaker — stop feeding the ban) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -109,7 +109,7 @@ const TREND_TOP_WIDE      = parseInt(process.env.TREND_TOP_WIDE || '10', 10);   
 const TREND_BLUECHIP_HI   = parseFloat(process.env.TREND_BLUECHIP_HI || '0.20');      // tier-2 bluechip threshold (>20%)
 const TREND_MIN_AGE       = parseInt(process.env.TREND_MIN_AGE || '60', 10);          // >= 60s old
 const MC_MIN_USD          = parseFloat(process.env.MC_MIN_USD || '30000');            // >= $30k market cap (both signals)
-const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '120', 10);        // refresh every 120s (was 60 — cut GMGN rank load further after 2nd ban)
+const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '300', 10);        // refresh every 300s/5min — even minimal poller (cluster+tracker OFF) still hit GMGN's rate limit, so cutting the CORE poll rate hard
 // All five intervals — a token counts as trending if it's top-10 in ANY of them.
 const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
 
@@ -453,12 +453,34 @@ function tokenMarketCap(info) {
 }
 
 // ── HTTP ──────────────────────────────────────────────────────
+// ── GMGN RATE-LIMIT CIRCUIT BREAKER ───────────────────────────
+// GMGN's docs: on a 429 RATE_LIMIT_BANNED, EVERY request during the cooldown
+// EXTENDS the ban by 5s (up to 5 min). So the old behavior — keep polling through
+// a ban — fed the ban and made it permanent. This gate makes the bot STOP calling
+// GMGN until the ban's reset_at passes. gmgnBannedUntil is a unix-secs timestamp.
+let gmgnBannedUntil = 0;
+function gmgnIsBanned() { return Math.floor(Date.now() / 1000) < gmgnBannedUntil; }
+
 function httpsGet(hostname, path, headers = {}) {
   return new Promise((resolve) => {
     const req = https.request({ hostname, path, method: 'GET', headers }, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
+        // On a 429 from GMGN, read reset_at and trip the breaker so we stop
+        // calling until the ban lifts (calling during cooldown extends it 5s each).
+        if (res.statusCode === 429 && hostname === 'openapi.gmgn.ai') {
+          let resetAt = 0;
+          try { resetAt = parseInt(JSON.parse(data)?.reset_at ?? 0, 10) || 0; } catch {}
+          // fall back to the X-RateLimit-Reset header, then a 5-min default
+          if (!resetAt) resetAt = parseInt(res.headers['x-ratelimit-reset'] ?? 0, 10) || 0;
+          if (!resetAt) resetAt = Math.floor(Date.now() / 1000) + 300;
+          if (resetAt > gmgnBannedUntil) {
+            gmgnBannedUntil = resetAt;
+            log(`[GMGN] 🛑 429 RATE_LIMIT_BANNED — pausing ALL GMGN calls until ${new Date(resetAt*1000).toLocaleTimeString('en-US',{timeZone:'America/Toronto'})} (calling during cooldown would extend the ban)`);
+          }
+          resolve(null); return;
+        }
         if (res.statusCode !== 200) { resolve(null); return; }
         try { resolve(JSON.parse(data)); } catch { resolve(null); }
       });
@@ -503,6 +525,10 @@ async function getTransaction(signature) {
 // Auth requires ALL of: X-APIKEY header, a browser User-Agent (GMGN 403s the
 // default Node/Python UA), plus timestamp + client_id query params.
 async function gmgnGet(path, params = {}, skipAuth = false) {
+  // Circuit breaker: if we're inside a known ban window, do NOT call GMGN —
+  // returning null here is what lets the ban actually expire instead of being
+  // extended 5s by every request during cooldown.
+  if (gmgnIsBanned()) return null;
   if (!skipAuth) {
     params.timestamp = Math.floor(Date.now() / 1000).toString();
     params.client_id = Math.random().toString(36).substring(2) + Date.now().toString(36);
@@ -1359,7 +1385,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17o ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17q ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
