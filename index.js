@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17q  (429 circuit breaker — stop feeding the ban) <<<
+//  >>> VERSION: 2026-07-17t  (cluster revised 5w/$500/60m + new whale-holder signal) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -109,7 +109,7 @@ const TREND_TOP_WIDE      = parseInt(process.env.TREND_TOP_WIDE || '10', 10);   
 const TREND_BLUECHIP_HI   = parseFloat(process.env.TREND_BLUECHIP_HI || '0.20');      // tier-2 bluechip threshold (>20%)
 const TREND_MIN_AGE       = parseInt(process.env.TREND_MIN_AGE || '60', 10);          // >= 60s old
 const MC_MIN_USD          = parseFloat(process.env.MC_MIN_USD || '30000');            // >= $30k market cap (both signals)
-const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '300', 10);        // refresh every 300s/5min — even minimal poller (cluster+tracker OFF) still hit GMGN's rate limit, so cutting the CORE poll rate hard
+const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '60', 10);        // refresh every 60s — the 429 circuit breaker (17q) handles bans now, and rank is weight-1 (~20 req/sec headroom), so the 300s panic setting is unnecessary and was causing missed #1-everywhere signals between polls
 // All five intervals — a token counts as trending if it's top-10 in ANY of them.
 const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
 
@@ -127,16 +127,22 @@ const TOP1_SIGNAL_CHAT = process.env.TOP1_SIGNAL_CHAT || "-5305037806";
 // MASTER SWITCH: cluster signal. Default OFF (2026-08-05) to cut GMGN load while
 // isolating the rate-limit bans — bluechip + #1-everywhere stay on. Set
 // ENABLE_CLUSTER=1 in .env-vars to turn it back on (no code change needed).
-const ENABLE_CLUSTER = (process.env.ENABLE_CLUSTER || '0') === '1';
-const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '7', 10);
+const ENABLE_CLUSTER = (process.env.ENABLE_CLUSTER || '1') === '1';   // re-enabled 2026-08-11 with revised rule
+const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '5', 10);   // 5+ wallets, each with a >=$500 buy
 const CLUSTER_MIN_AGE     = parseInt(process.env.CLUSTER_MIN_AGE || '60', 10);      // >= 60 seconds old
-const CLUSTER_MAX_AGE     = parseInt(process.env.CLUSTER_MAX_AGE || '86400', 10);   // <= 24 hours old
+const CLUSTER_MAX_AGE     = parseInt(process.env.CLUSTER_MAX_AGE || '3600', 10);   // <= 60 minutes old (revised 2026-08-11)
 
 // Cluster signal additionally requires that AT LEAST ONE of the distinct wallets
 // spent >= this much USD on its buy. Sub-threshold buys still count toward the
 // wallet count — this is a "someone had real conviction" filter, not a size floor.
 // 7 x $50 + 1 x $500 fires; 8 x $50 does not.
 const CLUSTER_MIN_BIG_BUY_USD = parseFloat(process.env.CLUSTER_MIN_BIG_BUY_USD || '500');
+// WHALE HOLDER signal (2026-08-11): fires when a token has >WHALE_MIN_HOLDERS
+// holders, is < WHALE_MAX_AGE old, and is #1 in >=1 trending interval. Poll-driven
+// (reads the trending rows — no wallet buys, no WebSocket, no extra GMGN call).
+const WHALE_MIN_HOLDERS   = parseInt(process.env.WHALE_MIN_HOLDERS || '5000', 10);
+const WHALE_MAX_AGE       = parseInt(process.env.WHALE_MAX_AGE || '3600', 10);   // < 60 min old
+const WHALE_SIGNAL_CHAT   = process.env.WHALE_SIGNAL_CHAT || CLUSTER_SIGNAL_CHAT; // cluster chat
 
 // Bluechip trending signal now needs this many DISTINCT tracked wallets (was 1).
 const TREND_MIN_WALLETS   = parseInt(process.env.TREND_MIN_WALLETS || '2', 10);
@@ -357,6 +363,7 @@ function walletName(addr) {
 let trendFired      = loadSet(FIRED_FILE);   // tokens that already fired — one alert per token
 let top1Fired       = loadSet('/tmp/sol_top1_fired.json');  // tokens that already fired the #1-everywhere signal
 let top1Primed      = false;  // first #1-everywhere pass after boot is SILENT — it records what's ALREADY #1 without alerting, so we only fire on tokens that hit #1 AFTER the bot started watching (avoids a stale startup burst)
+let top1PrimedSet   = new Set();  // tokens seen as #1 during the silent boot prime — NON-persisted; NOT the fired-set. A token here was #1 at boot; if it's still #1 on a later (non-silent) cycle it fires normally.
 let trendBuyers     = {};         // mint -> Set of distinct tracked wallets that bought it (for TREND_MIN_WALLETS gate)
 let tokenInfoCache  = {};
 let tokenInfoInflight = {};
@@ -370,6 +377,7 @@ let seenPairs       = new Set();  // "wallet:mint" — only the first buy per wa
 // treated as QUALIFYING (fail-open), see clusterHasBigBuySol().
 let clusterBuyers   = {};
 let clusterFired    = loadSet('/tmp/sol_cluster_fired.json');  // tokens that already fired the cluster signal
+let whaleFired      = loadSet('/tmp/sol_whale_fired.json');    // tokens that already fired the whale-holder signal
 let walletEventTimes = {};        // wallet -> recent event timestamps (ms), flood throttle
 const processing    = new Set();  // synchronous guard against duplicate concurrent signals
 
@@ -703,6 +711,7 @@ async function refreshTrending() {
         // First full pass after boot primes SILENTLY (records current #1s without
         // alerting). Every pass after fires normally.
         await checkTop1Everywhere(next, !top1Primed);
+        checkWhaleHolders(next);
         top1Primed = true;
       }
       // Log how many of the trending tokens would actually qualify, so it's
@@ -732,6 +741,35 @@ async function refreshTrending() {
 // `ranks` map the poller already built — no extra network calls. Caller only
 // invokes this when all five intervals reported (strict), so "#1 in all five"
 // is real, not an artifact of a missing interval.
+// WHALE HOLDER: scan the current trending map for tokens with > WHALE_MIN_HOLDERS
+// holders, age < WHALE_MAX_AGE, and #1 in at least one interval. Poll-driven; fires
+// once per token to the cluster chat. No wallet/WebSocket dependency.
+function checkWhaleHolders(map) {
+  if (!ENABLE_CLUSTER) return;   // gated with the cluster (same "add-back" package)
+  const now = Math.floor(Date.now() / 1000);
+  for (const [addr, v] of map.entries()) {
+    if (whaleFired.has(addr)) continue;
+    if ((v.holders || 0) <= WHALE_MIN_HOLDERS) continue;         // need > 5000 holders
+    if ((v.bestRank || 999) !== 1) continue;                    // #1 in >=1 interval
+    if (!(v.created > 0)) continue;                             // need age; fail-closed
+    if ((now - v.created) >= WHALE_MAX_AGE) continue;           // must be < 60 min old
+
+    whaleFired.add(addr);
+    saveSet('/tmp/sol_whale_fired.json', whaleFired);
+    const ageMin = Math.floor((now - v.created) / 60);
+    const msg =
+      `🐳 <b>WHALE HOLDER — ${v.symbol || '?'}</b>\n\n` +
+      `<b>Holders:</b> ${v.holders.toLocaleString()}\n` +
+      `<b>Age:</b> ${ageMin}m\n` +
+      `<b>Trending Rank:</b> #${v.bestRank} (best across intervals)\n` +
+      `<b>Market Cap:</b> ${fmtUsd(v.mc || 0)}\n` +
+      `<b>Contract:</b> <code>${addr}</code>\n\n` +
+      `🔗 <a href="https://gmgn.ai/sol/token/${addr}">View on GMGN</a>`;
+    sendTelegram(WHALE_SIGNAL_CHAT, msg);
+    log(`[WHALE] 🐳 FIRED ${v.symbol || addr.substring(0,8)} — ${v.holders} holders, ${ageMin}m old, rank #${v.bestRank}`);
+  }
+}
+
 async function checkTop1Everywhere(map, silent) {
   try {
     for (const [addr, v] of map) {
@@ -758,15 +796,27 @@ async function checkTop1Everywhere(map, silent) {
       if ((_now - _created) > 48 * 3600) continue;         // too old
       v.created = _created;                                // cache for the alert
 
-      top1Fired.add(addr);
-      saveSet('/tmp/sol_top1_fired.json', top1Fired);
-
-      // Silent prime pass: record the token as seen but do NOT alert. This is
-      // what's ALREADY #1 at boot — not news. Fires only on later transitions.
+      // Silent prime pass: record what's ALREADY #1 at boot in a SEPARATE,
+      // non-persisted set so we don't alert on stale boot state. Do NOT add to
+      // top1Fired here — that set is only for tokens that actually ALERTED. (Old
+      // bug: silent prime added to the persisted fired-set, so a token that was
+      // #1 across restarts got permanently skipped and never fired — which is
+      // exactly what happened with restarts while a token sat at #1.)
       if (silent) {
+        top1PrimedSet.add(addr);
         log(`[TOP1] prime (silent) ${v.symbol} ${addr.substring(0,8)} — already #1 everywhere at boot, not alerting`);
         continue;
       }
+
+      // A token primed at boot should NOT be suppressed forever — only skipped
+      // while it's still the same boot-state token. But once we're past the prime
+      // pass (silent=false) and it's still #1, it's worth firing. So we clear it
+      // from the primed set and fire normally below.
+      top1PrimedSet.delete(addr);
+
+      // Mark as fired ONLY now that we're actually alerting.
+      top1Fired.add(addr);
+      saveSet('/tmp/sol_top1_fired.json', top1Fired);
 
       const now = Math.floor(Date.now() / 1000);
       const age = v.created > 0 ? now - v.created : null;
@@ -939,17 +989,16 @@ async function checkClusterSignal(trackedWallet, tokenMint, tx) {
     }
     const count = clusterBuyers[tokenMint].size;
 
-    if (count < CLUSTER_MIN_WALLETS) return;   // not enough distinct wallets yet
+    // Quick pre-check: can't possibly have 5 big buyers with fewer than 5 wallets.
+    if (count < CLUSTER_MIN_WALLETS) return;
     if (clusterFired.has(tokenMint)) return;
 
-    // GATE: at least ONE of the distinct wallets must have spent >= $500 USD.
-    // Sub-threshold buys still counted toward `count` above. We convert SOL->USD
-    // ONCE here (not per buy) — a single price lookup only when a cluster is
-    // actually close to firing. FAIL-OPEN: unknown size (null) or a failed price
-    // lookup counts as qualifying, so a blip can't suppress a real cluster.
-    const bigBuy = await clusterHasBigBuySol(clusterBuyers[tokenMint]);
-    if (!bigBuy.qualifies) {
-      log(`[CLUSTER] SKIP ${tokenMint.substring(0,8)} — ${count} wallets but no buy >= ${fmtUsd(CLUSTER_MIN_BIG_BUY_USD)} [${bigBuy.sizesStr}]`);
+    // GATE (revised 2026-08-11): require >= CLUSTER_MIN_WALLETS wallets that EACH
+    // spent >= $500 (not just one). Convert SOL->USD ONCE here, only when a cluster
+    // is close to firing. FAIL-OPEN per-wallet: an unparseable size counts as big.
+    const bigBuy = await clusterBigBuyerCount(clusterBuyers[tokenMint]);
+    if (bigBuy.bigCount < CLUSTER_MIN_WALLETS) {
+      log(`[CLUSTER] SKIP ${tokenMint.substring(0,8)} — ${count} wallets, only ${bigBuy.bigCount} spent >= ${fmtUsd(CLUSTER_MIN_BIG_BUY_USD)} (need ${CLUSTER_MIN_WALLETS}) [${bigBuy.sizesStr}]`);
       return;
     }
 
@@ -1134,6 +1183,24 @@ async function getSolPriceUsd() {
 // FAIL-OPEN: any null (unparseable buy) qualifies; if the price lookup itself
 // fails, the whole cluster qualifies (can't prove it doesn't). Returns
 // { qualifies, sizesStr } — sizesStr is a "$123, $45, ?" display for logs/alert.
+// Revised rule (2026-08-11): count how many DISTINCT wallets EACH spent >= the
+// big-buy threshold. The cluster now requires >= CLUSTER_MIN_WALLETS wallets that
+// INDIVIDUALLY cleared $500 (not just one). Unknown size (null) or a failed price
+// lookup counts as qualifying for that wallet (fail-open, so a parse blip can't
+// suppress a real cluster). Returns { bigCount, sizesStr }.
+async function clusterBigBuyerCount(solMap) {
+  const price = await getSolPriceUsd();
+  const parts = [];
+  let bigCount = 0;
+  for (const [, sol] of solMap) {
+    if (sol === null || !(price > 0)) { parts.push('?'); bigCount++; continue; }  // fail-open
+    const usd = sol * price;
+    parts.push(`$${Math.round(usd)}`);
+    if (usd >= CLUSTER_MIN_BIG_BUY_USD) bigCount++;
+  }
+  return { bigCount, sizesStr: parts.join(', '), price };
+}
+
 async function clusterHasBigBuySol(solMap) {
   // null (unknown) always qualifies, no price needed.
   for (const [, sol] of solMap) { if (sol === null) { /* still need sizesStr */ } }
@@ -1328,6 +1395,7 @@ setInterval(() => {
   if (trendFired.size > 20000) { trendFired.clear(); saveSet(FIRED_FILE, trendFired); log(`[CLEANUP] trendFired cleared`); }
   if (top1Fired.size > 20000) { top1Fired.clear(); saveSet('/tmp/sol_top1_fired.json', top1Fired); log(`[CLEANUP] top1Fired cleared`); }
   if (clusterFired.size > 20000) { clusterFired.clear(); saveSet('/tmp/sol_cluster_fired.json', clusterFired); log(`[CLEANUP] clusterFired cleared`); }
+  if (whaleFired.size > 20000) { whaleFired.clear(); saveSet('/tmp/sol_whale_fired.json', whaleFired); log(`[CLEANUP] whaleFired cleared`); }
   if (Object.keys(clusterBuyers).length > 20000) { clusterBuyers = {}; log(`[CLEANUP] clusterBuyers cleared`); }
   if (Object.keys(trendBuyers).length > 20000) { trendBuyers = {}; log(`[CLEANUP] trendBuyers cleared`); }
   if (Object.keys(vol5mCache).length > 5000) { vol5mCache = {}; }
@@ -1385,11 +1453,11 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17q ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17t ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
-log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster=${ENABLE_CLUSTER ? 'ON' : 'OFF'}`);
+log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster(5w/$500/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'}, whale-holder(>5k/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'}`);
 
 https.get('https://api.ipify.org?format=json', (res) => {
   let d = ''; res.on('data', c => d += c);
