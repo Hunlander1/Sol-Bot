@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17v  (HTTP buy-polling mode — free-tier safe, replaces WebSocket) <<<
+//  >>> VERSION: 2026-07-17w  (fix: bluechip carry-forward only fills a 0, no longer locks in a stale HIGH) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -685,7 +685,7 @@ async function refreshTrending() {
           existing.intervals.add(interval);
           existing.ranks[interval] = rankPos;   // per-interval rank (for #1-everywhere)
           if (rankPos < existing.bestRank) existing.bestRank = rankPos;
-          if (bluechip > existing.bluechip) existing.bluechip = bluechip;  // keep highest bluechip seen
+          if (bluechip > existing.bluechip) existing.bluechip = bluechip;  // within THIS cycle, take the highest non-zero interval reading (all are "now")
         } else {
           next.set(addr, {
             symbol:   t.symbol ?? 'UNKNOWN',
@@ -719,8 +719,14 @@ async function refreshTrending() {
       // it's absent from `next` and drops from the map (correct — no more fires).
       for (const [addr, v] of next) {
         const prev = trendingMap.get(addr);
-        if (prev && prev.bluechip > v.bluechip) {
-          log(`[TREND] carry-forward ${v.symbol} bluechip ${(v.bluechip*100).toFixed(1)}% -> ${(prev.bluechip*100).toFixed(1)}% (partial refresh, kept prior)`);
+        // ONLY carry the prior value when THIS cycle read 0 (missing data — the
+        // bluechip-bearing interval dropped out this refresh). A non-zero reading
+        // is current truth and REPLACES the prior, even when it's lower — a token
+        // whose bluechip genuinely fell must reflect the new value, not the stale
+        // peak. (Bug fix 2026-08-12: tokens were firing on a locked-in high after
+        // their real bluechip had dropped, e.g. GTA fired 26.8% when live was 3.2%.)
+        if (prev && v.bluechip === 0 && prev.bluechip > 0) {
+          log(`[TREND] carry-forward ${v.symbol} bluechip 0.0% -> ${(prev.bluechip*100).toFixed(1)}% (missing this cycle, kept prior)`);
           v.bluechip = prev.bluechip;
         }
       }
@@ -1484,7 +1490,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17v ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17w ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
