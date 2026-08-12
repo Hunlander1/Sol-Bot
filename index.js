@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17t  (cluster revised 5w/$500/60m + new whale-holder signal) <<<
+//  >>> VERSION: 2026-07-17u  (add dRPC + Chainstack WSS providers) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -87,6 +87,10 @@ const GMGN_API_KEY  = process.env.GMGN_API_KEY;
 const SHYFT_API_KEY = process.env.SHYFT_API_KEY;
 const HELIUS_API_KEY  = process.env.HELIUS_API_KEY;
 const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY;
+// Full wss:// URLs (the API key is embedded in the URL, so we read the whole URL,
+// not a bare key). Set SB_DRPC_WSS_URL / SB_CHAINSTACK_WSS_URL in .env-vars.
+const DRPC_WSS_URL       = process.env.DRPC_WSS_URL;
+const CHAINSTACK_WSS_URL = process.env.CHAINSTACK_WSS_URL;
 
 const TELEGRAM_TOKEN      = process.env.TELEGRAM_TOKEN;
 const CHAT_ID_FAST        = process.env.CHAT_ID_FAST        || '-5081620734';
@@ -168,10 +172,13 @@ const HTTP_RPCS = [
 // Once Helius credits reset, set WSS_ORDER=HELIUS,PUBLIC to prefer it again — no
 // code change needed.
 const WSS_DEFS = {
-  HELIUS:  HELIUS_API_KEY  ? { name: 'HELIUS',  url: `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` }  : null,
-  ALCHEMY: ALCHEMY_API_KEY ? { name: 'ALCHEMY', url: `wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` } : null,
-  SHYFT:   SHYFT_API_KEY   ? { name: 'SHYFT',   url: `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}` }              : null,
-  PUBLIC:  { name: 'PUBLIC', url: 'wss://api.mainnet-beta.solana.com' },
+  HELIUS:     HELIUS_API_KEY   ? { name: 'HELIUS',     url: `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` }  : null,
+  ALCHEMY:    ALCHEMY_API_KEY  ? { name: 'ALCHEMY',    url: `wss://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` } : null,
+  SHYFT:      SHYFT_API_KEY     ? { name: 'SHYFT',      url: `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}` }              : null,
+  // dRPC + Chainstack: full private wss:// URLs from .env-vars (key is in the URL).
+  DRPC:       DRPC_WSS_URL       ? { name: 'DRPC',       url: DRPC_WSS_URL }       : null,
+  CHAINSTACK: CHAINSTACK_WSS_URL ? { name: 'CHAINSTACK', url: CHAINSTACK_WSS_URL } : null,
+  PUBLIC:     { name: 'PUBLIC', url: 'wss://api.mainnet-beta.solana.com' },
 };
 const WSS_ORDER = (process.env.WSS_ORDER || 'PUBLIC,HELIUS,ALCHEMY')
   .split(',').map(s => s.trim().toUpperCase());
@@ -1453,7 +1460,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17t ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17u ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
