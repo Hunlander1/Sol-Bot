@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17u  (add dRPC + Chainstack WSS providers) <<<
+//  >>> VERSION: 2026-07-17v  (HTTP buy-polling mode — free-tier safe, replaces WebSocket) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -133,6 +133,12 @@ const TOP1_SIGNAL_CHAT = process.env.TOP1_SIGNAL_CHAT || "-5305037806";
 // ENABLE_CLUSTER=1 in .env-vars to turn it back on (no code change needed).
 const ENABLE_CLUSTER = (process.env.ENABLE_CLUSTER || '1') === '1';   // re-enabled 2026-08-11 with revised rule
 const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '5', 10);   // 5+ wallets, each with a >=$500 buy
+// BUY DETECTION MODE (2026-08-11): 'POLL' = HTTP getSignaturesForAddress every
+// BUY_POLL_SECS (works on any free RPC — no WebSocket subscriptions, which every
+// free tier gates). 'WS' = the old logsSubscribe WebSocket. Default POLL because
+// free WSS endpoints (public/dRPC/Chainstack) all refuse 94-wallet logsSubscribe.
+const BUY_MODE      = (process.env.BUY_MODE || 'POLL').toUpperCase();
+const BUY_POLL_SECS = parseInt(process.env.BUY_POLL_SECS || '60', 10);
 const CLUSTER_MIN_AGE     = parseInt(process.env.CLUSTER_MIN_AGE || '60', 10);      // >= 60 seconds old
 const CLUSTER_MAX_AGE     = parseInt(process.env.CLUSTER_MAX_AGE || '3600', 10);   // <= 60 minutes old (revised 2026-08-11)
 
@@ -534,6 +540,19 @@ async function getTransaction(signature) {
     if (r?.result) return r.result;
   }
   return null;
+}
+
+// Recent signatures for a wallet (newest first). `untilSig` stops the walk once
+// we reach a signature we've already processed, so we only ever fetch NEW activity.
+async function getSignaturesForAddress(wallet, untilSig) {
+  const params = untilSig
+    ? [wallet, { limit: 25, until: untilSig, commitment: 'confirmed' }]
+    : [wallet, { limit: 5, commitment: 'confirmed' }];   // first pass: just seed the cursor
+  for (const rpc of HTTP_RPCS) {
+    const r = await httpsPost(rpc, { jsonrpc: '2.0', id: 1, method: 'getSignaturesForAddress', params });
+    if (Array.isArray(r?.result)) return r.result;   // [] is a valid answer (no new txs)
+  }
+  return null;   // all RPCs failed
 }
 
 // ── GMGN ──────────────────────────────────────────────────────
@@ -1270,11 +1289,16 @@ async function processLogNotification(params) {
   const value = params?.result?.value;
   const subId = params?.subscription;
   if (!value || (value.err !== null && value.err !== undefined)) return;
-
-  const signature     = value.signature;
   const trackedWallet = subIdToWallet[subId];
   if (!trackedWallet) return;
+  await processBuySignature(value.signature, trackedWallet);
+}
 
+// Shared buy-processing path used by BOTH the WebSocket handler and the HTTP
+// poller. Given a signature + which tracked wallet it belongs to, fetch the tx,
+// find the bought mint, and run the signal checks. Idempotent per (wallet,mint).
+async function processBuySignature(signature, trackedWallet) {
+  if (!signature || !trackedWallet) return;
   if (!isActiveHours()) return;
 
   if (pendingSigs.has(signature)) return;
@@ -1460,11 +1484,11 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17u ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17v ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
-log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster(5w/$500/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'}, whale-holder(>5k/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'}`);
+log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster(5w/$500/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'}, whale-holder(>5k/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'} | buy-detection=${BUY_MODE}`);
 
 https.get('https://api.ipify.org?format=json', (res) => {
   let d = ''; res.on('data', c => d += c);
@@ -1477,8 +1501,55 @@ refreshTrending().then(() => {
 });
 setInterval(refreshTrending, TREND_POLL_SECS * 1000);
 
-// Connect WebSocket
-connect();
+// ── HTTP BUY POLLER ───────────────────────────────────────────
+// Watches all wallets via getSignaturesForAddress over HTTP — the free-tier-safe
+// alternative to logsSubscribe (which every free WSS endpoint gates). Each cycle,
+// for each wallet, fetch signatures newer than the last one we saw and process
+// them. Paced so 94 wallets spread across the cycle instead of bursting.
+let lastSeenSig = {};   // wallet -> most recent signature already processed
+let pollerRunning = false;
+
+async function pollWalletsForBuys() {
+  if (pollerRunning) return;   // don't overlap cycles if one runs long
+  pollerRunning = true;
+  try {
+    if (!isActiveHours()) return;
+    const perWalletGapMs = Math.max(50, Math.floor((BUY_POLL_SECS * 1000) / Math.max(1, WALLETS.length)) - 20);
+    let newBuys = 0, rpcFails = 0;
+    for (const wallet of WALLETS) {
+      const prev = lastSeenSig[wallet];
+      const sigs = await getSignaturesForAddress(wallet, prev);
+      if (sigs === null) { rpcFails++; await sleep(perWalletGapMs); continue; }
+      if (sigs.length > 0) {
+        // Newest is first. Update cursor to the newest signature immediately.
+        lastSeenSig[wallet] = sigs[0].signature;
+        if (prev) {
+          // Process oldest->newest so ordering matches real buy order. Skip errored txs.
+          const fresh = sigs.filter(x => !x.err).reverse();
+          for (const x of fresh) { await processBuySignature(x.signature, wallet); newBuys++; }
+        }
+        // If prev was undefined this was just the seeding pass — cursor set, no processing.
+      }
+      await sleep(perWalletGapMs);
+    }
+    if (rpcFails > 0) log(`[POLL] cycle done — ${newBuys} new buys, ${rpcFails}/${WALLETS.length} wallets had RPC failures`);
+  } catch (e) {
+    log(`[POLL] error: ${e.message}`);
+  } finally {
+    pollerRunning = false;
+  }
+}
+
+// Start buy detection in the configured mode.
+if (BUY_MODE === 'POLL') {
+  log(`[START] Buy detection: HTTP POLL every ${BUY_POLL_SECS}s across ${WALLETS.length} wallets (free-tier safe, no WebSocket)`);
+  // First cycle seeds cursors silently (no alerts for pre-existing history), then polls.
+  pollWalletsForBuys().then(() => log(`[POLL] cursors seeded — now watching for new buys`));
+  setInterval(pollWalletsForBuys, BUY_POLL_SECS * 1000);
+} else {
+  log(`[START] Buy detection: WebSocket (logsSubscribe)`);
+  connect();
+}
 
 // Self-ping (Render only — harmless on a VPS where RENDER_EXTERNAL_URL is unset)
 if (RENDER_URL) {
