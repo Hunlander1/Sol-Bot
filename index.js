@@ -1,7 +1,24 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-07-17w  (fix: bluechip carry-forward only fills a 0, no longer locks in a stale HIGH) <<<
+//  >>> VERSION: 2026-08-12a  (fix: GMGN rank order_by 'volume' -> 'default'; capture hot_level) <<<
+//  ----------------------------------------------------------
+//  2026-08-12a CHANGE: the trending poller queried /v1/market/rank with
+//  order_by:'volume', so the `rank` it stored per interval was really "position
+//  when sorted by volume" — NOT position on GMGN's actual Trending tab. GMGN's
+//  own docs confirm `rank` is just the array index within whatever order_by you
+//  asked for, and that order_by accepts default/swaps/marketcap/volume/... as
+//  distinct sorts, with `hot_level` ("Trending intensity level, higher = hotter")
+//  as a SEPARATE response field. Net effect: "#1 Trending Everywhere" actually
+//  meant "#1 by volume on all five intervals", which a steady high-volume token
+//  can satisfy without ever trending. (Found via the EVM bot's false GMEB fire
+//  on BSC; identical bug lived here since the original July version.)
+//  Now uses order_by:'default' — GMGN's own baseline sort, the closest documented
+//  proxy for the Trending tab — and captures hot_level per token, surfaced in the
+//  #1-Everywhere alert so a fire can be sanity-checked against the live site.
+//  This poller feeds BOTH the bluechip trending signal and #1-everywhere, so both
+//  now rank by GMGN's trending order rather than raw volume.
+//  >>> PREVIOUS: 2026-07-17w (fix: bluechip carry-forward only fills a 0, no longer locks in a stale HIGH) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
 //
@@ -651,10 +668,13 @@ function extractRank(data) {
 // rebuild due to a transient GMGN rate-limit/timeout — part of the FABLE fix.
 async function fetchTrendingInterval(interval) {
   for (let attempt = 0; attempt < 2; attempt++) {
+    // order_by was 'volume' until 2026-08-12a. That made the `rank` position we
+    // store below mean "rank BY VOLUME", not "rank on GMGN's Trending tab" — see
+    // the header note. 'default' is GMGN's own baseline trending sort.
     const data = await gmgnGet('/v1/market/rank', {
       chain: 'sol',
       interval,
-      order_by: 'volume',
+      order_by: 'default',
       direction: 'desc',
       limit: String(TREND_TOP_N),
     });
@@ -680,12 +700,14 @@ async function refreshTrending() {
         const rankPos = ri + 1;   // 1-based rank within this interval
         const bluechip = parseFloat(t.bluechip_owner_percentage ?? 0) || 0;
         const created  = parseInt(t.creation_timestamp ?? 0, 10) || 0;
+        const hotLevel = parseFloat(t.hot_level ?? 0) || 0;   // GMGN's own trending-intensity metric (2026-08-12a)
         const existing = next.get(addr);
         if (existing) {
           existing.intervals.add(interval);
           existing.ranks[interval] = rankPos;   // per-interval rank (for #1-everywhere)
           if (rankPos < existing.bestRank) existing.bestRank = rankPos;
           if (bluechip > existing.bluechip) existing.bluechip = bluechip;  // within THIS cycle, take the highest non-zero interval reading (all are "now")
+          if (hotLevel > (existing.hotLevel || 0)) existing.hotLevel = hotLevel;
         } else {
           next.set(addr, {
             symbol:   t.symbol ?? 'UNKNOWN',
@@ -700,6 +722,7 @@ async function refreshTrending() {
             smart:    parseInt(t.smart_degen_count ?? 0, 10) || 0,
             kol:      parseInt(t.renowned_count ?? 0, 10) || 0,
             liquidity: parseFloat(t.liquidity ?? 0) || 0,
+            hotLevel,                                        // GMGN trending intensity (2026-08-12a)
             intervals: new Set([interval]),
           });
         }
@@ -855,26 +878,29 @@ async function checkTop1Everywhere(map, silent) {
       const mcStr  = v.mc > 0 ? fmtUsd(v.mc) : 'N/A';
       const athStr = v.ath > 0 ? fmtUsd(v.ath) : 'N/A';
       const volStr = v.volume > 0 ? fmtUsd(v.volume) : 'N/A';
+      const hotStr = v.hotLevel > 0 ? v.hotLevel.toLocaleString() : 'N/A';
       const signalTime = new Date().toLocaleTimeString('en-US', {
         timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
       });
 
       sendTelegram(TOP1_SIGNAL_CHAT,
         `\ud83d\udc51 <b>#1 Trending Everywhere — ${v.symbol}</b>\n\n` +
-        `Rank #1 on ALL timeframes: ${TREND_INTERVALS.join(', ')}\n\n` +
+        `Rank #1 on ALL timeframes: ${TREND_INTERVALS.join(', ')}\n` +
+        `(ranked by GMGN's default trending order, not raw volume)\n\n` +
         `Chain: Solana\n` +
         `Contract: <code>${addr}</code>\n` +
         `Token Age: ${fmtAge(age)}\n` +
         `Market Cap: ${mcStr}\n` +
         `ATH MC: ${athStr}\n` +
         `Volume: ${volStr}\n` +
+        `Hot Level: ${hotStr}\n` +
         `Bluechip: ${(v.bluechip*100).toFixed(1)}%\n` +
         `Holders: ${v.holders || 'N/A'}\n` +
         `Smart / KOL: ${v.smart} / ${v.kol}\n\n` +
         `Signal Time: ${signalTime}\n\n` +
         `\ud83d\udd17 <a href="https://gmgn.ai/sol/token/${addr}">View on GMGN</a>`
       );
-      log(`[TOP1] \ud83d\udc51 FIRED ${v.symbol} ${addr.substring(0,8)} — #1 on all ${TREND_INTERVALS.length} intervals`);
+      log(`[TOP1] \ud83d\udc51 FIRED ${v.symbol} ${addr.substring(0,8)} — #1 on all ${TREND_INTERVALS.length} intervals (hot_level=${v.hotLevel || 'N/A'})`);
     }
   } catch (e) {
     log(`[ERR] checkTop1Everywhere: ${e.message}`);
@@ -1490,7 +1516,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-07-17w ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12a ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
