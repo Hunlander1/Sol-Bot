@@ -158,6 +158,17 @@ const TREND_FILTERS = (process.env.TREND_FILTERS ?? 'renounced,frozen')
 // Sent as the rank endpoint's `max_created` (duration string with m/h/d suffix;
 // a bare number is rejected). Empty string disables the age filter.
 const TREND_MAX_CREATED = (process.env.TREND_MAX_CREATED ?? '2880m').trim();
+// SMART MONEY / KOL floor on the POOL (added 2026-08-12 at N's request).
+// Sent as the rank endpoint's server-side min_smart_degen_count /
+// min_renowned_count, so GMGN drops thin tokens BEFORE the top-N cut and the
+// bot's 10 slots go to tokens with real smart-money and KOL participation.
+// Applies to the whole trendingMap, so BOTH the bluechip signal and
+// #1-everywhere inherit it — no per-signal code needed.
+// NOTE: this deliberately makes the bot's pool STRICTER than gmgn.ai's Trending
+// tab, which has no such filter, so the two lists will no longer match
+// one-for-one. Intended. Set either to 0 to disable that bound.
+const TREND_MIN_SMART = parseInt(process.env.TREND_MIN_SMART || '2', 10);   // >= 2 smart-money holders
+const TREND_MIN_KOL   = parseInt(process.env.TREND_MIN_KOL   || '2', 10);   // >= 2 KOL / renowned holders
 
 // ══════════════════════════════════════════════════════════════
 //  8-WALLET CLUSTER SIGNAL CONFIG
@@ -195,6 +206,16 @@ const CLUSTER_MIN_BIG_BUY_USD = parseFloat(process.env.CLUSTER_MIN_BIG_BUY_USD |
 const WHALE_MIN_HOLDERS   = parseInt(process.env.WHALE_MIN_HOLDERS || '5000', 10);
 const WHALE_MAX_AGE       = parseInt(process.env.WHALE_MAX_AGE || '3600', 10);   // < 60 min old
 const WHALE_SIGNAL_CHAT   = process.env.WHALE_SIGNAL_CHAT || CLUSTER_SIGNAL_CHAT; // cluster chat
+// WHALE HOLDER extra gates (added 2026-08-12 at N's request): on top of
+// >5000 holders + <60min + #1 trending, the token must ALSO have >=2 smart-money
+// holders, >=2 KOL holders, and at least ONE buy >= $500 from a TRACKED wallet.
+// NOTE this makes the signal no longer purely poll-driven — it now also needs a
+// tracked-wallet buy, so it depends on buy detection (BUY_MODE) being healthy.
+const WHALE_MIN_SMART       = parseInt(process.env.WHALE_MIN_SMART || '2', 10);
+const WHALE_MIN_KOL         = parseInt(process.env.WHALE_MIN_KOL   || '2', 10);
+const WHALE_MIN_BIG_BUY_USD = parseFloat(process.env.WHALE_MIN_BIG_BUY_USD || '500');
+// Window for that tracked buy. Matches WHALE_MAX_AGE (60 min).
+const WHALE_BUY_WINDOW_MS   = parseInt(process.env.WHALE_BUY_WINDOW_MS || '3600000', 10);
 
 // Bluechip trending signal now needs this many DISTINCT tracked wallets (was 1).
 const TREND_MIN_WALLETS   = parseInt(process.env.TREND_MIN_WALLETS || '2', 10);
@@ -431,6 +452,13 @@ let seenPairs       = new Set();  // "wallet:mint" — only the first buy per wa
 // A value of null means "size unknown" (price lookup or extraction failed) —
 // treated as QUALIFYING (fail-open), see clusterHasBigBuySol().
 let clusterBuyers   = {};
+// trackedBuysWhale: mint -> Map(walletAddr -> { ts, sol })
+// SEPARATE from clusterBuyers on purpose. clusterBuyers has no per-entry
+// timestamp (so it can't be windowed), is only written when ENABLE_CLUSTER is on,
+// and is cleared wholesale by the size-based cleanup — any of which would make
+// the whale-holder signal miss buys for reasons that have nothing to do with it.
+// This store is written on EVERY tracked buy and pruned at WHALE_BUY_WINDOW_MS.
+let trackedBuysWhale = {};
 let clusterFired    = loadSet('/tmp/sol_cluster_fired.json');  // tokens that already fired the cluster signal
 let whaleFired      = loadSet('/tmp/sol_whale_fired.json');    // tokens that already fired the whale-holder signal
 let walletEventTimes = {};        // wallet -> recent event timestamps (ms), flood throttle
@@ -718,6 +746,8 @@ async function fetchTrendingInterval(interval) {
       limit: String(TREND_TOP_N),
       ...(TREND_FILTERS.length ? { filters: TREND_FILTERS } : {}),
       ...(TREND_MAX_CREATED ? { max_created: TREND_MAX_CREATED } : {}),
+      ...(TREND_MIN_SMART > 0 ? { min_smart_degen_count: String(TREND_MIN_SMART) } : {}),
+      ...(TREND_MIN_KOL   > 0 ? { min_renowned_count:    String(TREND_MIN_KOL)   } : {}),
     });
     const rank = extractRank(data);
     if (rank.length) return rank.slice(0, TREND_TOP_N);
@@ -807,7 +837,7 @@ async function refreshTrending() {
         // First full pass after boot primes SILENTLY (records current #1s without
         // alerting). Every pass after fires normally.
         await checkTop1Everywhere(next, !top1Primed);
-        checkWhaleHolders(next);
+        await checkWhaleHolders(next);   // async since 12h (prices a tracked buy)
         top1Primed = true;
       }
       // Log how many of the trending tokens would actually qualify, so it's
@@ -840,7 +870,28 @@ async function refreshTrending() {
 // WHALE HOLDER: scan the current trending map for tokens with > WHALE_MIN_HOLDERS
 // holders, age < WHALE_MAX_AGE, and #1 in at least one interval. Poll-driven; fires
 // once per token to the cluster chat. No wallet/WebSocket dependency.
-function checkWhaleHolders(map) {
+// Does any TRACKED wallet have a buy >= minUsd on this mint inside the window?
+// Reads trackedBuysWhale (see its declaration for why it is separate).
+// Returns { ok, detail }. FAIL-OPEN when size is unknown (unparseable tx) or the
+// SOL price lookup fails — a dead price feed must never silently mute the signal.
+async function whaleTrackedBigBuy(mint, minUsd) {
+  const bucket = trackedBuysWhale[mint];
+  if (!bucket || bucket.size === 0) return { ok: false, detail: 'no tracked buys' };
+  const cutoff = Date.now() - WHALE_BUY_WINDOW_MS;
+  const live = [...bucket.entries()].filter(([, r]) => r.ts >= cutoff);
+  if (!live.length) return { ok: false, detail: 'no tracked buys in window' };
+  const price = await getSolPriceUsd();
+  let best = 0, unknown = false;
+  for (const [, r] of live) {
+    if (r.sol === null || r.sol === undefined || !(price > 0)) { unknown = true; continue; }
+    const usd = r.sol * price;
+    if (usd > best) best = usd;
+  }
+  if (best >= minUsd) return { ok: true, detail: fmtUsd(best) };
+  if (unknown) return { ok: true, detail: 'size unknown (fail-open)' };
+  return { ok: false, detail: `largest tracked buy ${fmtUsd(best)} < ${fmtUsd(minUsd)}` };
+}
+async function checkWhaleHolders(map) {
   if (!ENABLE_CLUSTER) return;   // gated with the cluster (same "add-back" package)
   const now = Math.floor(Date.now() / 1000);
   for (const [addr, v] of map.entries()) {
@@ -849,6 +900,25 @@ function checkWhaleHolders(map) {
     if ((v.bestRank || 999) !== 1) continue;                    // #1 in >=1 interval
     if (!(v.created > 0)) continue;                             // need age; fail-closed
     if ((now - v.created) >= WHALE_MAX_AGE) continue;           // must be < 60 min old
+    // Smart-money / KOL floors. The 12g pool filter already asks GMGN for
+    // min_smart_degen_count / min_renowned_count, so these are usually already
+    // met — kept explicit so this signal holds its own floor even if
+    // TREND_MIN_SMART / TREND_MIN_KOL are lowered.
+    if ((v.smart || 0) < WHALE_MIN_SMART) {
+      log(`[WHALE] SKIP ${v.symbol || addr.substring(0,8)} — smart ${v.smart || 0} < ${WHALE_MIN_SMART}`);
+      continue;
+    }
+    if ((v.kol || 0) < WHALE_MIN_KOL) {
+      log(`[WHALE] SKIP ${v.symbol || addr.substring(0,8)} — KOL ${v.kol || 0} < ${WHALE_MIN_KOL}`);
+      continue;
+    }
+    // At least one >= $500 buy from a TRACKED wallet in the window. Checked LAST
+    // because it is the only gate that can cost a network call.
+    const big = await whaleTrackedBigBuy(addr, WHALE_MIN_BIG_BUY_USD);
+    if (!big.ok) {
+      log(`[WHALE] SKIP ${v.symbol || addr.substring(0,8)} — ${big.detail}`);
+      continue;
+    }
 
     whaleFired.add(addr);
     saveSet('/tmp/sol_whale_fired.json', whaleFired);
@@ -858,6 +928,8 @@ function checkWhaleHolders(map) {
       `<b>Holders:</b> ${v.holders.toLocaleString()}\n` +
       `<b>Age:</b> ${ageMin}m\n` +
       `<b>Trending Rank:</b> #${v.bestRank} (best across intervals)\n` +
+      `<b>Smart / KOL:</b> ${v.smart || 0} / ${v.kol || 0}\n` +
+      `<b>Tracked Buy:</b> ${big.detail}\n` +
       `<b>Market Cap:</b> ${fmtUsd(v.mc || 0)}\n` +
       `<b>Contract:</b> <code>${addr}</code>\n\n` +
       `🔗 <a href="https://gmgn.ai/sol/token/${addr}">View on GMGN</a>`;
@@ -1415,6 +1487,14 @@ async function processBuySignature(signature, trackedWallet) {
   // ── SIGNAL 1: Bluechip trending buy ──
   await sendTrendSignal(trackedWallet, mint, tx);
 
+  // Record EVERY tracked buy for the whale-holder signal — unconditionally, and
+  // BEFORE the ENABLE_CLUSTER gate below, so the whale signal never depends on
+  // the cluster being enabled. extractSolSpent is free (no network).
+  try {
+    if (!trackedBuysWhale[mint]) trackedBuysWhale[mint] = new Map();
+    trackedBuysWhale[mint].set(trackedWallet, { ts: Date.now(), sol: extractSolSpent(tx, trackedWallet) });
+  } catch (e) { /* never let bookkeeping break the buy path */ }
+
   // ── SIGNAL 2: 8-wallet cluster ──
   if (ENABLE_CLUSTER) await checkClusterSignal(trackedWallet, mint, tx);
 }
@@ -1501,6 +1581,16 @@ setInterval(() => {
   if (clusterFired.size > 20000) { clusterFired.clear(); saveSet('/tmp/sol_cluster_fired.json', clusterFired); log(`[CLEANUP] clusterFired cleared`); }
   if (whaleFired.size > 20000) { whaleFired.clear(); saveSet('/tmp/sol_whale_fired.json', whaleFired); log(`[CLEANUP] whaleFired cleared`); }
   if (Object.keys(clusterBuyers).length > 20000) { clusterBuyers = {}; log(`[CLEANUP] clusterBuyers cleared`); }
+  // Prune trackedBuysWhale by its own time window (not by size) so entries expire
+  // predictably and the whale gate never reads a stale buy.
+  {
+    const wCut = Date.now() - WHALE_BUY_WINDOW_MS;
+    for (const m of Object.keys(trackedBuysWhale)) {
+      const b = trackedBuysWhale[m];
+      for (const [w, rec] of b) { if (!rec || rec.ts < wCut) b.delete(w); }
+      if (b.size === 0) delete trackedBuysWhale[m];
+    }
+  }
   if (Object.keys(trendBuyers).length > 20000) { trendBuyers = {}; log(`[CLEANUP] trendBuyers cleared`); }
   if (Object.keys(vol5mCache).length > 5000) { vol5mCache = {}; }
   const cutMs = Date.now() - 10000;
@@ -1557,11 +1647,15 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12f ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12h ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
 log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster(5w/$500/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'}, whale-holder(>5k/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'} | buy-detection=${BUY_MODE}`);
+// Print the exact trending-pool query config at boot. Everything below is sent to
+// /v1/market/rank, so this line IS what the bot is asking GMGN for — no need to
+// read the source or guess which build is live.
+log(`[START] Trending pool: order_by=volume desc | top${TREND_TOP_N} per interval | filters=[${TREND_FILTERS.join(', ') || 'none'}] | max_created=${TREND_MAX_CREATED || 'none'} | min_smart=${TREND_MIN_SMART} | min_kol=${TREND_MIN_KOL}`);
 
 https.get('https://api.ipify.org?format=json', (res) => {
   let d = ''; res.on('data', c => d += c);
