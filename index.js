@@ -139,6 +139,25 @@ const MC_MIN_USD          = parseFloat(process.env.MC_MIN_USD || '30000');      
 const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '60', 10);        // refresh every 60s — the 429 circuit breaker (17q) handles bans now, and rank is weight-1 (~20 req/sec headroom), so the 300s panic setting is unnecessary and was causing missed #1-everywhere signals between polls
 // All five intervals — a token counts as trending if it's top-10 in ANY of them.
 const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
+// Filter tags sent with every /v1/market/rank call, set 2026-08-12 to N's ACTUAL
+// SOL Trending tab settings: NoMint + No Blacklist.
+// UI label -> API tag mapping (counterintuitive, do not "correct" these):
+//   "NoMint"       -> renounced  (mint authority revoked, renounced_mint == 1)
+//   "No Blacklist" -> frozen     (freeze authority revoked,
+//                                 renounced_freeze_account == 1). The tag is
+//                                 named for the AUTHORITY, not the state — it
+//                                 does NOT mean "this token is frozen".
+// Comma-separated, env-tunable. Set TREND_FILTERS= (empty) to send no filters.
+const TREND_FILTERS = (process.env.TREND_FILTERS ?? 'renounced,frozen')
+  .split(',').map(s => s.trim()).filter(Boolean);
+// MAX TOKEN AGE ON THE POOL — N's SOL tab has a 2880-minute (48h) age filter, so
+// the site ranks the top N *among tokens younger than 48h*. The bot previously
+// ranked the top N of ALL ages and only checked age later, per token, in
+// checkTop1Everywhere — so older high-volume tokens could occupy pool slots and
+// crowd out genuinely new trending ones before any bot-side gate ran.
+// Sent as the rank endpoint's `max_created` (duration string with m/h/d suffix;
+// a bare number is rejected). Empty string disables the age filter.
+const TREND_MAX_CREATED = (process.env.TREND_MAX_CREATED ?? '2880m').trim();
 
 // ══════════════════════════════════════════════════════════════
 //  8-WALLET CLUSTER SIGNAL CONFIG
@@ -590,7 +609,18 @@ async function gmgnGet(path, params = {}, skipAuth = false) {
     params.timestamp = Math.floor(Date.now() / 1000).toString();
     params.client_id = Math.random().toString(36).substring(2) + Date.now().toString(36);
   }
-  const query = new URLSearchParams(params).toString();
+  // Build the query manually so ARRAY values become REPEATED params
+  // (filters=a&filters=b&filters=c), which is how gmgn-cli encodes them —
+  // verified 2026-08-12 in its buildUrl(). `new URLSearchParams(obj)` would
+  // comma-join an array into "a,b,c", which GMGN silently ignores: the request
+  // still succeeds and returns an UNFILTERED list, so a broken filter is
+  // indistinguishable from a working one. Hence the hand-rolled loop.
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (Array.isArray(v)) { for (const item of v) qs.append(k, String(item)); }
+    else if (v !== undefined && v !== null) qs.set(k, String(v));
+  }
+  const query = qs.toString();
   const headers = {
     'X-APIKEY': GMGN_API_KEY,
     'Accept': 'application/json',
@@ -674,16 +704,20 @@ function extractRank(data) {
 // rebuild due to a transient GMGN rate-limit/timeout — part of the FABLE fix.
 async function fetchTrendingInterval(interval) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    // NO order_by / direction — send ONLY chain + interval + limit and let GMGN
-    // decide the order. This is exactly what `gmgn-cli market trending` puts on
-    // the wire (verified 2026-08-12 by reading the CLI source: it adds order_by
-    // ONLY when --order-by is passed). No sort param => the service returns its
-    // OWN trending ranking. Forcing order_by=volume overrode that with a plain
-    // volume leaderboard. DO NOT re-add order_by "to be explicit".
+    // MATCHES gmgn.ai's Trending tab: volume sort + the chain's filter tags.
+    // Established 2026-08-12 from screenshots of the live tab — each interval's
+    // column header reads "<interval> Vol ↓" with rows descending by that
+    // interval's volume, so order_by=volume + direction=desc is correct. (12c
+    // dropped the sort entirely, which moved AWAY from the site.) TREND_FILTERS
+    // supplies the chain defaults the raw endpoint does NOT apply on its own.
     const data = await gmgnGet('/v1/market/rank', {
       chain: 'sol',
       interval,
+      order_by: 'volume',
+      direction: 'desc',
       limit: String(TREND_TOP_N),
+      ...(TREND_FILTERS.length ? { filters: TREND_FILTERS } : {}),
+      ...(TREND_MAX_CREATED ? { max_created: TREND_MAX_CREATED } : {}),
     });
     const rank = extractRank(data);
     if (rank.length) return rank.slice(0, TREND_TOP_N);
@@ -1523,7 +1557,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12c ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12f ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
