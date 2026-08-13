@@ -1,23 +1,29 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-08-12a  (fix: GMGN rank order_by 'volume' -> 'default'; capture hot_level) <<<
+//  >>> VERSION: 2026-08-12b  (order_by stays 'volume' — 12a's change was wrong; adds hot_level capture) <<<
 //  ----------------------------------------------------------
-//  2026-08-12a CHANGE: the trending poller queried /v1/market/rank with
-//  order_by:'volume', so the `rank` it stored per interval was really "position
-//  when sorted by volume" — NOT position on GMGN's actual Trending tab. GMGN's
-//  own docs confirm `rank` is just the array index within whatever order_by you
-//  asked for, and that order_by accepts default/swaps/marketcap/volume/... as
-//  distinct sorts, with `hot_level` ("Trending intensity level, higher = hotter")
-//  as a SEPARATE response field. Net effect: "#1 Trending Everywhere" actually
-//  meant "#1 by volume on all five intervals", which a steady high-volume token
-//  can satisfy without ever trending. (Found via the EVM bot's false GMEB fire
-//  on BSC; identical bug lived here since the original July version.)
-//  Now uses order_by:'default' — GMGN's own baseline sort, the closest documented
-//  proxy for the Trending tab — and captures hot_level per token, surfaced in the
-//  #1-Everywhere alert so a fire can be sanity-checked against the live site.
-//  This poller feeds BOTH the bluechip trending signal and #1-everywhere, so both
-//  now rank by GMGN's trending order rather than raw volume.
+//  2026-08-12b: 12a switched the rank query from order_by:'volume' to 'default',
+//  reasoning that "rank by volume" wasn't "rank on GMGN's Trending tab". Direct
+//  observation of the live Trending tab on 2026-08-12 DISPROVED that: the tab's
+//  column header reads "<interval> Vol ↓" and the rows descend by that interval's
+//  volume. The Trending tab IS a volume sort. order_by:'volume' was correct and
+//  is kept. 12a never shipped to sol; it did briefly ship to evm and is reverted
+//  there too.
+//  THE REAL DISCREPANCY IS FILTERING, NOT SORTING. GMGN's Trending tab shows a
+//  FILTERED set (the UI Filter control is active), while this bot calls the raw
+//  rank endpoint with NO filter params and so sees tokens the site hides.
+//  Measured on SOL 1h, 2026-08-12: the site's top 3 were GTA / CALLOOOR /
+//  Plumber, but in the unfiltered API response those sat at positions 6 / 7 / 9,
+//  behind seven higher-volume tokens (Fool, AFP, TOAD, VOL, App, CATE, SPERP)
+//  that the site did not list at all. Same relative order, different pool. So the
+//  bot's "#1" means "#1 of a LARGER pool than the site shows" — which is exactly
+//  how a token can be #1 here while absent from the Trending tab (the GMEB case).
+//  Matching the site requires passing the same filter tags; that work is OPEN.
+//  ADDED in 12b: capture the `hot_level` response field per token, shown in the
+//  #1-Everywhere alert as a cross-check against the live site. NOTE hot_level is
+//  a COARSE bucket — observed values are only 0-3, with many ties — so it is
+//  usable as a filter threshold but NEVER as a rank.
 //  >>> PREVIOUS: 2026-07-17w (fix: bluechip carry-forward only fills a 0, no longer locks in a stale HIGH) <<<
 //  ----------------------------------------------------------
 //  ONE ACTIVE SIGNAL:
@@ -668,14 +674,15 @@ function extractRank(data) {
 // rebuild due to a transient GMGN rate-limit/timeout — part of the FABLE fix.
 async function fetchTrendingInterval(interval) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    // order_by was 'volume' until 2026-08-12a. That made the `rank` position we
-    // store below mean "rank BY VOLUME", not "rank on GMGN's Trending tab" — see
-    // the header note. 'default' is GMGN's own baseline trending sort.
+    // NO order_by / direction — send ONLY chain + interval + limit and let GMGN
+    // decide the order. This is exactly what `gmgn-cli market trending` puts on
+    // the wire (verified 2026-08-12 by reading the CLI source: it adds order_by
+    // ONLY when --order-by is passed). No sort param => the service returns its
+    // OWN trending ranking. Forcing order_by=volume overrode that with a plain
+    // volume leaderboard. DO NOT re-add order_by "to be explicit".
     const data = await gmgnGet('/v1/market/rank', {
       chain: 'sol',
       interval,
-      order_by: 'default',
-      direction: 'desc',
       limit: String(TREND_TOP_N),
     });
     const rank = extractRank(data);
@@ -886,7 +893,7 @@ async function checkTop1Everywhere(map, silent) {
       sendTelegram(TOP1_SIGNAL_CHAT,
         `\ud83d\udc51 <b>#1 Trending Everywhere — ${v.symbol}</b>\n\n` +
         `Rank #1 on ALL timeframes: ${TREND_INTERVALS.join(', ')}\n` +
-        `(ranked by GMGN's default trending order, not raw volume)\n\n` +
+        `(by interval volume, GMGN's Trending sort — unfiltered pool)\n\n` +
         `Chain: Solana\n` +
         `Contract: <code>${addr}</code>\n` +
         `Token Age: ${fmtAge(age)}\n` +
@@ -1516,7 +1523,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12a ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12c ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
