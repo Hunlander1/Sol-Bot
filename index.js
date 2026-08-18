@@ -139,6 +139,24 @@ const MC_MIN_USD          = parseFloat(process.env.MC_MIN_USD || '30000');      
 const TREND_POLL_SECS     = parseInt(process.env.TREND_POLL_SECS || '60', 10);        // refresh every 60s — the 429 circuit breaker (17q) handles bans now, and rank is weight-1 (~20 req/sec headroom), so the 300s panic setting is unnecessary and was causing missed #1-everywhere signals between polls
 // All five intervals — a token counts as trending if it's top-10 in ANY of them.
 const TREND_INTERVALS     = ['1m', '5m', '1h', '6h', '24h'];
+// Intervals the #1-EVERYWHERE signal must ALL be rank 1 on. Narrowed 2026-08-12
+// from all five to the three SHORT windows at N's request — 6h/24h rarely agree
+// with the fast ones, so requiring all five almost never fired.
+// DELIBERATELY SEPARATE from TREND_INTERVALS: the poller still FETCHES all five
+// (the bluechip signal's bestRank and "Trending in: ..." depend on 6h/24h); this
+// only narrows what the #1 signal is judged on. Env: TOP1_INTERVALS=1m,5m,1h
+const TOP1_INTERVALS = (process.env.TOP1_INTERVALS || '1m,5m,1h')
+  .split(',').map(x => x.trim()).filter(Boolean);
+// #1-EVERYWHERE also now requires >= 1 buy of this size from a TRACKED wallet.
+const TOP1_MIN_BIG_BUY_USD = parseFloat(process.env.TOP1_MIN_BIG_BUY_USD || '500');
+// Max token age for the #1 signal. Was hardcoded inline as 48*3600; named here
+// so the buy window below can be DERIVED from it and the two cannot drift.
+const TOP1_MAX_AGE_SECS = parseInt(process.env.TOP1_MAX_AGE || '172800', 10);   // 48h
+// The qualifying tracked buy may have happened ANY TIME FROM MINT up to the
+// moment the intervals line up — so the window is simply the token's maximum
+// eligible age, not an independent number. (12i used an arbitrary 6h here;
+// that was wrong and would have rejected a buy made early in a token's run.)
+const TOP1_BUY_WINDOW_MS = parseInt(process.env.TOP1_BUY_WINDOW_MS || String(TOP1_MAX_AGE_SECS * 1000), 10);
 // Filter tags sent with every /v1/market/rank call, set 2026-08-12 to N's ACTUAL
 // SOL Trending tab settings: NoMint + No Blacklist.
 // UI label -> API tag mapping (counterintuitive, do not "correct" these):
@@ -216,6 +234,11 @@ const WHALE_MIN_KOL         = parseInt(process.env.WHALE_MIN_KOL   || '2', 10);
 const WHALE_MIN_BIG_BUY_USD = parseFloat(process.env.WHALE_MIN_BIG_BUY_USD || '500');
 // Window for that tracked buy. Matches WHALE_MAX_AGE (60 min).
 const WHALE_BUY_WINDOW_MS   = parseInt(process.env.WHALE_BUY_WINDOW_MS || '3600000', 10);
+// trackedBuysWhale is shared by the whale (60m) and #1 (6h) gates, so it must be
+// pruned at the LONGER of the two — pruning at the shorter one would silently
+// starve the longer-window consumer. Declared here, AFTER both deps exist.
+const TRACKED_BUY_RETENTION_MS = Math.max(WHALE_BUY_WINDOW_MS, TOP1_BUY_WINDOW_MS);
+const TRACKED_BUY_MAX_TOKENS = parseInt(process.env.TRACKED_BUY_MAX_TOKENS || '20000', 10);
 
 // Bluechip trending signal now needs this many DISTINCT tracked wallets (was 1).
 const TREND_MIN_WALLETS   = parseInt(process.env.TREND_MIN_WALLETS || '2', 10);
@@ -759,11 +782,11 @@ async function fetchTrendingInterval(interval) {
 async function refreshTrending() {
   try {
     const next = new Map();
-    let okIntervals = 0;
+    const okSet = new Set();   // WHICH intervals reported this cycle (was a bare count)
 
     for (const interval of TREND_INTERVALS) {
       const rows = await fetchTrendingInterval(interval);
-      if (rows.length) okIntervals++;
+      if (rows.length) okSet.add(interval);
       for (let ri = 0; ri < rows.length; ri++) {
         const t = rows[ri];
         const addr = t.address;
@@ -833,7 +856,10 @@ async function refreshTrending() {
       // this cycle, so a partial refresh can never produce a false #1-everywhere
       // (a missing interval isn't a #1). Reads `ranks` already built above; makes
       // NO new GMGN calls.
-      if (okIntervals === TREND_INTERVALS.length) {
+      // Strict: every interval the #1 signal JUDGES ON must have reported this
+      // cycle. Previously required all five; now exactly the TOP1_INTERVALS set,
+      // since 6h/24h no longer affect the verdict.
+      if (TOP1_INTERVALS.every(iv => okSet.has(iv))) {
         // First full pass after boot primes SILENTLY (records current #1s without
         // alerting). Every pass after fires normally.
         await checkTop1Everywhere(next, !top1Primed);
@@ -874,10 +900,10 @@ async function refreshTrending() {
 // Reads trackedBuysWhale (see its declaration for why it is separate).
 // Returns { ok, detail }. FAIL-OPEN when size is unknown (unparseable tx) or the
 // SOL price lookup fails — a dead price feed must never silently mute the signal.
-async function whaleTrackedBigBuy(mint, minUsd) {
+async function whaleTrackedBigBuy(mint, minUsd, windowMs) {
   const bucket = trackedBuysWhale[mint];
   if (!bucket || bucket.size === 0) return { ok: false, detail: 'no tracked buys' };
-  const cutoff = Date.now() - WHALE_BUY_WINDOW_MS;
+  const cutoff = Date.now() - (windowMs || WHALE_BUY_WINDOW_MS);
   const live = [...bucket.entries()].filter(([, r]) => r.ts >= cutoff);
   if (!live.length) return { ok: false, detail: 'no tracked buys in window' };
   const price = await getSolPriceUsd();
@@ -914,7 +940,7 @@ async function checkWhaleHolders(map) {
     }
     // At least one >= $500 buy from a TRACKED wallet in the window. Checked LAST
     // because it is the only gate that can cost a network call.
-    const big = await whaleTrackedBigBuy(addr, WHALE_MIN_BIG_BUY_USD);
+    const big = await whaleTrackedBigBuy(addr, WHALE_MIN_BIG_BUY_USD, WHALE_BUY_WINDOW_MS);
     if (!big.ok) {
       log(`[WHALE] SKIP ${v.symbol || addr.substring(0,8)} — ${big.detail}`);
       continue;
@@ -944,7 +970,7 @@ async function checkTop1Everywhere(map, silent) {
       if (top1Fired.has(addr)) continue;
       const r = v.ranks || {};
       // Every interval must be present AND equal to 1.
-      const allOne = TREND_INTERVALS.every(iv => r[iv] === 1);
+      const allOne = TOP1_INTERVALS.every(iv => r[iv] === 1);
       if (!allOne) continue;
 
       // FILTER: at least one smart-money or KOL holder (GMGN counts).
@@ -961,7 +987,7 @@ async function checkTop1Everywhere(map, silent) {
         _created = parseInt(_info?.creation_timestamp ?? 0, 10) || 0;
       }
       if (!(_created > 0)) continue;                       // truly unknown -> skip
-      if ((_now - _created) > 48 * 3600) continue;         // too old
+      if ((_now - _created) > TOP1_MAX_AGE_SECS) continue;  // too old
       v.created = _created;                                // cache for the alert
 
       // Silent prime pass: record what's ALREADY #1 at boot in a SEPARATE,
@@ -982,6 +1008,18 @@ async function checkTop1Everywhere(map, silent) {
       // from the primed set and fire normally below.
       top1PrimedSet.delete(addr);
 
+      // At least one >= $500 buy from a TRACKED wallet inside TOP1_BUY_WINDOW_MS.
+      // Placed AFTER the silent-prime block on purpose: at boot trackedBuysWhale
+      // is empty, so gating the prime pass on buy history would leave every
+      // already-#1 token unprimed and let it fire later as if it were new.
+      // Runs BEFORE top1Fired.add so a token blocked here stays eligible and can
+      // still fire on a later cycle once a tracked wallet buys it.
+      const big = await whaleTrackedBigBuy(addr, TOP1_MIN_BIG_BUY_USD, TOP1_BUY_WINDOW_MS);
+      if (!big.ok) {
+        log(`[TOP1] SKIP ${v.symbol || addr.substring(0,8)} — #1 on ${TOP1_INTERVALS.join('/')} but ${big.detail}`);
+        continue;
+      }
+
       // Mark as fired ONLY now that we're actually alerting.
       top1Fired.add(addr);
       saveSet('/tmp/sol_top1_fired.json', top1Fired);
@@ -998,7 +1036,7 @@ async function checkTop1Everywhere(map, silent) {
 
       sendTelegram(TOP1_SIGNAL_CHAT,
         `\ud83d\udc51 <b>#1 Trending Everywhere — ${v.symbol}</b>\n\n` +
-        `Rank #1 on ALL timeframes: ${TREND_INTERVALS.join(', ')}\n` +
+        `Rank #1 on: ${TOP1_INTERVALS.join(', ')}\n` +
         `(by interval volume, GMGN's Trending sort — unfiltered pool)\n\n` +
         `Chain: Solana\n` +
         `Contract: <code>${addr}</code>\n` +
@@ -1009,7 +1047,8 @@ async function checkTop1Everywhere(map, silent) {
         `Hot Level: ${hotStr}\n` +
         `Bluechip: ${(v.bluechip*100).toFixed(1)}%\n` +
         `Holders: ${v.holders || 'N/A'}\n` +
-        `Smart / KOL: ${v.smart} / ${v.kol}\n\n` +
+        `Smart / KOL: ${v.smart} / ${v.kol}\n` +
+        `Tracked Buy: ${big.detail}\n\n` +
         `Signal Time: ${signalTime}\n\n` +
         `\ud83d\udd17 <a href="https://gmgn.ai/sol/token/${addr}">View on GMGN</a>`
       );
@@ -1584,11 +1623,24 @@ setInterval(() => {
   // Prune trackedBuysWhale by its own time window (not by size) so entries expire
   // predictably and the whale gate never reads a stale buy.
   {
-    const wCut = Date.now() - WHALE_BUY_WINDOW_MS;
+    const wCut = Date.now() - TRACKED_BUY_RETENTION_MS;
     for (const m of Object.keys(trackedBuysWhale)) {
       const b = trackedBuysWhale[m];
       for (const [w, rec] of b) { if (!rec || rec.ts < wCut) b.delete(w); }
       if (b.size === 0) delete trackedBuysWhale[m];
+    }
+    // Size cap: retention is now 48h (the #1 signal's max token age), so this
+    // store holds far more than the old 60-min version. If it still exceeds the
+    // cap after time pruning, drop the tokens whose MOST RECENT buy is oldest.
+    // Deliberately NOT the wholesale `= {}` clear used for the other stores —
+    // wiping this one would silently mute the #1 and whale signals.
+    const tbKeys = Object.keys(trackedBuysWhale);
+    if (tbKeys.length > TRACKED_BUY_MAX_TOKENS) {
+      const newest = (k) => { let mx = 0; for (const [, r] of trackedBuysWhale[k]) if (r && r.ts > mx) mx = r.ts; return mx; };
+      const ordered = tbKeys.map(k => [k, newest(k)]).sort((x, y) => x[1] - y[1]);
+      const drop = ordered.length - TRACKED_BUY_MAX_TOKENS;
+      for (let i = 0; i < drop; i++) delete trackedBuysWhale[ordered[i][0]];
+      log(`[CLEANUP] trackedBuysWhale trimmed ${drop} oldest tokens (cap ${TRACKED_BUY_MAX_TOKENS})`);
     }
   }
   if (Object.keys(trendBuyers).length > 20000) { trendBuyers = {}; log(`[CLEANUP] trendBuyers cleared`); }
@@ -1647,7 +1699,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12h ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12j ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
@@ -1656,6 +1708,7 @@ log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster(5w/$500/60m)=${ENAB
 // /v1/market/rank, so this line IS what the bot is asking GMGN for — no need to
 // read the source or guess which build is live.
 log(`[START] Trending pool: order_by=volume desc | top${TREND_TOP_N} per interval | filters=[${TREND_FILTERS.join(', ') || 'none'}] | max_created=${TREND_MAX_CREATED || 'none'} | min_smart=${TREND_MIN_SMART} | min_kol=${TREND_MIN_KOL}`);
+log(`[START] #1 signal: rank 1 on [${TOP1_INTERVALS.join(', ')}] + >=1 tracked buy >= $${TOP1_MIN_BIG_BUY_USD} within ${Math.round(TOP1_BUY_WINDOW_MS/60000)}m | whale: >${WHALE_MIN_HOLDERS} holders + smart>=${WHALE_MIN_SMART} + kol>=${WHALE_MIN_KOL} + tracked buy >= $${WHALE_MIN_BIG_BUY_USD} within ${Math.round(WHALE_BUY_WINDOW_MS/60000)}m`);
 
 https.get('https://api.ipify.org?format=json', (res) => {
   let d = ''; res.on('data', c => d += c);
