@@ -149,6 +149,10 @@ const TOP1_INTERVALS = (process.env.TOP1_INTERVALS || '1m,5m,1h')
   .split(',').map(x => x.trim()).filter(Boolean);
 // #1-EVERYWHERE also now requires >= 1 buy of this size from a TRACKED wallet.
 const TOP1_MIN_BIG_BUY_USD = parseFloat(process.env.TOP1_MIN_BIG_BUY_USD || '500');
+// How many DISTINCT tracked wallets must EACH clear TOP1_MIN_BIG_BUY_USD.
+// Raised 1 -> 3 on 2026-08-12 at N's request. Counted per WALLET, not per buy:
+// one wallet buying $2000 counts as 1, not 4.
+const TOP1_MIN_BIG_BUYS = parseInt(process.env.TOP1_MIN_BIG_BUYS || '3', 10);
 // Max token age for the #1 signal. Was hardcoded inline as 48*3600; named here
 // so the buy window below can be DERIVED from it and the two cannot drift.
 const TOP1_MAX_AGE_SECS = parseInt(process.env.TOP1_MAX_AGE || '172800', 10);   // 48h
@@ -247,12 +251,23 @@ const TREND_MIN_WALLETS   = parseInt(process.env.TREND_MIN_WALLETS || '2', 10);
 const VOL_GATE_USD        = parseFloat(process.env.VOL_GATE_USD || '100000');   // $100k 5-min volume
 
 // ── RPC ───────────────────────────────────────────────────────
-const HTTP_RPCS = [
-  HELIUS_API_KEY  ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : null,
-  SHYFT_API_KEY   ? `https://rpc.shyft.to?api_key=${SHYFT_API_KEY}` : null,
-  ALCHEMY_API_KEY ? `https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` : null,
-  'https://api.mainnet-beta.solana.com',
-].filter(Boolean);
+// HTTP RPC endpoints, tried IN ORDER, first success wins.
+// 2026-08-12: this list used to be hardcoded with HELIUS FIRST and had no env
+// control — WSS_ORDER only ever governed WebSockets. That is why BUY_MODE=POLL
+// silently burned Helius credits: 94 wallets x getSignaturesForAddress every 60s
+// = ~135k paid calls/day, all landing on Helius, versus ~free logsSubscribe.
+// HTTP_RPC_ORDER now controls it. Default keeps the historical order; set
+// HTTP_RPC_ORDER=PUBLIC,HELIUS to keep polling off the paid endpoint.
+const HTTP_RPC_DEFS = {
+  HELIUS:  HELIUS_API_KEY  ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : null,
+  SHYFT:   SHYFT_API_KEY   ? `https://rpc.shyft.to?api_key=${SHYFT_API_KEY}` : null,
+  ALCHEMY: ALCHEMY_API_KEY ? `https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` : null,
+  PUBLIC:  'https://api.mainnet-beta.solana.com',
+};
+const HTTP_RPC_ORDER = (process.env.HTTP_RPC_ORDER || 'HELIUS,SHYFT,ALCHEMY,PUBLIC')
+  .split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+const HTTP_RPCS = HTTP_RPC_ORDER.map(n => HTTP_RPC_DEFS[n]).filter(Boolean);
+const HTTP_RPC_NAMES = HTTP_RPC_ORDER.filter(n => HTTP_RPC_DEFS[n]);
 // WebSocket endpoints, tried IN ORDER. On repeated failure the bot rotates to
 // the next one. Helius free tier caps at 100 concurrent subscriptions and we run
 // exactly 100 wallets — during a reconnect the old subs may still be open, which
@@ -900,22 +915,27 @@ async function refreshTrending() {
 // Reads trackedBuysWhale (see its declaration for why it is separate).
 // Returns { ok, detail }. FAIL-OPEN when size is unknown (unparseable tx) or the
 // SOL price lookup fails — a dead price feed must never silently mute the signal.
-async function whaleTrackedBigBuy(mint, minUsd, windowMs) {
+async function whaleTrackedBigBuy(mint, minUsd, windowMs, minCount) {
+  const need = Math.max(1, minCount || 1);
   const bucket = trackedBuysWhale[mint];
-  if (!bucket || bucket.size === 0) return { ok: false, detail: 'no tracked buys' };
+  if (!bucket || bucket.size === 0) return { ok: false, count: 0, detail: 'no tracked buys' };
   const cutoff = Date.now() - (windowMs || WHALE_BUY_WINDOW_MS);
-  const live = [...bucket.entries()].filter(([, r]) => r.ts >= cutoff);
-  if (!live.length) return { ok: false, detail: 'no tracked buys in window' };
+  const live = [...bucket.entries()].filter(([, r]) => r && r.ts >= cutoff);
+  if (!live.length) return { ok: false, count: 0, detail: 'no tracked buys in window' };
   const price = await getSolPriceUsd();
-  let best = 0, unknown = false;
+  let count = 0, unknown = 0;
+  const parts = [];
   for (const [, r] of live) {
-    if (r.sol === null || r.sol === undefined || !(price > 0)) { unknown = true; continue; }
+    // FAIL-OPEN per wallet: unparseable size or a dead price feed counts as
+    // qualifying, matching the cluster gate, so a blip cannot mute a signal.
+    if (r.sol === null || r.sol === undefined || !(price > 0)) { unknown++; count++; parts.push('?'); continue; }
     const usd = r.sol * price;
-    if (usd > best) best = usd;
+    if (usd >= minUsd) { count++; parts.push(fmtUsd(usd)); }
   }
-  if (best >= minUsd) return { ok: true, detail: fmtUsd(best) };
-  if (unknown) return { ok: true, detail: 'size unknown (fail-open)' };
-  return { ok: false, detail: `largest tracked buy ${fmtUsd(best)} < ${fmtUsd(minUsd)}` };
+  if (count >= need) {
+    return { ok: true, count, detail: (parts.join(', ') || `${count} qualifying`) + (unknown ? ` (${unknown} size unknown, fail-open)` : '') };
+  }
+  return { ok: false, count, detail: `only ${count}/${need} tracked wallets bought >= ${fmtUsd(minUsd)}` };
 }
 async function checkWhaleHolders(map) {
   if (!ENABLE_CLUSTER) return;   // gated with the cluster (same "add-back" package)
@@ -940,7 +960,7 @@ async function checkWhaleHolders(map) {
     }
     // At least one >= $500 buy from a TRACKED wallet in the window. Checked LAST
     // because it is the only gate that can cost a network call.
-    const big = await whaleTrackedBigBuy(addr, WHALE_MIN_BIG_BUY_USD, WHALE_BUY_WINDOW_MS);
+    const big = await whaleTrackedBigBuy(addr, WHALE_MIN_BIG_BUY_USD, WHALE_BUY_WINDOW_MS, 1);
     if (!big.ok) {
       log(`[WHALE] SKIP ${v.symbol || addr.substring(0,8)} — ${big.detail}`);
       continue;
@@ -955,7 +975,7 @@ async function checkWhaleHolders(map) {
       `<b>Age:</b> ${ageMin}m\n` +
       `<b>Trending Rank:</b> #${v.bestRank} (best across intervals)\n` +
       `<b>Smart / KOL:</b> ${v.smart || 0} / ${v.kol || 0}\n` +
-      `<b>Tracked Buy:</b> ${big.detail}\n` +
+      `<b>Tracked Buys (${big.count}):</b> ${big.detail}\n` +
       `<b>Market Cap:</b> ${fmtUsd(v.mc || 0)}\n` +
       `<b>Contract:</b> <code>${addr}</code>\n\n` +
       `🔗 <a href="https://gmgn.ai/sol/token/${addr}">View on GMGN</a>`;
@@ -1014,7 +1034,7 @@ async function checkTop1Everywhere(map, silent) {
       // already-#1 token unprimed and let it fire later as if it were new.
       // Runs BEFORE top1Fired.add so a token blocked here stays eligible and can
       // still fire on a later cycle once a tracked wallet buys it.
-      const big = await whaleTrackedBigBuy(addr, TOP1_MIN_BIG_BUY_USD, TOP1_BUY_WINDOW_MS);
+      const big = await whaleTrackedBigBuy(addr, TOP1_MIN_BIG_BUY_USD, TOP1_BUY_WINDOW_MS, TOP1_MIN_BIG_BUYS);
       if (!big.ok) {
         log(`[TOP1] SKIP ${v.symbol || addr.substring(0,8)} — #1 on ${TOP1_INTERVALS.join('/')} but ${big.detail}`);
         continue;
@@ -1048,7 +1068,7 @@ async function checkTop1Everywhere(map, silent) {
         `Bluechip: ${(v.bluechip*100).toFixed(1)}%\n` +
         `Holders: ${v.holders || 'N/A'}\n` +
         `Smart / KOL: ${v.smart} / ${v.kol}\n` +
-        `Tracked Buy: ${big.detail}\n\n` +
+        `Tracked Buys (${big.count}): ${big.detail}\n\n` +
         `Signal Time: ${signalTime}\n\n` +
         `\ud83d\udd17 <a href="https://gmgn.ai/sol/token/${addr}">View on GMGN</a>`
       );
@@ -1699,16 +1719,17 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12j ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12k ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
+log(`[START] HTTP RPC chain: ${HTTP_RPC_NAMES.join(' -> ')} | buy-detection=${BUY_MODE}` + (BUY_MODE === 'POLL' ? `  <-- POLL makes ~${WALLETS.length} RPC calls every ${BUY_POLL_SECS}s against the FIRST endpoint` : ''));
 log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster(5w/$500/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'}, whale-holder(>5k/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'} | buy-detection=${BUY_MODE}`);
 // Print the exact trending-pool query config at boot. Everything below is sent to
 // /v1/market/rank, so this line IS what the bot is asking GMGN for — no need to
 // read the source or guess which build is live.
 log(`[START] Trending pool: order_by=volume desc | top${TREND_TOP_N} per interval | filters=[${TREND_FILTERS.join(', ') || 'none'}] | max_created=${TREND_MAX_CREATED || 'none'} | min_smart=${TREND_MIN_SMART} | min_kol=${TREND_MIN_KOL}`);
-log(`[START] #1 signal: rank 1 on [${TOP1_INTERVALS.join(', ')}] + >=1 tracked buy >= $${TOP1_MIN_BIG_BUY_USD} within ${Math.round(TOP1_BUY_WINDOW_MS/60000)}m | whale: >${WHALE_MIN_HOLDERS} holders + smart>=${WHALE_MIN_SMART} + kol>=${WHALE_MIN_KOL} + tracked buy >= $${WHALE_MIN_BIG_BUY_USD} within ${Math.round(WHALE_BUY_WINDOW_MS/60000)}m`);
+log(`[START] #1 signal: rank 1 on [${TOP1_INTERVALS.join(', ')}] + >=${TOP1_MIN_BIG_BUYS} wallets each >= $${TOP1_MIN_BIG_BUY_USD} within ${Math.round(TOP1_BUY_WINDOW_MS/60000)}m | whale: >${WHALE_MIN_HOLDERS} holders + smart>=${WHALE_MIN_SMART} + kol>=${WHALE_MIN_KOL} + tracked buy >= $${WHALE_MIN_BIG_BUY_USD} within ${Math.round(WHALE_BUY_WINDOW_MS/60000)}m`);
 
 https.get('https://api.ipify.org?format=json', (res) => {
   let d = ''; res.on('data', c => d += c);
@@ -1760,6 +1781,28 @@ async function pollWalletsForBuys() {
   }
 }
 
+// ── WS -> POLL AUTOMATIC FALLBACK ────────────────────────────
+// WebSocket logsSubscribe is the cheap path (one connection, ~free in credits)
+// but it DIES when Helius credits run out — which is exactly how buy detection
+// went silent for days. This watchdog starts the HTTP POLL backstop if the
+// socket is unhealthy for WS_FALLBACK_SECS, and stops it again once the socket
+// recovers, so the bot degrades to "costs credits" instead of "detects nothing".
+const WS_FALLBACK_SECS = parseInt(process.env.WS_FALLBACK_SECS || '180', 10);
+let fallbackPollTimer = null, fallbackPollActive = false, wsUnhealthySince = 0;
+function startFallbackPoll(reason) {
+  if (fallbackPollActive) return;
+  fallbackPollActive = true;
+  log(`[FALLBACK] WebSocket unhealthy (${reason}) — starting HTTP POLL backstop every ${BUY_POLL_SECS}s so buy detection does not go silent. NOTE: polling consumes RPC credits.`);
+  pollWalletsForBuys().then(() => log(`[FALLBACK] poll cursors seeded`)).catch(() => {});
+  fallbackPollTimer = setInterval(pollWalletsForBuys, BUY_POLL_SECS * 1000);
+}
+function stopFallbackPoll() {
+  if (!fallbackPollActive) return;
+  clearInterval(fallbackPollTimer);
+  fallbackPollTimer = null; fallbackPollActive = false;
+  log(`[FALLBACK] WebSocket healthy again — stopping HTTP POLL backstop (back to near-zero-credit buy detection)`);
+}
+
 // Start buy detection in the configured mode.
 if (BUY_MODE === 'POLL') {
   log(`[START] Buy detection: HTTP POLL every ${BUY_POLL_SECS}s across ${WALLETS.length} wallets (free-tier safe, no WebSocket)`);
@@ -1767,8 +1810,20 @@ if (BUY_MODE === 'POLL') {
   pollWalletsForBuys().then(() => log(`[POLL] cursors seeded — now watching for new buys`));
   setInterval(pollWalletsForBuys, BUY_POLL_SECS * 1000);
 } else {
-  log(`[START] Buy detection: WebSocket (logsSubscribe)`);
+  log(`[START] Buy detection: WebSocket (logsSubscribe) + auto POLL fallback after ${WS_FALLBACK_SECS}s unhealthy`);
   connect();
+  // Health = socket open AND at least half the wallets actually subscribed.
+  // Half, not all, because a partial subscribe still detects most buys and we do
+  // not want to flap onto the paid path over one or two failed subscriptions.
+  setInterval(() => {
+    const active = Object.keys(subIdToWallet).length;
+    const healthy = ws && ws.readyState === WebSocket.OPEN && active >= Math.ceil(WALLETS.length / 2);
+    if (healthy) { wsUnhealthySince = 0; stopFallbackPoll(); return; }
+    if (!wsUnhealthySince) wsUnhealthySince = Date.now();
+    if (Date.now() - wsUnhealthySince > WS_FALLBACK_SECS * 1000) {
+      startFallbackPoll(`${active}/${WALLETS.length} subscriptions active`);
+    }
+  }, 30000);
 }
 
 // Self-ping (Render only — harmless on a VPS where RENDER_EXTERNAL_URL is unset)
