@@ -244,6 +244,22 @@ const WHALE_BUY_WINDOW_MS   = parseInt(process.env.WHALE_BUY_WINDOW_MS || '36000
 const TRACKED_BUY_RETENTION_MS = Math.max(WHALE_BUY_WINDOW_MS, TOP1_BUY_WINDOW_MS);
 const TRACKED_BUY_MAX_TOKENS = parseInt(process.env.TRACKED_BUY_MAX_TOKENS || '20000', 10);
 
+// ══════════════════════════════════════════════════════════════
+//  TELEGRAM CALL GATE (2026-08-12m)
+// ══════════════════════════════════════════════════════════════
+// Every signal additionally requires the mint to have been CALLED in one of N's
+// Telegram channels. This bot cannot read Telegram; profit_tracker.py runs a
+// Telethon USER session across ~55 channels and writes TG_CALLS_FILE. We only
+// read that file — no network, no credentials, no Telegram code here.
+// A call may arrive BEFORE or AFTER the on-chain conditions, so a signal whose
+// on-chain side is satisfied but has no call yet is held PENDING and re-checked.
+const TG_CALLS_FILE = process.env.TG_CALLS_FILE || '/tmp/tg_calls.json';
+// Feed older than this => tracker presumed down => FAIL OPEN (fire, flagged)
+// rather than silently muting every signal.
+const TG_CALLS_MAX_STALE_SEC = parseInt(process.env.TG_CALLS_MAX_STALE_SEC || '900', 10);
+const TG_RECHECK_SECS = parseInt(process.env.TG_RECHECK_SECS || '30', 10);
+const TG_GATE_ENABLED = (process.env.TG_GATE_ENABLED || '1') === '1';
+
 // Bluechip trending signal now needs this many DISTINCT tracked wallets (was 1).
 const TREND_MIN_WALLETS   = parseInt(process.env.TREND_MIN_WALLETS || '2', 10);
 // Volume gate shared by the cluster signal: token qualifies if it is trending
@@ -497,6 +513,10 @@ let clusterBuyers   = {};
 // the whale-holder signal miss buys for reasons that have nothing to do with it.
 // This store is written on EVERY tracked buy and pruned at WHALE_BUY_WINDOW_MS.
 let trackedBuysWhale = {};
+// Pending signals: on-chain side satisfied, waiting on a Telegram call.
+let pendingTop1  = {};   // mint -> { since }
+let pendingTrend = {};   // mint -> { buyerName, since }
+let _tgCache = { mtime: -1, data: null };
 let clusterFired    = loadSet('/tmp/sol_cluster_fired.json');  // tokens that already fired the cluster signal
 let whaleFired      = loadSet('/tmp/sol_whale_fired.json');    // tokens that already fired the whale-holder signal
 let walletEventTimes = {};        // wallet -> recent event timestamps (ms), flood throttle
@@ -911,6 +931,42 @@ async function refreshTrending() {
 // WHALE HOLDER: scan the current trending map for tokens with > WHALE_MIN_HOLDERS
 // holders, age < WHALE_MAX_AGE, and #1 in at least one interval. Poll-driven; fires
 // once per token to the cluster chat. No wallet/WebSocket dependency.
+// ── TELEGRAM CALL FEED ────────────────────────────────────────────────────────
+// Reads the file profit_tracker.py writes. Cached on mtime so the 30s re-check
+// loop does not re-parse an unchanged file. Never throws.
+function readTgCalls() {
+  try {
+    const st = fs.statSync(TG_CALLS_FILE);
+    if (_tgCache.data && st.mtimeMs === _tgCache.mtime) return _tgCache.data;
+    const parsed = JSON.parse(fs.readFileSync(TG_CALLS_FILE, 'utf8'));
+    _tgCache = { mtime: st.mtimeMs, data: parsed };
+    return parsed;
+  } catch (e) {
+    return null;   // missing / unreadable / mid-write — treat as tracker down
+  }
+}
+// Has this mint been called? Returns { ok, stale, detail }.
+// FAIL-OPEN: missing or stale feed => ok:true, stale:true (fires, flagged).
+// A FRESH feed that simply lacks the mint is a real "no call" => ok:false.
+// CASE: Solana mints are base58 and CASE-SENSITIVE — the tracker stores them
+// with exact case, so we look up exactly. (Only EVM addresses get lowercased.)
+function tgCallCheck(mint) {
+  if (!TG_GATE_ENABLED) return { ok: true, stale: false, detail: 'gate disabled' };
+  const feed = readTgCalls();
+  if (!feed) return { ok: true, stale: true, detail: 'call feed unavailable — tracker down? (gate NOT enforced)' };
+  const age = Math.floor(Date.now() / 1000) - (parseInt(feed.updated, 10) || 0);
+  const e = (feed.calls || {})[mint];
+  if (e) {
+    const chans = (e.channels || []).slice(0, 3).join(', ');
+    const mins = Math.max(0, Math.floor((Date.now() / 1000 - (e.first || 0)) / 60));
+    return { ok: true, stale: false, detail: `${e.count} call(s) — ${chans}${(e.channels || []).length > 3 ? ' +more' : ''} (first ${mins}m ago)` };
+  }
+  if (age > TG_CALLS_MAX_STALE_SEC) {
+    return { ok: true, stale: true, detail: `call feed stale ${Math.round(age / 60)}m — tracker down? (gate NOT enforced)` };
+  }
+  return { ok: false, stale: false, detail: 'no telegram call yet' };
+}
+
 // Does any TRACKED wallet have a buy >= minUsd on this mint inside the window?
 // Reads trackedBuysWhale (see its declaration for why it is separate).
 // Returns { ok, detail }. FAIL-OPEN when size is unknown (unparseable tx) or the
@@ -991,7 +1047,13 @@ async function checkTop1Everywhere(map, silent) {
       const r = v.ranks || {};
       // Every interval must be present AND equal to 1.
       const allOne = TOP1_INTERVALS.every(iv => r[iv] === 1);
-      if (!allOne) continue;
+      if (!allOne) {
+        if (pendingTop1[addr]) {
+          log(`[TOP1] pending DROPPED ${v.symbol || addr.substring(0,8)} — no longer #1 on all of ${TOP1_INTERVALS.join('/')}`);
+          delete pendingTop1[addr];
+        }
+        continue;
+      }
 
       // FILTER: at least one smart-money or KOL holder (GMGN counts).
       if (((v.smart || 0) + (v.kol || 0)) < 1) continue;
@@ -1039,6 +1101,17 @@ async function checkTop1Everywhere(map, silent) {
         log(`[TOP1] SKIP ${v.symbol || addr.substring(0,8)} — #1 on ${TOP1_INTERVALS.join('/')} but ${big.detail}`);
         continue;
       }
+      const tg = tgCallCheck(addr);
+      if (!tg.ok) {
+        // On-chain side satisfied; only the call is missing. HOLD, don't drop —
+        // and do NOT add to top1Fired, or it could never fire once a call lands.
+        if (!pendingTop1[addr]) {
+          pendingTop1[addr] = { since: Date.now() };
+          log(`[TOP1] PENDING ${v.symbol || addr.substring(0,8)} — #1 + ${big.count} buys, waiting on a telegram call (re-checking every ${TG_RECHECK_SECS}s)`);
+        }
+        continue;
+      }
+      delete pendingTop1[addr];
 
       // Mark as fired ONLY now that we're actually alerting.
       top1Fired.add(addr);
@@ -1068,7 +1141,10 @@ async function checkTop1Everywhere(map, silent) {
         `Bluechip: ${(v.bluechip*100).toFixed(1)}%\n` +
         `Holders: ${v.holders || 'N/A'}\n` +
         `Smart / KOL: ${v.smart} / ${v.kol}\n` +
-        `Tracked Buys (${big.count}): ${big.detail}\n\n` +
+        `Tracked Buys (${big.count}): ${big.detail}\n` +
+        `Telegram: ${tg.detail}\n` +
+        (tg.stale ? '\u26a0\ufe0f call gate NOT enforced — feed unavailable\n' : '') +
+        `\n` +
         `Signal Time: ${signalTime}\n\n` +
         `\ud83d\udd17 <a href="https://gmgn.ai/sol/token/${addr}">View on GMGN</a>`
       );
@@ -1152,6 +1228,22 @@ async function sendTrendSignal(trackedWallet, tokenMint, tx) {
       return;
     }
 
+    // TELEGRAM CALL GATE. On-chain side is fully satisfied here; if there is no
+    // call yet we HOLD rather than discard, and crucially do NOT add to
+    // trendFired — adding it would permanently block the token from ever firing
+    // once a call arrives.
+    const tgT = tgCallCheck(tokenMint);
+    if (!tgT.ok) {
+      if (!pendingTrend[tokenMint]) {
+        // Keep the originating buy so the re-check can re-enter sendTrendSignal
+        // itself rather than rebuilding the alert (one fire path, no drift).
+        pendingTrend[tokenMint] = { trackedWallet, tx, since: Date.now() };
+        log(`[TREND] PENDING ${t.symbol} — bluechip ${(t.bluechip*100).toFixed(1)}%, waiting on a telegram call (re-checking every ${TG_RECHECK_SECS}s)`);
+      }
+      return;
+    }
+    delete pendingTrend[tokenMint];
+
     // All gates passed — fire once.
     if (trendFired.has(tokenMint) || processing.has(tokenMint)) return;
     processing.add(tokenMint);            // synchronous — no await between check and add
@@ -1186,7 +1278,10 @@ async function sendTrendSignal(trackedWallet, tokenMint, tx) {
       `Volume: ${volStr}\n` +
       `Holders: ${t.holders || 'N/A'}\n` +
       `Smart / KOL: ${t.smart} / ${t.kol}\n` +
-      `Trending in: ${intervalsStr}\n\n` +
+      `Trending in: ${intervalsStr}\n` +
+      `Telegram: ${tgT.detail}\n` +
+      (tgT.stale ? '\u26a0\ufe0f call gate NOT enforced — feed unavailable\n' : '') +
+      `\n` +
       `Signal Time: ${signalTime}\n\n` +
       `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
     );
@@ -1195,6 +1290,81 @@ async function sendTrendSignal(trackedWallet, tokenMint, tx) {
   } catch (e) {
     processing.delete(tokenMint);
     log(`[ERR] sendTrendSignal: ${e.message}`);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  PENDING RE-CHECK  (telegram call arriving AFTER the on-chain signal)
+// ══════════════════════════════════════════════════════════════
+// Runs every TG_RECHECK_SECS. Cheap: in-memory trendingMap + one mtime-cached
+// file read. No GMGN or RPC calls unless a signal is actually about to fire.
+//
+// #1: keep waiting while the mint is STILL rank 1 on all TOP1_INTERVALS.
+// BLUECHIP: keep waiting while it STILL qualifies (rank + bluechip%) and is
+// under TREND_MAX_TOKEN_AGE (24h). Both re-read the live map, so "still
+// qualifies" is verified fresh rather than trusted from when it went pending.
+async function recheckPendingSignals() {
+  // ── #1 TRENDING ──
+  for (const mint of Object.keys(pendingTop1)) {
+    try {
+      if (top1Fired.has(mint)) { delete pendingTop1[mint]; continue; }
+      const v = trendingMap.get(mint);
+      const r = (v && v.ranks) || {};
+      if (!v || !TOP1_INTERVALS.every(iv => r[iv] === 1)) {
+        log(`[TOP1] pending DROPPED ${(v && v.symbol) || mint.substring(0,8)} — no longer #1 on all of ${TOP1_INTERVALS.join('/')}`);
+        delete pendingTop1[mint]; continue;
+      }
+      const now = Math.floor(Date.now() / 1000);
+      if (v.created > 0 && (now - v.created) > TOP1_MAX_AGE_SECS) {
+        log(`[TOP1] pending DROPPED ${v.symbol || mint.substring(0,8)} — aged out`);
+        delete pendingTop1[mint]; continue;
+      }
+      const tg = tgCallCheck(mint);
+      if (!tg.ok) continue;                    // still no call — keep waiting
+      const big = await whaleTrackedBigBuy(mint, TOP1_MIN_BIG_BUY_USD, TOP1_BUY_WINDOW_MS, TOP1_MIN_BIG_BUYS);
+      if (!big.ok) continue;                   // buys aged out of the window
+      // Re-enter the normal path: clearing the pending flag and letting the next
+      // trending refresh fire it keeps ONE fire path instead of a duplicate.
+      delete pendingTop1[mint];
+      log(`[TOP1] pending SATISFIED ${v.symbol || mint.substring(0,8)} — call landed (${tg.detail}); will fire on the next trending refresh`);
+      await checkTop1Everywhere(new Map([[mint, v]]), false);
+    } catch (e) {
+      log(`[ERR] recheck top1 ${mint.substring(0,8)}: ${e.message}`);
+    }
+  }
+  // ── BLUECHIP ──
+  for (const mint of Object.keys(pendingTrend)) {
+    try {
+      if (trendFired.has(mint)) { delete pendingTrend[mint]; continue; }
+      const t = trendingMap.get(mint);
+      if (!t) {
+        log(`[TREND] pending DROPPED ${mint.substring(0,8)} — fell out of the trending pool`);
+        delete pendingTrend[mint]; continue;
+      }
+      const rank = t.bestRank || 999;
+      if (!(rank <= TREND_TOP_WIDE && t.bluechip > TREND_MIN_BLUECHIP)) {
+        log(`[TREND] pending DROPPED ${t.symbol} — no longer qualifies (rank ${rank}, bc ${(t.bluechip*100).toFixed(1)}%)`);
+        delete pendingTrend[mint]; continue;
+      }
+      const info = await getCachedTokenInfo(mint);
+      const created = parseInt(info?.creation_timestamp ?? t.created ?? 0, 10) || 0;
+      const age = created > 0 ? Math.floor(Date.now()/1000) - created : null;
+      if (age == null || age > TREND_MAX_TOKEN_AGE) {
+        log(`[TREND] pending DROPPED ${t.symbol} — aged out (${fmtAge(age)})`);
+        delete pendingTrend[mint]; continue;
+      }
+      const tg = tgCallCheck(mint);
+      if (!tg.ok) continue;                    // still no call — keep waiting
+      log(`[TREND] pending SATISFIED ${t.symbol} — call landed (${tg.detail}), firing`);
+      // Re-enter sendTrendSignal with the ORIGINAL buy. Every gate re-runs (now
+      // including the call, which passes), and the alert is built by the one
+      // existing code path — no duplicated message to drift out of sync.
+      const p = pendingTrend[mint];
+      delete pendingTrend[mint];
+      await sendTrendSignal(p.trackedWallet, mint, p.tx);
+    } catch (e) {
+      log(`[ERR] recheck trend ${mint.substring(0,8)}: ${e.message}`);
+    }
   }
 }
 
@@ -1270,6 +1440,15 @@ async function checkClusterSignal(trackedWallet, tokenMint, tx) {
 
     // Fire once.
     if (clusterFired.has(tokenMint)) return;
+    // TELEGRAM CALL GATE. No call yet -> do NOT mark fired and do NOT clear the
+    // buyer bucket: the whole cluster state stays intact so the NEXT tracked buy
+    // on this mint re-runs this function and re-checks for a call. That is N's
+    // "only check again when another wallet buys" rule; it needs no timer.
+    const tgC = tgCallCheck(tokenMint);
+    if (!tgC.ok) {
+      log(`[CLUSTER] PENDING ${tokenMint.substring(0,8)} — cluster complete, waiting on a telegram call (re-checks on the next tracked buy)`);
+      return;
+    }
     clusterFired.add(tokenMint);
     saveSet('/tmp/sol_cluster_fired.json', clusterFired);
     const gateReason = `#1 trending`;
@@ -1307,7 +1486,10 @@ async function checkClusterSignal(trackedWallet, tokenMint, tx) {
       `Token Age: ${fmtAge(age)}\n` +
       `Market Cap: ${mcStr}\n` +
       `Trending Rank: ${rankStr}\n` +
-      `Largest Buy: <b>${largestStr}</b>\n\n` +
+      `Largest Buy: <b>${largestStr}</b>\n` +
+      `Telegram: ${tgC.detail}\n` +
+      (tgC.stale ? '\u26a0\ufe0f call gate NOT enforced — feed unavailable\n' : '') +
+      `\n` +
       `<b>Bought by:</b>\n${buyerList}\n\n` +
       `Signal Time: ${signalTime}\n\n` +
       `🔗 <a href="https://gmgn.ai/sol/token/${tokenMint}">View on GMGN</a>`
@@ -1719,7 +1901,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12k ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12m ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
@@ -1728,6 +1910,8 @@ log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster(5w/$500/60m)=${ENAB
 // Print the exact trending-pool query config at boot. Everything below is sent to
 // /v1/market/rank, so this line IS what the bot is asking GMGN for — no need to
 // read the source or guess which build is live.
+setInterval(() => { recheckPendingSignals().catch(e => log(`[ERR] recheck loop: ${e.message}`)); }, TG_RECHECK_SECS * 1000);
+log(`[START] TG call gate: ${TG_GATE_ENABLED ? 'ON' : 'OFF'} | feed=${TG_CALLS_FILE} | re-check every ${TG_RECHECK_SECS}s | fail-open if feed older than ${Math.round(TG_CALLS_MAX_STALE_SEC/60)}m`);
 log(`[START] Trending pool: order_by=volume desc | top${TREND_TOP_N} per interval | filters=[${TREND_FILTERS.join(', ') || 'none'}] | max_created=${TREND_MAX_CREATED || 'none'} | min_smart=${TREND_MIN_SMART} | min_kol=${TREND_MIN_KOL}`);
 log(`[START] #1 signal: rank 1 on [${TOP1_INTERVALS.join(', ')}] + >=${TOP1_MIN_BIG_BUYS} wallets each >= $${TOP1_MIN_BIG_BUY_USD} within ${Math.round(TOP1_BUY_WINDOW_MS/60000)}m | whale: >${WHALE_MIN_HOLDERS} holders + smart>=${WHALE_MIN_SMART} + kol>=${WHALE_MIN_KOL} + tracked buy >= $${WHALE_MIN_BIG_BUY_USD} within ${Math.round(WHALE_BUY_WINDOW_MS/60000)}m`);
 
