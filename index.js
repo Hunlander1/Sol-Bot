@@ -259,6 +259,15 @@ const TG_CALLS_FILE = process.env.TG_CALLS_FILE || '/tmp/tg_calls.json';
 const TG_CALLS_MAX_STALE_SEC = parseInt(process.env.TG_CALLS_MAX_STALE_SEC || '900', 10);
 const TG_RECHECK_SECS = parseInt(process.env.TG_RECHECK_SECS || '30', 10);
 const TG_GATE_ENABLED = (process.env.TG_GATE_ENABLED || '1') === '1';
+// FAIL-CLOSED (changed 2026-08-21 at N's request: "i don't need the signal
+// without the telegram calls"). Feed missing or stale => signals are HELD, not
+// fired. The danger is silence — a dead tracker muting everything unnoticed — so
+// an outage is announced to Telegram instead (see the watchdog below), and held
+// signals still fire later if the feed returns while they still qualify.
+// Set TG_FAIL_OPEN=1 to revert to firing unchecked when the feed is down.
+const TG_FAIL_OPEN = (process.env.TG_FAIL_OPEN || '0') === '1';
+const TG_DOWN_NOTIFY_SECS = parseInt(process.env.TG_DOWN_NOTIFY_SECS || '1800', 10);
+let _tgDownSince = 0, _tgDownNotifiedAt = 0;
 
 // Bluechip trending signal now needs this many DISTINCT tracked wallets (was 1).
 const TREND_MIN_WALLETS   = parseInt(process.env.TREND_MIN_WALLETS || '2', 10);
@@ -953,7 +962,7 @@ function readTgCalls() {
 function tgCallCheck(mint) {
   if (!TG_GATE_ENABLED) return { ok: true, stale: false, detail: 'gate disabled' };
   const feed = readTgCalls();
-  if (!feed) return { ok: true, stale: true, detail: 'call feed unavailable — tracker down? (gate NOT enforced)' };
+  if (!feed) return { ok: TG_FAIL_OPEN, stale: true, down: true, detail: 'call feed unavailable — tracker down' };
   const age = Math.floor(Date.now() / 1000) - (parseInt(feed.updated, 10) || 0);
   const e = (feed.calls || {})[mint];
   if (e) {
@@ -962,7 +971,7 @@ function tgCallCheck(mint) {
     return { ok: true, stale: false, detail: `${e.count} call(s) — ${chans}${(e.channels || []).length > 3 ? ' +more' : ''} (first ${mins}m ago)` };
   }
   if (age > TG_CALLS_MAX_STALE_SEC) {
-    return { ok: true, stale: true, detail: `call feed stale ${Math.round(age / 60)}m — tracker down? (gate NOT enforced)` };
+    return { ok: TG_FAIL_OPEN, stale: true, down: true, detail: `call feed stale ${Math.round(age / 60)}m — tracker down` };
   }
   return { ok: false, stale: false, detail: 'no telegram call yet' };
 }
@@ -1901,7 +1910,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-12m ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-21a ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
@@ -1995,6 +2004,34 @@ if (BUY_MODE === 'POLL') {
   setInterval(pollWalletsForBuys, BUY_POLL_SECS * 1000);
 } else {
   log(`[START] Buy detection: WebSocket (logsSubscribe) + auto POLL fallback after ${WS_FALLBACK_SECS}s unhealthy`);
+// Feed-outage watchdog. Fail-closed means a dead tracker blocks every signal, so
+// announce it rather than going quiet — silence is the failure mode to avoid.
+setInterval(() => {
+  try {
+    const probe = tgCallCheck('So11111111111111111111111111111111111111112__probe');
+    const now = Math.floor(Date.now() / 1000);
+    if (probe.down) {
+      if (!_tgDownSince) _tgDownSince = now;
+      if (now - _tgDownNotifiedAt >= TG_DOWN_NOTIFY_SECS) {
+        _tgDownNotifiedAt = now;
+        const mins = Math.round((now - _tgDownSince) / 60);
+        sendTelegram(TOP1_SIGNAL_CHAT,
+          `\u26a0\ufe0f <b>SOL BOT — TELEGRAM CALL FEED DOWN</b>\n\n` +
+          `${probe.detail}\n` +
+          `Down for ~${mins}m.\n\n` +
+          `<b>All signals are being SUPPRESSED</b> (fail-closed): nothing fires without a call.\n` +
+          `Pending signals are still held and will fire if the feed returns while they qualify.\n\n` +
+          `Fix: check profit-tracker is running and writing ${TG_CALLS_FILE}.`);
+        log(`[TG] FEED DOWN ${mins}m — all signals suppressed (fail-closed)`);
+      }
+    } else if (_tgDownSince) {
+      const mins = Math.round((now - _tgDownSince) / 60);
+      sendTelegram(TOP1_SIGNAL_CHAT, `\u2705 <b>SOL BOT — call feed RECOVERED</b> after ~${mins}m. Signals re-enabled.`);
+      log(`[TG] feed recovered after ${mins}m`);
+      _tgDownSince = 0; _tgDownNotifiedAt = 0;
+    }
+  } catch (e) { log(`[TG] watchdog: ${e.message}`); }
+}, 60_000);
   connect();
   // Health = socket open AND at least half the wallets actually subscribed.
   // Half, not all, because a partial subscribe still detects most buys and we do
