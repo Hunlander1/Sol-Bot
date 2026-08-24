@@ -233,6 +233,18 @@ const WHALE_SIGNAL_CHAT   = process.env.WHALE_SIGNAL_CHAT || CLUSTER_SIGNAL_CHAT
 // holders, >=2 KOL holders, and at least ONE buy >= $500 from a TRACKED wallet.
 // NOTE this makes the signal no longer purely poll-driven — it now also needs a
 // tracked-wallet buy, so it depends on buy detection (BUY_MODE) being healthy.
+// ── AIRDROP FILTER (2026-08-21) ──
+// Holder count alone cannot tell a bought-into token from an airdropped one.
+// Two ratios do:
+//   1. MARKET CAP PER HOLDER — a real holder paid for something worth real money;
+//      airdrop recipients hold dust (observed on BSC: 278,569 holders on $28,648
+//      MC = $0.10 each; 1,210,331 on $56,755 = $0.05).
+//   2. HOLDERS PER BUY — every real holder generated a buy, so this sits near 1;
+//      an airdrop mints hundreds of thousands of holders from a few transactions.
+// Set either to 0 to disable that check.
+const WHALE_MIN_MC_PER_HOLDER   = parseFloat(process.env.WHALE_MIN_MC_PER_HOLDER || '10');
+const WHALE_MAX_HOLDERS_PER_BUY = parseFloat(process.env.WHALE_MAX_HOLDERS_PER_BUY || '3');
+const WHALE_MAX_HOLDERS         = parseInt(process.env.WHALE_MAX_HOLDERS || '100000', 10);
 const WHALE_MIN_SMART       = parseInt(process.env.WHALE_MIN_SMART || '2', 10);
 const WHALE_MIN_KOL         = parseInt(process.env.WHALE_MIN_KOL   || '2', 10);
 const WHALE_MIN_BIG_BUY_USD = parseFloat(process.env.WHALE_MIN_BIG_BUY_USD || '500');
@@ -857,6 +869,8 @@ async function refreshTrending() {
             ath:      parseFloat(t.history_highest_market_cap ?? 0) || 0,
             volume:   parseFloat(t.volume ?? 0) || 0,
             holders:  parseInt(t.holder_count ?? 0, 10) || 0,
+            buys:     parseInt(t.buys ?? 0, 10) || 0,
+            swaps:    parseInt(t.swaps ?? 0, 10) || 0,
             smart:    parseInt(t.smart_degen_count ?? 0, 10) || 0,
             kol:      parseInt(t.renowned_count ?? 0, 10) || 0,
             liquidity: parseFloat(t.liquidity ?? 0) || 0,
@@ -1011,6 +1025,21 @@ async function checkWhaleHolders(map) {
     if ((v.bestRank || 999) !== 1) continue;                    // #1 in >=1 interval
     if (!(v.created > 0)) continue;                             // need age; fail-closed
     if ((now - v.created) >= WHALE_MAX_AGE) continue;           // must be < 60 min old
+    // ── AIRDROP FILTERS ──
+    if (WHALE_MAX_HOLDERS > 0 && (v.holders || 0) > WHALE_MAX_HOLDERS) {
+      log(`[WHALE] SKIP ${v.symbol || addr.substring(0,8)} — ${v.holders.toLocaleString()} holders > ${WHALE_MAX_HOLDERS.toLocaleString()} (airdrop scale)`);
+      continue;
+    }
+    const _mcPerHolder = (v.holders > 0 && v.mc > 0) ? (v.mc / v.holders) : 0;
+    if (WHALE_MIN_MC_PER_HOLDER > 0 && _mcPerHolder < WHALE_MIN_MC_PER_HOLDER) {
+      log(`[WHALE] SKIP ${v.symbol || addr.substring(0,8)} — ${fmtUsd(_mcPerHolder)}/holder < ${fmtUsd(WHALE_MIN_MC_PER_HOLDER)} (${v.holders.toLocaleString()} holders on ${fmtUsd(v.mc)} MC — airdropped, not bought)`);
+      continue;
+    }
+    const _holdersPerBuy = (v.buys > 0) ? (v.holders / v.buys) : Infinity;
+    if (WHALE_MAX_HOLDERS_PER_BUY > 0 && _holdersPerBuy > WHALE_MAX_HOLDERS_PER_BUY) {
+      log(`[WHALE] SKIP ${v.symbol || addr.substring(0,8)} — ${_holdersPerBuy === Infinity ? 'no buys recorded' : _holdersPerBuy.toFixed(1) + ' holders per buy'} > ${WHALE_MAX_HOLDERS_PER_BUY} (holders did not buy in)`);
+      continue;
+    }
     // Smart-money / KOL floors. The 12g pool filter already asks GMGN for
     // min_smart_degen_count / min_renowned_count, so these are usually already
     // met — kept explicit so this signal holds its own floor even if
@@ -1030,17 +1059,27 @@ async function checkWhaleHolders(map) {
       log(`[WHALE] SKIP ${v.symbol || addr.substring(0,8)} — ${big.detail}`);
       continue;
     }
+    // TELEGRAM CALL GATE (added 2026-08-21 — this signal was missed when the gate
+    // went into the other three). No pending registry needed: whaleFired is NOT
+    // set on a miss and checkWhaleHolders re-runs every trending refresh, so the
+    // token is re-checked each cycle until it fires or ages past WHALE_MAX_AGE.
+    const tgw = tgCallCheck(addr);
+    if (!tgw.ok) {
+      log(`[WHALE] HOLD ${v.symbol || addr.substring(0,8)} — ${v.holders} holders + buys, but ${tgw.detail}`);
+      continue;
+    }
 
     whaleFired.add(addr);
     saveSet('/tmp/sol_whale_fired.json', whaleFired);
     const ageMin = Math.floor((now - v.created) / 60);
     const msg =
       `🐳 <b>WHALE HOLDER — ${v.symbol || '?'}</b>\n\n` +
-      `<b>Holders:</b> ${v.holders.toLocaleString()}\n` +
+      `<b>Holders:</b> ${v.holders.toLocaleString()} (${fmtUsd(_mcPerHolder)}/holder, ${_holdersPerBuy.toFixed(1)} per buy)\n` +
       `<b>Age:</b> ${ageMin}m\n` +
       `<b>Trending Rank:</b> #${v.bestRank} (best across intervals)\n` +
       `<b>Smart / KOL:</b> ${v.smart || 0} / ${v.kol || 0}\n` +
       `<b>Tracked Buys (${big.count}):</b> ${big.detail}\n` +
+      `<b>Telegram:</b> ${tgw.detail}\n` +
       `<b>Market Cap:</b> ${fmtUsd(v.mc || 0)}\n` +
       `<b>Contract:</b> <code>${addr}</code>\n\n` +
       `🔗 <a href="https://gmgn.ai/sol/token/${addr}">View on GMGN</a>`;
@@ -1910,7 +1949,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-21a ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-21c ═══`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
@@ -1920,7 +1959,7 @@ log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster(5w/$500/60m)=${ENAB
 // /v1/market/rank, so this line IS what the bot is asking GMGN for — no need to
 // read the source or guess which build is live.
 setInterval(() => { recheckPendingSignals().catch(e => log(`[ERR] recheck loop: ${e.message}`)); }, TG_RECHECK_SECS * 1000);
-log(`[START] TG call gate: ${TG_GATE_ENABLED ? 'ON' : 'OFF'} | feed=${TG_CALLS_FILE} | re-check every ${TG_RECHECK_SECS}s | fail-open if feed older than ${Math.round(TG_CALLS_MAX_STALE_SEC/60)}m`);
+log(`[START] TG call gate: ${TG_GATE_ENABLED ? 'ON' : 'OFF'} | ${TG_FAIL_OPEN ? 'FAIL-OPEN (fires unchecked if feed down)' : 'FAIL-CLOSED (no call = no signal)'} | feed=${TG_CALLS_FILE} | re-check every ${TG_RECHECK_SECS}s | feed considered down after ${Math.round(TG_CALLS_MAX_STALE_SEC/60)}m without a heartbeat`);
 log(`[START] Trending pool: order_by=volume desc | top${TREND_TOP_N} per interval | filters=[${TREND_FILTERS.join(', ') || 'none'}] | max_created=${TREND_MAX_CREATED || 'none'} | min_smart=${TREND_MIN_SMART} | min_kol=${TREND_MIN_KOL}`);
 log(`[START] #1 signal: rank 1 on [${TOP1_INTERVALS.join(', ')}] + >=${TOP1_MIN_BIG_BUYS} wallets each >= $${TOP1_MIN_BIG_BUY_USD} within ${Math.round(TOP1_BUY_WINDOW_MS/60000)}m | whale: >${WHALE_MIN_HOLDERS} holders + smart>=${WHALE_MIN_SMART} + kol>=${WHALE_MIN_KOL} + tracked buy >= $${WHALE_MIN_BIG_BUY_USD} within ${Math.round(WHALE_BUY_WINDOW_MS/60000)}m`);
 
