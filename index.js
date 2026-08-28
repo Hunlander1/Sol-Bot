@@ -206,7 +206,13 @@ const TOP1_SIGNAL_CHAT = process.env.TOP1_SIGNAL_CHAT || "-5305037806";
 // MASTER SWITCH: cluster signal. Default OFF (2026-08-05) to cut GMGN load while
 // isolating the rate-limit bans — bluechip + #1-everywhere stay on. Set
 // ENABLE_CLUSTER=1 in .env-vars to turn it back on (no code change needed).
-const ENABLE_CLUSTER = (process.env.ENABLE_CLUSTER || '1') === '1';   // re-enabled 2026-08-11 with revised rule
+const ENABLE_CLUSTER = (process.env.ENABLE_CLUSTER || '1') === '1';
+// Per-signal kill switches. Default ON, so setting nothing keeps today's
+// behaviour exactly. Set to 0 in .env-vars to silence a signal without touching
+// code — ENABLE_CLUSTER already covers cluster AND whale-holder, these two cover
+// the rest. With all of them off the bot still runs the FOMO signal.
+const ENABLE_TREND = (process.env.ENABLE_TREND || '1') === '1';   // bluechip trending
+const ENABLE_TOP1  = (process.env.ENABLE_TOP1  || '1') === '1';   // #1-everywhere   // re-enabled 2026-08-11 with revised rule
 const CLUSTER_MIN_WALLETS = parseInt(process.env.CLUSTER_MIN_WALLETS || '5', 10);   // 5+ wallets, each with a >=$500 buy
 // BUY DETECTION MODE (2026-08-11): 'POLL' = HTTP getSignaturesForAddress every
 // BUY_POLL_SECS (works on any free RPC — no WebSocket subscriptions, which every
@@ -1052,8 +1058,8 @@ async function refreshTrending() {
       if (TOP1_INTERVALS.every(iv => okSet.has(iv))) {
         // First full pass after boot primes SILENTLY (records current #1s without
         // alerting). Every pass after fires normally.
-        await checkTop1Everywhere(next, !top1Primed);
-        await checkWhaleHolders(next);   // async since 12h (prices a tracked buy)
+        if (ENABLE_TOP1) await checkTop1Everywhere(next, !top1Primed);
+        await checkWhaleHolders(next);   // async since 12h (prices a tracked buy); no-ops when ENABLE_CLUSTER is off
         top1Primed = true;
       }
       // Log how many of the trending tokens would actually qualify, so it's
@@ -1485,7 +1491,7 @@ async function sendTrendSignal(trackedWallet, tokenMint, tx) {
 // qualifies" is verified fresh rather than trusted from when it went pending.
 async function recheckPendingSignals() {
   // ── #1 TRENDING ──
-  for (const mint of Object.keys(pendingTop1)) {
+  for (const mint of (ENABLE_TOP1 ? Object.keys(pendingTop1) : [])) {
     try {
       if (top1Fired.has(mint)) { delete pendingTop1[mint]; continue; }
       const v = trendingMap.get(mint);
@@ -1513,7 +1519,7 @@ async function recheckPendingSignals() {
     }
   }
   // ── BLUECHIP ──
-  for (const mint of Object.keys(pendingTrend)) {
+  for (const mint of (ENABLE_TREND ? Object.keys(pendingTrend) : [])) {
     try {
       if (trendFired.has(mint)) { delete pendingTrend[mint]; continue; }
       const t = trendingMap.get(mint);
@@ -1916,7 +1922,7 @@ async function processBuySignature(signature, trackedWallet) {
   if (ENABLE_FOMO && isFomo) await checkFomoSignal(trackedWallet, mint, tx);
 
   // ── SIGNAL 1: Bluechip trending buy ──
-  if (isLegacy) await sendTrendSignal(trackedWallet, mint, tx);
+  if (ENABLE_TREND && isLegacy) await sendTrendSignal(trackedWallet, mint, tx);
 
   // Record EVERY legacy tracked buy for the whale-holder signal — independent of
   // the ENABLE_CLUSTER gate below, so the whale signal never depends on the
@@ -2215,7 +2221,7 @@ log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
 log(`[START] HTTP RPC chain: ${HTTP_RPC_NAMES.join(' -> ')} | buy-detection=${BUY_MODE}` + (BUY_MODE === 'POLL' ? `  <-- POLL makes ~${WALLETS.length} RPC calls every ${BUY_POLL_SECS}s against the FIRST endpoint` : ''));
-log(`[START] Signals: bluechip=ON, #1-everywhere=ON, cluster(5w/$500/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'}, whale-holder(>5k/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'} | buy-detection=${BUY_MODE}`);
+log(`[START] Signals: bluechip=${ENABLE_TREND ? 'ON' : 'OFF'}, #1-everywhere=${ENABLE_TOP1 ? 'ON' : 'OFF'}, cluster(5w/$500/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'}, whale-holder(>5k/60m)=${ENABLE_CLUSTER ? 'ON' : 'OFF'}, FOMO=${ENABLE_FOMO ? 'ON' : 'OFF'} | buy-detection=${BUY_MODE}`);
 // Print the exact trending-pool query config at boot. Everything below is sent to
 // /v1/market/rank, so this line IS what the bot is asking GMGN for — no need to
 // read the source or guess which build is live.
@@ -2229,11 +2235,17 @@ https.get('https://api.ipify.org?format=json', (res) => {
   res.on('end', () => { try { log(`[IP] ${JSON.parse(d).ip}`); } catch {} });
 }).on('error', () => {});
 
-// Prime the trending cache immediately, then refresh on a timer.
-refreshTrending().then(() => {
-  log(`[TREND] initial load: ${trendingMap.size} tokens`);
-});
-setInterval(refreshTrending, TREND_POLL_SECS * 1000);
+// Prime the trending cache immediately, then refresh on a timer — but only if a
+// signal still consumes it. The FOMO signal has no trending gate, so with the
+// legacy signals off this poller would be pure GMGN quota burn.
+if (ENABLE_TREND || ENABLE_TOP1 || ENABLE_CLUSTER) {
+  refreshTrending().then(() => {
+    log(`[TREND] initial load: ${trendingMap.size} tokens`);
+  });
+  setInterval(refreshTrending, TREND_POLL_SECS * 1000);
+} else {
+  log(`[TREND] poller OFF — no signal consumes trending (FOMO-only mode)`);
+}
 
 // ── HTTP BUY POLLER ───────────────────────────────────────────
 // Watches all wallets via getSignaturesForAddress over HTTP — the free-tier-safe
