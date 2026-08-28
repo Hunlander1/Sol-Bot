@@ -485,7 +485,15 @@ const FOMO_WALLETS = [
 // signal a buy counts toward is decided per buy by the two Sets below.
 const LEGACY_ADDR_SET = new Set(LEGACY_WALLETS);
 const FOMO_ADDR_SET   = new Set(FOMO_WALLETS);
-const WALLETS = [...new Set([...LEGACY_WALLETS, ...FOMO_WALLETS])];
+// Watch only the wallets a LIVE signal consumes. Subscribing to wallets nothing
+// reads is not free: the public RPC cuts the socket at ~100 logsSubscribe calls,
+// so carrying 94 unused legacy wallets alongside the 50 FOMO ones put us at 144
+// and the bot could never finish subscribing ("closed mid-subscribe at 101/144").
+const _needLegacy = ENABLE_TREND || ENABLE_TOP1 || ENABLE_CLUSTER;
+const WALLETS = [...new Set([
+  ...(_needLegacy ? LEGACY_WALLETS : []),
+  ...(ENABLE_FOMO ? FOMO_WALLETS   : []),
+])];
 const WALLET_SET = new Set(WALLETS);
 
 // Wallet name lookup — all known names
@@ -1071,7 +1079,7 @@ async function refreshTrending() {
         if (age <= TREND_MAX_TOKEN_AGE && v.bluechip > TREND_MIN_BLUECHIP) eligible++;
       }
       if (trendRefreshes % 10 === 1) {  // every ~5 min, not every 30s
-        log(`[TREND] refreshed: ${next.size} unique tokens across ${okIntervals}/${TREND_INTERVALS.length} intervals | ${eligible} currently meet age<${TREND_MAX_TOKEN_AGE/3600}h + bluechip>${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
+        log(`[TREND] refreshed: ${next.size} unique tokens across ${okSet.size}/${TREND_INTERVALS.length} intervals | ${eligible} currently meet age<${TREND_MAX_TOKEN_AGE/3600}h + bluechip>${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
       }
     } else {
       log(`[TREND] ⚠️ refresh returned NO tokens across all intervals — check GMGN auth / rate limit`);
@@ -2215,7 +2223,7 @@ http.createServer((req, res) => {
 
 // ── START ─────────────────────────────────────────────────────
 log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-28a ═══`);
-log(`[START] wallets: ${WALLETS.length} watched = ${LEGACY_ADDR_SET.size} legacy (bluechip/cluster/#1/whale) + ${FOMO_ADDR_SET.size} FOMO traders (FOMO signal only)`);
+log(`[START] wallets: ${WALLETS.length} watched = ${_needLegacy ? LEGACY_ADDR_SET.size : 0} legacy (bluechip/cluster/#1/whale)${_needLegacy ? '' : ' — SKIPPED, those signals are off'} + ${ENABLE_FOMO ? FOMO_ADDR_SET.size : 0} FOMO traders`);
 log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets entering within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | min buy ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any'} | chat ${FOMO_SIGNAL_CHAT}`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
