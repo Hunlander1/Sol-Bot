@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA COMBINED BOT
 //  ----------------------------------------------------------
-//  >>> VERSION: 2026-08-12b  (order_by stays 'volume' — 12a's change was wrong; adds hot_level capture) <<<
+//  >>> VERSION: 2026-08-28a  (FOMO trader list + 3-entry/24h-from-mint signal); prior: 2026-08-12b  (order_by stays 'volume' — 12a's change was wrong; adds hot_level capture) <<<
 //  ----------------------------------------------------------
 //  2026-08-12b: 12a switched the rank query from order_by:'volume' to 'default',
 //  reasoning that "rank by volume" wasn't "rank on GMGN's Trending tab". Direct
@@ -228,6 +228,17 @@ const CLUSTER_MIN_BIG_BUY_USD = parseFloat(process.env.CLUSTER_MIN_BIG_BUY_USD |
 const WHALE_MIN_HOLDERS   = parseInt(process.env.WHALE_MIN_HOLDERS || '5000', 10);
 const WHALE_MAX_AGE       = parseInt(process.env.WHALE_MAX_AGE || '3600', 10);   // < 60 min old
 const WHALE_SIGNAL_CHAT   = process.env.WHALE_SIGNAL_CHAT || CLUSTER_SIGNAL_CHAT; // cluster chat
+
+// ── SIGNAL 5: FOMO TRADER ENTRY ──────────────────────────────────────────────
+// FOMO_MIN_WALLETS distinct tracked wallets take an entry in the same token, and
+// every one of those entries lands within FOMO_MAX_MINT_AGE of the mint. No
+// trending / MC / volume gate — the wallets ARE the thesis. The Telegram-call
+// gate still applies, same as every other signal.
+const ENABLE_FOMO       = (process.env.ENABLE_FOMO || '1') === '1';
+const FOMO_MIN_WALLETS  = parseInt(process.env.FOMO_MIN_WALLETS || '3', 10);
+const FOMO_MAX_MINT_AGE = parseInt(process.env.FOMO_MAX_MINT_AGE || '86400', 10); // seconds from mint
+const FOMO_MIN_BUY_USD  = parseFloat(process.env.FOMO_MIN_BUY_USD || '0');        // 0 = any size
+const FOMO_SIGNAL_CHAT  = process.env.FOMO_SIGNAL_CHAT || '-5174318212';   // dedicated FOMO chat
 // WHALE HOLDER extra gates (added 2026-08-12 at N's request): on top of
 // >5000 holders + <60min + #1 trending, the token must ALSO have >=2 smart-money
 // holders, >=2 KOL holders, and at least ONE buy >= $500 from a TRACKED wallet.
@@ -344,7 +355,7 @@ function saveSet(path, set) {
 }
 
 // ── WALLETS ───────────────────────────────────────────────────
-const WALLETS = [
+const LEGACY_WALLETS = [
   "CzbN6T1gKkKutvuPXcxNmV8FLqzjsDWebWmg9o8e2ZbU","H8s4GoDcABkvykQSS7mUSHTSKUcxivoULUXgZDkjuoUf",
   "AmNMqM5VbPwtG14gLBdtrqZpQrhSzavLkQPufS8CQ7LB","AMRsSeU5JpqwQWJGNLMpZzRCZSFEwYQYbMnms3dD4311",
   "2bBRwhGoL4fRZk6g8NnhBZywsF8PdLJnBRfWDCEMogD2","6EDaVsS6enYgJ81tmhEkiKFcb4HuzPUVFZeom6PHUqN3",
@@ -406,10 +417,125 @@ const WALLETS = [
   "yMBRVpuVm7bgASPEvEhVtKTbz4g4UhNFEDz8kBmHAv1", // Notable 16
   "HmBmSYwYEgEZuBUYuDs9xofyqBAkw4ywugB1d7R7sTGh", // tobx
 ];
+// FOMO leaderboard traders (fomo.family), Solana side. Collected 2026-08-28.
+// ADDITIVE — these do NOT replace the list above. They feed exactly one signal,
+// the FOMO entry signal; the original signals still judge on LEGACY_WALLETS only.
+const FOMO_WALLETS = [
+  "DrXBn8eeRZXsc1h7qsj4V1W38at1sEynyZNC8mVrbuV5",  // AdmiralFinest
+  "H2QSGECp13sFLJgdTsDtayX3dk18Dm6sQMSQKcew7Xzk",  // AJC
+  "DVFYHVKFYLxws4bV97va6EceVRrKjddHSWYq3is4ad49",  // Altcoinist
+  "9BMzTpSo4URse1oN666pmexhdjpU1vA5p7LtroCFQdLU",  // Aurelius
+  "8xL8S7P4QLdTGRquHas8NP5EVjp2qUGbmSgrkh97mvmq",  // Avast
+  "HWYpE693cw8AWxHSynrHhUsKDbfzubAFYWpTcMZdNWKR",  // B The Bezel
+  "4ZZW5ePCAsHJdnHHUdgozdvLqYNVnkE9CgrW3iyZdskb",  // Bluntz
+  "F11mt2PsYTR7RF7hzfvFyeFbWREiCS3soa5pGbPX88Lb",  // bull.path
+  "GFRjGNXY8JrGSPC46inqrH4XPdUFMDLkE1oNm1nXiPsJ",  // Burgz
+  "J9WiAZKf8JnCkHFL8fLCCXdEgdoLjLRqU2EGsDjdqYga",  // Change
+  "HvkKCEUWFYK1ZdzoshDYFddLHoVyECwFReo9qxi6ioD7",  // Claymore
+  "FcTTjHafvSrXu11BLGBRsLoKGbVnLgkZxz3hACpwN4A8",  // Conviction
+  "6b5JivZqr5G8SCjgDQxqm8DgtiN4PufJRFS8yCWSFxRk",  // Cryptoolin
+  "9QXT3u8x98z2RaDzRacopXJpBYbKrkG3Sjck868jpDou",  // Dtrain22
+  "5FGoPPj1nL8LCnfVnpTmreqQtqLuMXXAwuS1uahMrp8V",  // DumbCrayonEater
+  "GpHkiRzoJDNPpDVgMx2E3xamrxogHKGaZg4HahQxhRVB",  // Dxrant
+  "2xUbYAVq1oJGj45d6JjnaYHAke3NQecUcqWvvVbwmYw8",  // Ethermonk
+  "5VRgqb2qbVqaWVGsM2k1b2bnPJk7up2xYbn4ziEjFgNt",  // Figaro
+  "DAejzMs5cUeCCENNvapy9KWFwzwegh7LvcgNkZ6hnf1y",  // FomoPumpGuy
+  "498g1rVnFcnjBjpfw1xyqA1WvgQXUU8RWuELjxkjAayQ",  // Frank
+  "C481ZKiw4TZGs4EjNkhm6TB7s17swzmqAmCcNm73vGnW",  // Guava Guy
+  "8QrAeBvyNj1f54pMwqKkxXXK95bStDZRcqGEcp3nSa4s",  // IKnowWhyy
+  "33vFB2rtG9FDpJReNaJrBF4RZgri5HTVo5gSxP1XfVCr",  // Insentos
+  "CBKJmhjDp7mxBYGAFWxCaPjD2BSJWpb4nQqnLd7rhSaM",  // InYourWalls
+  "EVqxB3F6iUBeWsTpBFQqWwxpqUS8s4NrzgxBvQ2VRbTq",  // Jack
+  "2QQFwT3QV1LrH9vvaUiGjhpNCmGqVDxRAkmGKvjruBUS",  // King
+  "EJ1izM56eBS5baVLk7Q4iaQvsgCPa3W5bZgc44wwHz8U",  // Kyle
+  "3qBVJLMAWXCbW3nhz99T99in82zZeUHkbDeSDJThbN4Z",  // Leo
+  "9EhcDGGJ6NpetxNumZKwD1o1kuHBwvfNGKrmS6zekP7C",  // LordArbiter
+  "GAsnqm4XkNkPVgrAofNQ65jWf8f3tKCLHhE9ZqSy2AP1",  // Nach
+  "DCeH3aCsstGUSxQqS72VBZwTydoor1nQ6dWaxrgGQk39",  // Nate
+  "2MxSnHSRgfEKLe9noU9wZSA3AYR9FnfgdrLefg7wCMC8",  // Onchainmetrics
+  "9zZCjLr9xfXfp3qdqvPh6YeaEaagepz21khLhca69B18",  // Paterniq
+  "2VR13Sh1zxPjP2ufj94CkzigTT9kokBV2Ffu1PqVegRf",  // Picadura
+  "HDixbrzwwLXczhDBk1JVrurPQsuLE8FUKnW2pucSXN3o",  // PoorGoat
+  "8f39XhhZoRD8sYb6K5K9N7iSHXkL7BDmFFQNDF3TtsEr",  // Qwerty
+  "CzU8MaRcwvwUoNkwJFLbvtFWJugcEXAhDDQqNFE4ybb7",  // Rowdy
+  "Ak6gsstZwaRDYKnzdyNg2HvCXDFvv21afjVix9VGRMQv",  // Rugdalio
+  "2GtmuqG31LuuWQmKzeK72YjH5iALPkJycuQaEQGsFzLw",  // SadCrissy
+  "2yXwy5Dsa1XtEXcsrkFVRJeyuWD3qKkMN3pP3p5VTW3V",  // Salem
+  "mDR91ufq4S2uSHa9E2PYL7xg4LwcQXaQFP7YK864a1z",  // Smol Intern
+  "5opd5KBmodmoNuAThQ5cmXKbRxHbQDfomWGKAs3uEUP9",  // Soby
+  "m4CkbwCZbbmEXB2EJhzQmAVX5LikLsyTozqwxXA9wEk",  // Still in the game
+  "CpKuhcFHogvrq7Fx3enu57xTRkh1WyzER1TVVBimC5mo",  // Swizzle
+  "4ugDhHJ8XDXAeABmrNmGffFaLbJb9BkPyiFGVSV9ocwo",  // TheSolstice
+  "9QuHMjmYXxhqCPmNYnrjviD5SPNbFnXCt8SYDcZnhq8q",  // TrenchHog
+  "2heJbC32Tpfcb3nbUb5ER61K11FGZVfVGtVnDm6LDogF",  // Unipcs
+  "F5hkYsi8JxjyA2JHN5CA7MbnnhWubkXB2ZQB7Gkaxqs6",  // Vee
+  "26W5Tq8LUTWct7pWbAHsmvsxQkXxPghbdwXj6MYiwQLU",  // Vydamo
+  "7iPPqPyrqcmfenRs4xZ72ab4pyuUofXB5YaQB83WJmT9",  // Wood
+];
+// The two lists drive DIFFERENT signals and are deliberately not merged into one
+// pool. LEGACY_WALLETS keep feeding the signals they have always fed (bluechip,
+// cluster, #1-trending, whale); FOMO_WALLETS feed ONLY the FOMO entry signal.
+// WALLETS is just the union — the addresses worth watching on-chain. Which
+// signal a buy counts toward is decided per buy by the two Sets below.
+const LEGACY_ADDR_SET = new Set(LEGACY_WALLETS);
+const FOMO_ADDR_SET   = new Set(FOMO_WALLETS);
+const WALLETS = [...new Set([...LEGACY_WALLETS, ...FOMO_WALLETS])];
 const WALLET_SET = new Set(WALLETS);
 
 // Wallet name lookup — all known names
 const WALLET_NAMES = {
+  // ── FOMO leaderboard traders (2026-08-28) ──
+  "DrXBn8eeRZXsc1h7qsj4V1W38at1sEynyZNC8mVrbuV5": "AdmiralFinest",
+  "H2QSGECp13sFLJgdTsDtayX3dk18Dm6sQMSQKcew7Xzk": "AJC",
+  "DVFYHVKFYLxws4bV97va6EceVRrKjddHSWYq3is4ad49": "Altcoinist",
+  "9BMzTpSo4URse1oN666pmexhdjpU1vA5p7LtroCFQdLU": "Aurelius",
+  "8xL8S7P4QLdTGRquHas8NP5EVjp2qUGbmSgrkh97mvmq": "Avast",
+  "HWYpE693cw8AWxHSynrHhUsKDbfzubAFYWpTcMZdNWKR": "B The Bezel",
+  "4ZZW5ePCAsHJdnHHUdgozdvLqYNVnkE9CgrW3iyZdskb": "Bluntz",
+  "F11mt2PsYTR7RF7hzfvFyeFbWREiCS3soa5pGbPX88Lb": "bull.path",
+  "GFRjGNXY8JrGSPC46inqrH4XPdUFMDLkE1oNm1nXiPsJ": "Burgz",
+  "J9WiAZKf8JnCkHFL8fLCCXdEgdoLjLRqU2EGsDjdqYga": "Change",
+  "HvkKCEUWFYK1ZdzoshDYFddLHoVyECwFReo9qxi6ioD7": "Claymore",
+  "FcTTjHafvSrXu11BLGBRsLoKGbVnLgkZxz3hACpwN4A8": "Conviction",
+  "6b5JivZqr5G8SCjgDQxqm8DgtiN4PufJRFS8yCWSFxRk": "Cryptoolin",
+  "9QXT3u8x98z2RaDzRacopXJpBYbKrkG3Sjck868jpDou": "Dtrain22",
+  "5FGoPPj1nL8LCnfVnpTmreqQtqLuMXXAwuS1uahMrp8V": "DumbCrayonEater",
+  "GpHkiRzoJDNPpDVgMx2E3xamrxogHKGaZg4HahQxhRVB": "Dxrant",
+  "2xUbYAVq1oJGj45d6JjnaYHAke3NQecUcqWvvVbwmYw8": "Ethermonk",
+  "5VRgqb2qbVqaWVGsM2k1b2bnPJk7up2xYbn4ziEjFgNt": "Figaro",
+  "DAejzMs5cUeCCENNvapy9KWFwzwegh7LvcgNkZ6hnf1y": "FomoPumpGuy",
+  "498g1rVnFcnjBjpfw1xyqA1WvgQXUU8RWuELjxkjAayQ": "Frank",
+  "C481ZKiw4TZGs4EjNkhm6TB7s17swzmqAmCcNm73vGnW": "Guava Guy",
+  "8QrAeBvyNj1f54pMwqKkxXXK95bStDZRcqGEcp3nSa4s": "IKnowWhyy",
+  "33vFB2rtG9FDpJReNaJrBF4RZgri5HTVo5gSxP1XfVCr": "Insentos",
+  "CBKJmhjDp7mxBYGAFWxCaPjD2BSJWpb4nQqnLd7rhSaM": "InYourWalls",
+  "EVqxB3F6iUBeWsTpBFQqWwxpqUS8s4NrzgxBvQ2VRbTq": "Jack",
+  "2QQFwT3QV1LrH9vvaUiGjhpNCmGqVDxRAkmGKvjruBUS": "King",
+  "EJ1izM56eBS5baVLk7Q4iaQvsgCPa3W5bZgc44wwHz8U": "Kyle",
+  "3qBVJLMAWXCbW3nhz99T99in82zZeUHkbDeSDJThbN4Z": "Leo",
+  "9EhcDGGJ6NpetxNumZKwD1o1kuHBwvfNGKrmS6zekP7C": "LordArbiter",
+  "GAsnqm4XkNkPVgrAofNQ65jWf8f3tKCLHhE9ZqSy2AP1": "Nach",
+  "DCeH3aCsstGUSxQqS72VBZwTydoor1nQ6dWaxrgGQk39": "Nate",
+  "2MxSnHSRgfEKLe9noU9wZSA3AYR9FnfgdrLefg7wCMC8": "Onchainmetrics",
+  "9zZCjLr9xfXfp3qdqvPh6YeaEaagepz21khLhca69B18": "Paterniq",
+  "2VR13Sh1zxPjP2ufj94CkzigTT9kokBV2Ffu1PqVegRf": "Picadura",
+  "HDixbrzwwLXczhDBk1JVrurPQsuLE8FUKnW2pucSXN3o": "PoorGoat",
+  "8f39XhhZoRD8sYb6K5K9N7iSHXkL7BDmFFQNDF3TtsEr": "Qwerty",
+  "CzU8MaRcwvwUoNkwJFLbvtFWJugcEXAhDDQqNFE4ybb7": "Rowdy",
+  "Ak6gsstZwaRDYKnzdyNg2HvCXDFvv21afjVix9VGRMQv": "Rugdalio",
+  "2GtmuqG31LuuWQmKzeK72YjH5iALPkJycuQaEQGsFzLw": "SadCrissy",
+  "2yXwy5Dsa1XtEXcsrkFVRJeyuWD3qKkMN3pP3p5VTW3V": "Salem",
+  "mDR91ufq4S2uSHa9E2PYL7xg4LwcQXaQFP7YK864a1z": "Smol Intern",
+  "5opd5KBmodmoNuAThQ5cmXKbRxHbQDfomWGKAs3uEUP9": "Soby",
+  "m4CkbwCZbbmEXB2EJhzQmAVX5LikLsyTozqwxXA9wEk": "Still in the game",
+  "CpKuhcFHogvrq7Fx3enu57xTRkh1WyzER1TVVBimC5mo": "Swizzle",
+  "4ugDhHJ8XDXAeABmrNmGffFaLbJb9BkPyiFGVSV9ocwo": "TheSolstice",
+  "9QuHMjmYXxhqCPmNYnrjviD5SPNbFnXCt8SYDcZnhq8q": "TrenchHog",
+  "2heJbC32Tpfcb3nbUb5ER61K11FGZVfVGtVnDm6LDogF": "Unipcs",
+  "F5hkYsi8JxjyA2JHN5CA7MbnnhWubkXB2ZQB7Gkaxqs6": "Vee",
+  "26W5Tq8LUTWct7pWbAHsmvsxQkXxPghbdwXj6MYiwQLU": "Vydamo",
+  "7iPPqPyrqcmfenRs4xZ72ab4pyuUofXB5YaQB83WJmT9": "Wood",
+  // ── legacy ──
   "CzbN6T1gKkKutvuPXcxNmV8FLqzjsDWebWmg9o8e2ZbU": "Income Dev",
   "HiSo5kykqDPs3EG14Fk9QY4B5RvkuEs8oJTiqPX3EDAn": "CL1 Dev",
   "8ZN71XTdVo8yRovnGLmNgW3Tgniw6A4J3JGLvPD686FP": "nate91 Dev",
@@ -540,6 +666,12 @@ let pendingTrend = {};   // mint -> { buyerName, since }
 let _tgCache = { mtime: -1, data: null };
 let clusterFired    = loadSet('/tmp/sol_cluster_fired.json');  // tokens that already fired the cluster signal
 let whaleFired      = loadSet('/tmp/sol_whale_fired.json');    // tokens that already fired the whale-holder signal
+let fomoFired       = loadSet('/tmp/sol_fomo_fired.json');     // tokens that already fired the FOMO-trader signal
+// fomoBuyers: mint -> Map(wallet -> { ts, sol })
+// Separate from clusterBuyers (no timestamps, cleared wholesale) and from
+// trackedBuysWhale (pruned at 60m) because this signal needs a 24h memory: a
+// token minted this morning can collect its third entry tonight.
+let fomoBuyers      = {};
 let walletEventTimes = {};        // wallet -> recent event timestamps (ms), flood throttle
 const processing    = new Set();  // synchronous guard against duplicate concurrent signals
 
@@ -1773,19 +1905,137 @@ async function processBuySignature(signature, trackedWallet) {
     setTimeout(() => delete devWalletCache[mint], 600000);
   }
 
-  // ── SIGNAL 1: Bluechip trending buy ──
-  await sendTrendSignal(trackedWallet, mint, tx);
+  // Which signals may this buy count toward? A legacy wallet feeds the original
+  // signals; a FOMO wallet feeds only the FOMO entry signal. Keeping the pools
+  // separate is the point — merging them would silently change what the existing
+  // signals mean.
+  const isLegacy = LEGACY_ADDR_SET.has(trackedWallet);
+  const isFomo   = FOMO_ADDR_SET.has(trackedWallet);
 
-  // Record EVERY tracked buy for the whale-holder signal — unconditionally, and
-  // BEFORE the ENABLE_CLUSTER gate below, so the whale signal never depends on
-  // the cluster being enabled. extractSolSpent is free (no network).
-  try {
-    if (!trackedBuysWhale[mint]) trackedBuysWhale[mint] = new Map();
-    trackedBuysWhale[mint].set(trackedWallet, { ts: Date.now(), sol: extractSolSpent(tx, trackedWallet) });
-  } catch (e) { /* never let bookkeeping break the buy path */ }
+  // ── SIGNAL 5: FOMO trader entry ──
+  if (ENABLE_FOMO && isFomo) await checkFomoSignal(trackedWallet, mint, tx);
+
+  // ── SIGNAL 1: Bluechip trending buy ──
+  if (isLegacy) await sendTrendSignal(trackedWallet, mint, tx);
+
+  // Record EVERY legacy tracked buy for the whale-holder signal — independent of
+  // the ENABLE_CLUSTER gate below, so the whale signal never depends on the
+  // cluster being enabled. extractSolSpent is free (no network). FOMO wallets are
+  // excluded on purpose: this store also feeds the #1-trending gate, and letting
+  // FOMO traders count there would quietly change what that signal means.
+  if (isLegacy) {
+    try {
+      if (!trackedBuysWhale[mint]) trackedBuysWhale[mint] = new Map();
+      trackedBuysWhale[mint].set(trackedWallet, { ts: Date.now(), sol: extractSolSpent(tx, trackedWallet) });
+    } catch (e) { /* never let bookkeeping break the buy path */ }
+  }
 
   // ── SIGNAL 2: 8-wallet cluster ──
-  if (ENABLE_CLUSTER) await checkClusterSignal(trackedWallet, mint, tx);
+  if (ENABLE_CLUSTER && isLegacy) await checkClusterSignal(trackedWallet, mint, tx);
+}
+
+// ── SIGNAL 5: FOMO TRADER ENTRY ───────────────────────────────
+// FOMO_MIN_WALLETS of the tracked wallets take an entry in the same mint, every
+// one of them inside FOMO_MAX_MINT_AGE of the token's mint time. Fires once per
+// mint, gated on a Telegram call like every other signal.
+async function checkFomoSignal(trackedWallet, mint, tx) {
+  try {
+    if (fomoFired.has(mint)) return;
+
+    if (!fomoBuyers[mint]) fomoBuyers[mint] = new Map();
+    const bucket = fomoBuyers[mint];
+    // Keep the FIRST entry per wallet. A trader adding again later must not drag
+    // their own timestamp past the 24h line and disqualify a buy that was in time.
+    if (!bucket.has(trackedWallet)) {
+      bucket.set(trackedWallet, { ts: Date.now(), sol: extractSolSpent(tx, trackedWallet) });
+    }
+    log(`[FOMO] ${walletName(trackedWallet)} — ${mint.substring(0,8)} — ${bucket.size}/${FOMO_MIN_WALLETS} traders`);
+    if (bucket.size < FOMO_MIN_WALLETS) return;
+
+    // Mint time, fetched only once the threshold is reached — a token that never
+    // gets there costs no API call.
+    const info = await getCachedTokenInfo(mint);
+    const created = parseInt(info?.creation_timestamp ?? 0, 10) || 0;
+    if (!(created > 0)) {
+      log(`[FOMO] SKIP ${mint.substring(0,8)} — no creation timestamp`);
+      return;
+    }
+
+    // Every qualifying entry must have landed within FOMO_MAX_MINT_AGE of mint.
+    // Buys are stamped when detected, so this is the age the token actually was.
+    const inTime = [];
+    const late = [];
+    for (const [w, rec] of bucket) {
+      const ageAtBuy = Math.floor(rec.ts / 1000) - created;
+      rec.ageAtBuy = ageAtBuy;
+      rec.wallet = w;
+      if (ageAtBuy <= FOMO_MAX_MINT_AGE) inTime.push(rec);
+      else late.push(`${walletName(w)} ${fmtAge(ageAtBuy)}`);
+    }
+    if (inTime.length < FOMO_MIN_WALLETS) {
+      log(`[FOMO] SKIP ${mint.substring(0,8)} — ${bucket.size} traders but only ${inTime.length} within ${fmtAge(FOMO_MAX_MINT_AGE)} of mint (late: ${late.join(', ') || 'none'})`);
+      return;
+    }
+
+    // Optional size floor. 0 (the default) means "any entry counts" and skips the
+    // price lookup entirely. FAIL-OPEN per wallet: an unparseable buy or a dead
+    // price feed qualifies rather than silently suppressing a real entry.
+    const solPrice = await getSolPriceUsd();
+    for (const rec of inTime) {
+      rec.usd = (rec.sol === null || rec.sol === undefined || !(solPrice > 0)) ? null : rec.sol * solPrice;
+    }
+    const sized = FOMO_MIN_BUY_USD > 0
+      ? inTime.filter(rec => rec.usd === null || rec.usd >= FOMO_MIN_BUY_USD)
+      : inTime;
+    if (sized.length < FOMO_MIN_WALLETS) {
+      log(`[FOMO] SKIP ${mint.substring(0,8)} — ${inTime.length} in time, only ${sized.length} >= ${fmtUsd(FOMO_MIN_BUY_USD)}`);
+      return;
+    }
+
+    // TELEGRAM CALL GATE. No call yet -> do NOT mark fired and do NOT clear the
+    // bucket, so the next entry on this mint re-runs this and re-checks.
+    const tg = tgCallCheck(mint);
+    if (!tg.ok) {
+      log(`[FOMO] PENDING ${mint.substring(0,8)} — ${sized.length} traders in, waiting on a telegram call (re-checks on the next entry)`);
+      return;
+    }
+
+    fomoFired.add(mint);
+    saveSet('/tmp/sol_fomo_fired.json', fomoFired);
+    delete fomoBuyers[mint];
+
+    const symbol = info?.symbol ?? 'UNKNOWN';
+    const mc     = tokenMarketCap(info);
+    const mcStr  = mc > 0 ? fmtUsd(mc) : 'N/A';
+    const age    = Math.floor(Date.now()/1000) - created;
+    // Earliest entry first — who got there first is the interesting part.
+    const ordered = [...sized].sort((a, b) => (a.ageAtBuy ?? 0) - (b.ageAtBuy ?? 0));
+    const buyerList = ordered.map(r =>
+      `  \u2022 ${walletName(r.wallet)} — ${fmtAge(r.ageAtBuy)} after mint` +
+      (r.usd === null ? '' : ` (${fmtUsd(r.usd)})`)
+    ).join('\n');
+    const signalTime = new Date().toLocaleTimeString('en-US', {
+      timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+    });
+
+    sendTelegram(FOMO_SIGNAL_CHAT,
+      `\u{1F3AF} <b>${ordered.length} FOMO Traders Entered — ${symbol}</b>\n\n` +
+      `Contract: <code>${mint}</code>\n\n` +
+      `Traders: <b>${ordered.length}</b> (all within ${fmtAge(FOMO_MAX_MINT_AGE)} of mint)\n` +
+      `Chain: Solana\n` +
+      `Token Age: ${fmtAge(age)}\n` +
+      `Market Cap: ${mcStr}\n` +
+      `Telegram: ${tg.detail}\n` +
+      (tg.stale ? '\u26a0\ufe0f call gate NOT enforced — feed unavailable\n' : '') +
+      `\n` +
+      `<b>Entered by:</b>\n${buyerList}\n\n` +
+      `Signal Time: ${signalTime}\n\n` +
+      `\u{1F517} <a href="https://gmgn.ai/sol/token/${mint}">View on GMGN</a>`
+    );
+    log(`[FOMO] \u{1F525} FIRED ${symbol} ${mint.substring(0,8)} — ${ordered.length} traders | age ${fmtAge(age)}`);
+  } catch (e) {
+    log(`[FOMO] error on ${mint?.substring(0,8)}: ${e.message}`);
+  }
 }
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
@@ -1870,6 +2120,15 @@ setInterval(() => {
   if (clusterFired.size > 20000) { clusterFired.clear(); saveSet('/tmp/sol_cluster_fired.json', clusterFired); log(`[CLEANUP] clusterFired cleared`); }
   if (whaleFired.size > 20000) { whaleFired.clear(); saveSet('/tmp/sol_whale_fired.json', whaleFired); log(`[CLEANUP] whaleFired cleared`); }
   if (Object.keys(clusterBuyers).length > 20000) { clusterBuyers = {}; log(`[CLEANUP] clusterBuyers cleared`); }
+  // Prune fomoBuyers. An entry only matters while the token can still be under
+  // FOMO_MAX_MINT_AGE; drop at 2x that so a token minted just before a restart
+  // can still complete its set.
+  for (const mint of Object.keys(fomoBuyers)) {
+    const fb = fomoBuyers[mint];
+    for (const [w, rec] of fb) { if (Date.now() - rec.ts > FOMO_MAX_MINT_AGE * 2000) fb.delete(w); }
+    if (fb.size === 0) delete fomoBuyers[mint];
+  }
+  if (fomoFired.size > 20000) { fomoFired.clear(); saveSet('/tmp/sol_fomo_fired.json', fomoFired); log(`[CLEANUP] fomoFired cleared`); }
   // Prune trackedBuysWhale by its own time window (not by size) so entries expire
   // predictably and the whale gate never reads a stale buy.
   {
@@ -1949,7 +2208,9 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000, () => log(`[HTTP] Health server on port ${process.env.PORT || 3000}`));
 
 // ── START ─────────────────────────────────────────────────────
-log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-21c ═══`);
+log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-28a ═══`);
+log(`[START] wallets: ${WALLETS.length} watched = ${LEGACY_ADDR_SET.size} legacy (bluechip/cluster/#1/whale) + ${FOMO_ADDR_SET.size} FOMO traders (FOMO signal only)`);
+log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets entering within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | min buy ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any'} | chat ${FOMO_SIGNAL_CHAT}`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
