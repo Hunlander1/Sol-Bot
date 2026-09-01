@@ -698,6 +698,14 @@ let fomoBuyers      = {};
 // sit unseen until a fourth trader happened to buy — which with a 24h window may
 // never happen.
 let pendingFomo     = {};
+// Mints the FOMO signal can never fire on again, so we stop paying for them.
+//   "old"  — the mint is already older than FOMO_MAX_MINT_AGE, so no future buy
+//            can land within 24h of it. Permanent.
+//   "nots" — GMGN has no creation timestamp for it. Retried hourly in case GMGN
+//            backfills, rather than written off forever.
+// Without this, an airdropped token held by many tracked wallets costs one GMGN
+// lookup and one log line PER WALLET, PER POLL, forever.
+let fomoDead        = {};   // mint -> { reason, until }
 let walletEventTimes = {};        // wallet -> recent event timestamps (ms), flood throttle
 const processing    = new Set();  // synchronous guard against duplicate concurrent signals
 
@@ -2015,9 +2023,15 @@ async function processBuySignature(signature, trackedWallet) {
 // FOMO_MIN_WALLETS of the tracked wallets take an entry in the same mint, every
 // one of them inside FOMO_MAX_MINT_AGE of the token's mint time. Fires once per
 // mint, gated on a Telegram call like every other signal.
+function fomoIsDead(mint) {
+  const d = fomoDead[mint];
+  if (!d) return false;
+  if (d.until && Date.now() > d.until) { delete fomoDead[mint]; return false; }
+  return true;
+}
 async function checkFomoSignal(trackedWallet, mint, tx) {
   try {
-    if (fomoFired.has(mint)) return;
+    if (fomoFired.has(mint) || fomoIsDead(mint)) return;
 
     if (!fomoBuyers[mint]) fomoBuyers[mint] = new Map();
     const bucket = fomoBuyers[mint];
@@ -2037,7 +2051,19 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
     const info = await getCachedTokenInfo(mint);
     const created = parseInt(info?.creation_timestamp ?? 0, 10) || 0;
     if (!(created > 0)) {
-      log(`[FOMO] SKIP ${mint.substring(0,8)} — no creation timestamp`);
+      fomoDead[mint] = { reason: 'no creation timestamp', until: Date.now() + 3600_000 };
+      log(`[FOMO] SKIP ${mint.substring(0,8)} — no creation timestamp (not retrying for 1h)`);
+      return;
+    }
+
+    // If the MINT is already past the window, no future buy can qualify. Retire it
+    // once instead of re-deciding on every wallet that holds it.
+    const mintAgeNow = Math.floor(Date.now() / 1000) - created;
+    if (mintAgeNow > FOMO_MAX_MINT_AGE) {
+      fomoDead[mint] = { reason: 'minted too long ago', until: 0 };
+      delete fomoBuyers[mint];
+      delete pendingFomo[mint];
+      log(`[FOMO] RETIRED ${info?.symbol ?? mint.substring(0,8)} — minted ${fmtAge(mintAgeNow)} ago, past the ${fmtAge(FOMO_MAX_MINT_AGE)} window; no further checks`);
       return;
     }
 
@@ -2232,6 +2258,10 @@ setInterval(() => {
   // Prune fomoBuyers. An entry only matters while the token can still be under
   // FOMO_MAX_MINT_AGE; drop at 2x that so a token minted just before a restart
   // can still complete its set.
+  for (const m of Object.keys(fomoDead)) {
+    const d = fomoDead[m];
+    if (d && d.until && Date.now() > d.until) delete fomoDead[m];
+  }
   for (const mint of Object.keys(fomoBuyers)) {
     const fb = fomoBuyers[mint];
     for (const [w, rec] of fb) { if (Date.now() - rec.ts > FOMO_MAX_MINT_AGE * 2000) fb.delete(w); }
