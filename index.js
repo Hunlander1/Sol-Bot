@@ -241,10 +241,17 @@ const WHALE_SIGNAL_CHAT   = process.env.WHALE_SIGNAL_CHAT || CLUSTER_SIGNAL_CHAT
 // trending / MC / volume gate — the wallets ARE the thesis. The Telegram-call
 // gate still applies, same as every other signal.
 const ENABLE_FOMO       = (process.env.ENABLE_FOMO || '1') === '1';
-const FOMO_MIN_WALLETS  = parseInt(process.env.FOMO_MIN_WALLETS || '3', 10);
+const FOMO_MIN_WALLETS  = parseInt(process.env.FOMO_MIN_WALLETS || '2', 10);
 const FOMO_MAX_MINT_AGE = parseInt(process.env.FOMO_MAX_MINT_AGE || '86400', 10); // seconds from mint
 const FOMO_MIN_BUY_USD  = parseFloat(process.env.FOMO_MIN_BUY_USD || '0');        // 0 = any size
 const FOMO_SIGNAL_CHAT  = process.env.FOMO_SIGNAL_CHAT || '-5174318212';   // dedicated FOMO chat
+// How many DISTINCT telegram channels must have called the mint. 1 = the old
+// behaviour (any single call). 2+ means two independent channels.
+const FOMO_MIN_CALLS    = parseInt(process.env.FOMO_MIN_CALLS || '2', 10);
+// Count "$TICKER" calls toward the gate, not just mints. Requires a tracker new
+// enough to write a `tickers` map into the feed; harmless without one.
+const TG_MATCH_TICKERS  = (process.env.TG_MATCH_TICKERS || '1') === '1';
+const TG_TICKER_MIN_LEN = parseInt(process.env.TG_TICKER_MIN_LEN || '3', 10);
 // WHALE HOLDER extra gates (added 2026-08-12 at N's request): on top of
 // >5000 holders + <60min + #1 trending, the token must ALSO have >=2 smart-money
 // holders, >=2 KOL holders, and at least ONE buy >= $500 from a TRACKED wallet.
@@ -686,6 +693,11 @@ let fomoFired       = loadSet('/tmp/sol_fomo_fired.json');     // tokens that al
 // trackedBuysWhale (pruned at 60m) because this signal needs a 24h memory: a
 // token minted this morning can collect its third entry tonight.
 let fomoBuyers      = {};
+// FOMO signals that are on-chain complete but short of telegram calls. Without a
+// registry + timer, a second channel calling AFTER the third trader bought would
+// sit unseen until a fourth trader happened to buy — which with a 24h window may
+// never happen.
+let pendingFomo     = {};
 let walletEventTimes = {};        // wallet -> recent event timestamps (ms), flood throttle
 const processing    = new Set();  // synchronous guard against duplicate concurrent signals
 
@@ -1119,17 +1131,68 @@ function readTgCalls() {
 // A FRESH feed that simply lacks the mint is a real "no call" => ok:false.
 // CASE: Solana mints are base58 and CASE-SENSITIVE — the tracker stores them
 // with exact case, so we look up exactly. (Only EVM addresses get lowercased.)
-function tgCallCheck(mint) {
+// Was this mint called in telegram, by enough distinct channels?
+//
+//   minChannels — how many DISTINCT channels must have called it. 1 (the default)
+//                 is the original behaviour: any single call opens the gate.
+//   symbol      — the token's ticker. Plenty of channels call a token as
+//                 "$ROBINCAT" and never post the mint, so those calls are
+//                 invisible if we only match addresses. When a symbol is given,
+//                 channels that called the CASHTAG are unioned with channels that
+//                 called the mint, and the threshold applies to the union. One
+//                 channel posting both still counts once.
+//
+// Cashtags are ambiguous — two tokens can share a ticker. Tolerable here because
+// this gate only ADDS evidence on top of the bot's own on-chain conditions.
+function tgCallCheck(mint, minChannels = 1, symbol = null) {
   if (!TG_GATE_ENABLED) return { ok: true, stale: false, detail: 'gate disabled' };
   const feed = readTgCalls();
   if (!feed) return { ok: TG_FAIL_OPEN, stale: true, down: true, detail: 'call feed unavailable — tracker down' };
   const age = Math.floor(Date.now() / 1000) - (parseInt(feed.updated, 10) || 0);
   const e = (feed.calls || {})[mint];
+
+  const chanSet = new Set();
+  let caCount = 0, tickerCount = 0, tickerName = null, firstTs = 0;
   if (e) {
-    const chans = (e.channels || []).slice(0, 3).join(', ');
-    const mins = Math.max(0, Math.floor((Date.now() / 1000 - (e.first || 0)) / 60));
-    return { ok: true, stale: false, detail: `${e.count} call(s) — ${chans}${(e.channels || []).length > 3 ? ' +more' : ''} (first ${mins}m ago)` };
+    caCount = e.count || 0;
+    firstTs = e.first || 0;
+    const list = e.channels || [];
+    // Older entries may predate channel tracking; count them as one, not zero.
+    if (list.length) for (const c of list) chanSet.add(c);
+    else if (caCount > 0) chanSet.add('(channel unrecorded)');
   }
+  if (TG_MATCH_TICKERS && symbol) {
+    const t = String(symbol).replace(/^\$/, '').trim().toUpperCase();
+    if (t.length >= TG_TICKER_MIN_LEN) {
+      const te = (feed.tickers || {})[t];
+      if (te) {
+        tickerCount = te.count || 0;
+        tickerName = t;
+        if (!firstTs || (te.first && te.first < firstTs)) firstTs = te.first || firstTs;
+        for (const c of (te.channels || [])) chanSet.add(c);
+      }
+    }
+  }
+
+  const nChans = chanSet.size;
+  const need = Math.max(1, minChannels);
+  if (nChans > 0) {
+    const names = [...chanSet];
+    const chans = names.slice(0, 3).join(', ') + (names.length > 3 ? ' +more' : '');
+    if (nChans < need) {
+      return { ok: false, stale: false, channels: nChans,
+               detail: `only ${nChans}/${need} channels called it — ${chans}` };
+    }
+    const parts = [];
+    if (caCount) parts.push(`${caCount} by contract`);
+    if (tickerCount) parts.push(`${tickerCount} by $${tickerName}`);
+    const mins = firstTs ? Math.max(0, Math.floor((Date.now() / 1000 - firstTs) / 60)) : null;
+    return { ok: true, stale: false, channels: nChans,
+             detail: `${parts.join(' + ')} across ${nChans} channel(s) — ${chans}${mins === null ? '' : ` (first ${mins}m ago)`}` };
+  }
+
+  // Nothing called it. Distinguish "genuinely uncalled" from "the tracker died",
+  // because fail-open only applies to the second.
   if (age > TG_CALLS_MAX_STALE_SEC) {
     return { ok: TG_FAIL_OPEN, stale: true, down: true, detail: `call feed stale ${Math.round(age / 60)}m — tracker down` };
   }
@@ -1961,7 +2024,10 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
     // Keep the FIRST entry per wallet. A trader adding again later must not drag
     // their own timestamp past the 24h line and disqualify a buy that was in time.
     if (!bucket.has(trackedWallet)) {
-      bucket.set(trackedWallet, { ts: Date.now(), sol: extractSolSpent(tx, trackedWallet) });
+      // tx is null when the pending re-check re-enters; that path only reaches
+      // here for wallets already in the bucket, but guard it so a future caller
+      // can't blow up on a missing tx.
+      bucket.set(trackedWallet, { ts: Date.now(), sol: tx ? extractSolSpent(tx, trackedWallet) : null });
     }
     log(`[FOMO] ${walletName(trackedWallet)} — ${mint.substring(0,8)} — ${bucket.size}/${FOMO_MIN_WALLETS} traders`);
     if (bucket.size < FOMO_MIN_WALLETS) return;
@@ -2008,11 +2074,15 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
 
     // TELEGRAM CALL GATE. No call yet -> do NOT mark fired and do NOT clear the
     // bucket, so the next entry on this mint re-runs this and re-checks.
-    const tg = tgCallCheck(mint);
+    const tg = tgCallCheck(mint, FOMO_MIN_CALLS, info?.symbol);
     if (!tg.ok) {
-      log(`[FOMO] PENDING ${mint.substring(0,8)} — ${sized.length} traders in, waiting on a telegram call (re-checks on the next entry)`);
+      if (!pendingFomo[mint]) {
+        pendingFomo[mint] = { since: Date.now(), symbol: info?.symbol || null };
+        log(`[FOMO] PENDING ${mint.substring(0,8)} — ${sized.length} traders in, ${tg.detail} (need ${FOMO_MIN_CALLS} channels)`);
+      }
       return;
     }
+    delete pendingFomo[mint];
 
     fomoFired.add(mint);
     saveSet('/tmp/sol_fomo_fired.json', fomoFired);
@@ -2049,6 +2119,31 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
     log(`[FOMO] \u{1F525} FIRED ${symbol} ${mint.substring(0,8)} — ${ordered.length} traders | age ${fmtAge(age)}`);
   } catch (e) {
     log(`[FOMO] error on ${mint?.substring(0,8)}: ${e.message}`);
+  }
+}
+
+// Re-check FOMO signals waiting on calls. Cheap: one mtime-cached file read per
+// pass, no RPC or GMGN calls unless a mint actually clears the gate.
+async function recheckPendingFomo() {
+  for (const mint of Object.keys(pendingFomo)) {
+    if (fomoFired.has(mint)) { delete pendingFomo[mint]; continue; }
+    const bucket = fomoBuyers[mint];
+    if (!bucket || bucket.size < FOMO_MIN_WALLETS) {
+      log(`[FOMO] pending DROPPED ${mint.substring(0,8)} — buys aged out`);
+      delete pendingFomo[mint];
+      continue;
+    }
+    if (!tgCallCheck(mint, FOMO_MIN_CALLS, pendingFomo[mint].symbol).ok) continue;
+    try {
+      log(`[FOMO] pending SATISFIED ${mint.substring(0,8)} — calls landed, re-evaluating`);
+      // Re-enter the one existing fire path so the alert can't drift out of sync.
+      // The tracked wallet/tx args are only used to RECORD a buy, and this mint
+      // already has its buyers, so passing the first recorded one is safe.
+      const [firstWallet] = [...bucket.keys()];
+      await checkFomoSignal(firstWallet, mint, null);
+    } catch (e) {
+      log(`[ERR] FOMO recheck ${mint.substring(0,8)}: ${e.message}`);
+    }
   }
 }
 
@@ -2224,7 +2319,7 @@ http.createServer((req, res) => {
 // ── START ─────────────────────────────────────────────────────
 log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-28a ═══`);
 log(`[START] wallets: ${WALLETS.length} watched = ${_needLegacy ? LEGACY_ADDR_SET.size : 0} legacy (bluechip/cluster/#1/whale)${_needLegacy ? '' : ' — SKIPPED, those signals are off'} + ${ENABLE_FOMO ? FOMO_ADDR_SET.size : 0} FOMO traders`);
-log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets entering within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | min buy ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any'} | chat ${FOMO_SIGNAL_CHAT}`);
+log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets entering within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | min buy ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any'} | >=${FOMO_MIN_CALLS} telegram channel(s)${TG_MATCH_TICKERS ? ' (contract or $ticker)' : ' (contract only)'} | chat ${FOMO_SIGNAL_CHAT}`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
@@ -2234,6 +2329,7 @@ log(`[START] Signals: bluechip=${ENABLE_TREND ? 'ON' : 'OFF'}, #1-everywhere=${E
 // /v1/market/rank, so this line IS what the bot is asking GMGN for — no need to
 // read the source or guess which build is live.
 setInterval(() => { recheckPendingSignals().catch(e => log(`[ERR] recheck loop: ${e.message}`)); }, TG_RECHECK_SECS * 1000);
+setInterval(() => { if (ENABLE_FOMO) recheckPendingFomo().catch(e => log(`[ERR] FOMO recheck loop: ${e.message}`)); }, TG_RECHECK_SECS * 1000);
 log(`[START] TG call gate: ${TG_GATE_ENABLED ? 'ON' : 'OFF'} | ${TG_FAIL_OPEN ? 'FAIL-OPEN (fires unchecked if feed down)' : 'FAIL-CLOSED (no call = no signal)'} | feed=${TG_CALLS_FILE} | re-check every ${TG_RECHECK_SECS}s | feed considered down after ${Math.round(TG_CALLS_MAX_STALE_SEC/60)}m without a heartbeat`);
 log(`[START] Trending pool: order_by=volume desc | top${TREND_TOP_N} per interval | filters=[${TREND_FILTERS.join(', ') || 'none'}] | max_created=${TREND_MAX_CREATED || 'none'} | min_smart=${TREND_MIN_SMART} | min_kol=${TREND_MIN_KOL}`);
 log(`[START] #1 signal: rank 1 on [${TOP1_INTERVALS.join(', ')}] + >=${TOP1_MIN_BIG_BUYS} wallets each >= $${TOP1_MIN_BIG_BUY_USD} within ${Math.round(TOP1_BUY_WINDOW_MS/60000)}m | whale: >${WHALE_MIN_HOLDERS} holders + smart>=${WHALE_MIN_SMART} + kol>=${WHALE_MIN_KOL} + tracked buy >= $${WHALE_MIN_BIG_BUY_USD} within ${Math.round(WHALE_BUY_WINDOW_MS/60000)}m`);
