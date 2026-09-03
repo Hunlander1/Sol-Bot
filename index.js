@@ -104,6 +104,7 @@ const https     = require('https');
 const http      = require('http');
 const fs        = require('fs');
 const WebSocket = require('ws');
+const { execFile } = require('child_process');
 
 // ── CONFIG ────────────────────────────────────────────────────
 const GMGN_API_KEY  = process.env.GMGN_API_KEY;
@@ -243,11 +244,24 @@ const WHALE_SIGNAL_CHAT   = process.env.WHALE_SIGNAL_CHAT || CLUSTER_SIGNAL_CHAT
 const ENABLE_FOMO       = (process.env.ENABLE_FOMO || '1') === '1';
 const FOMO_MIN_WALLETS  = parseInt(process.env.FOMO_MIN_WALLETS || '2', 10);
 const FOMO_MAX_MINT_AGE = parseInt(process.env.FOMO_MAX_MINT_AGE || '86400', 10); // seconds from mint
-const FOMO_MIN_BUY_USD  = parseFloat(process.env.FOMO_MIN_BUY_USD || '0');        // 0 = any size
+const FOMO_MIN_BUY_USD  = parseFloat(process.env.FOMO_MIN_BUY_USD || '2500');     // per-wallet USD floor; 0 = any size
 const FOMO_SIGNAL_CHAT  = process.env.FOMO_SIGNAL_CHAT || '-5174318212';   // dedicated FOMO chat
 // How many DISTINCT telegram channels must have called the mint. 1 = the old
 // behaviour (any single call). 2+ means two independent channels.
-const FOMO_MIN_CALLS    = parseInt(process.env.FOMO_MIN_CALLS || '2', 10);
+// 0 = NO telegram requirement for this signal (the other signals keep theirs).
+const FOMO_MIN_CALLS    = parseInt(process.env.FOMO_MIN_CALLS || '0', 10);
+// With a size floor set, a buy whose USD value can't be determined is REJECTED
+// rather than waved through — otherwise the floor quietly stops applying exactly
+// where it matters. Set to 1 to restore the old fail-open behaviour.
+const FOMO_SIZE_FAIL_OPEN = (process.env.FOMO_SIZE_FAIL_OPEN || '0') === '1';
+// Where per-wallet buy size comes from.
+//   'gmgn'  — gmgn-cli portfolio holdings -> history_bought_cost, the USD the
+//             wallet actually put into that mint. Works on ANY address.
+//   'spend' — the old way: SOL spent in the tx x SOL price.
+// gmgn falls back to spend automatically if the CLI is missing or errors.
+const FOMO_SIZE_SOURCE = (process.env.FOMO_SIZE_SOURCE || 'gmgn').toLowerCase();
+const GMGN_CLI         = process.env.GMGN_CLI || 'gmgn-cli';
+const GMGN_HOLD_TTL_MS = parseInt(process.env.GMGN_HOLD_TTL_MS || '60000', 10);
 // Count "$TICKER" calls toward the gate, not just mints. Requires a tracker new
 // enough to write a `tickers` map into the feed; harmless without one.
 const TG_MATCH_TICKERS  = (process.env.TG_MATCH_TICKERS || '1') === '1';
@@ -1407,7 +1421,7 @@ async function checkTop1Everywhere(map, silent) {
         `Holders: ${v.holders || 'N/A'}\n` +
         `Smart / KOL: ${v.smart} / ${v.kol}\n` +
         `Tracked Buys (${big.count}): ${big.detail}\n` +
-        `Telegram: ${tg.detail}\n` +
+        (tg.detail ? `Telegram: ${tg.detail}\n` : '') +
         (tg.stale ? '\u26a0\ufe0f call gate NOT enforced — feed unavailable\n' : '') +
         `\n` +
         `Signal Time: ${signalTime}\n\n` +
@@ -2029,6 +2043,56 @@ function fomoIsDead(mint) {
   if (d.until && Date.now() > d.until) { delete fomoDead[mint]; return false; }
   return true;
 }
+// ── GMGN holdings (per-wallet cost basis) ────────────────────────────────────
+// One CLI call returns up to 50 positions, most-recently-active first, so a mint
+// bought in the last 24h is essentially always on the first page. Cached per
+// wallet so a mint hit by N wallets costs N calls, not N per poll.
+const _holdCache = {};
+function gmgnHoldings(wallet) {
+  const c = _holdCache[wallet];
+  if (c && Date.now() - c.at < GMGN_HOLD_TTL_MS) return Promise.resolve(c.list);
+  return new Promise((resolve) => {
+    execFile(GMGN_CLI, ['portfolio', 'holdings',
+      '--chain', 'sol', '--wallet', wallet,
+      '--order-by', 'last_active_timestamp', '--direction', 'desc',
+      '--limit', '50', '--hide-airdrop', 'true', '--raw',
+    ], { timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+      if (err) {
+        log(`[FOMO] gmgn-cli holdings failed (${wallet.substring(0,8)}): ${err.message}`);
+        return resolve(null);
+      }
+      try {
+        const list = [];
+        for (const line of String(stdout).split('\n')) {
+          const t = line.trim();
+          if (!t.startsWith('{')) continue;
+          const doc = JSON.parse(t);
+          const arr = doc.holdings || doc.list || doc.data || [];
+          if (Array.isArray(arr)) list.push(...arr);
+        }
+        _holdCache[wallet] = { at: Date.now(), list };
+        resolve(list);
+      } catch (e) {
+        log(`[FOMO] gmgn-cli holdings unparseable: ${e.message}`);
+        resolve(null);
+      }
+    });
+  });
+}
+// GMGN has used a few names for cost basis across versions; accept any.
+function holdingCostUsd(list, mint) {
+  if (!Array.isArray(list)) return null;
+  for (const h of list) {
+    const addr = h?.token?.token_address || h?.token_address || h?.address || '';
+    if (addr !== mint) continue;
+    for (const f of ['history_bought_cost', 'total_cost', 'cost', 'buy_cost_usd', 'bought_cost']) {
+      const v = parseFloat(h?.[f] ?? NaN);
+      if (Number.isFinite(v) && v > 0) return v;
+    }
+    return 0;
+  }
+  return null;
+}
 async function checkFomoSignal(trackedWallet, mint, tx) {
   try {
     if (fomoFired.has(mint) || fomoIsDead(mint)) return;
@@ -2086,21 +2150,66 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
     // Optional size floor. 0 (the default) means "any entry counts" and skips the
     // price lookup entirely. FAIL-OPEN per wallet: an unparseable buy or a dead
     // price feed qualifies rather than silently suppressing a real entry.
+    // SOL spend is measured directly from the transaction, so this is the amount
+    // actually paid — not a token balance revalued at a guessed price.
     const solPrice = await getSolPriceUsd();
     for (const rec of inTime) {
       rec.usd = (rec.sol === null || rec.sol === undefined || !(solPrice > 0)) ? null : rec.sol * solPrice;
     }
-    const sized = FOMO_MIN_BUY_USD > 0
-      ? inTime.filter(rec => rec.usd === null || rec.usd >= FOMO_MIN_BUY_USD)
-      : inTime;
-    if (sized.length < FOMO_MIN_WALLETS) {
-      log(`[FOMO] SKIP ${mint.substring(0,8)} — ${inTime.length} in time, only ${sized.length} >= ${fmtUsd(FOMO_MIN_BUY_USD)}`);
-      return;
+    let sized = inTime;
+    if (FOMO_MIN_BUY_USD > 0 && FOMO_SIZE_SOURCE === 'gmgn') {
+      let anyKnown = false;
+      for (const rec of inTime) {
+        const list = await gmgnHoldings(rec.wallet);
+        const cost = list === null ? null : holdingCostUsd(list, mint);
+        if (cost !== null) { rec.usd = cost; anyKnown = true; } else { rec.usd = null; }
+      }
+      if (anyKnown) {
+        const parts = inTime.map(r => `${walletName(r.wallet)} ${r.usd === null ? '?' : fmtUsd(r.usd)}`);
+        sized = inTime.filter(r => r.usd === null ? FOMO_SIZE_FAIL_OPEN : r.usd >= FOMO_MIN_BUY_USD);
+        if (sized.length < FOMO_MIN_WALLETS) {
+          log(`[FOMO] SKIP ${mint.substring(0,8)} — ${inTime.length} in time, only ${sized.length} spent >= ${fmtUsd(FOMO_MIN_BUY_USD)} [${parts.join(', ')}] (gmgn cost basis)`);
+          return;
+        }
+      } else {
+        log(`[FOMO] ${mint.substring(0,8)} — no gmgn cost basis for any wallet, falling back to SOL spend`);
+        for (const rec of inTime) {
+          rec.usd = (rec.sol === null || rec.sol === undefined || !(solPrice > 0)) ? null : rec.sol * solPrice;
+        }
+        if (!(solPrice > 0) && !FOMO_SIZE_FAIL_OPEN) {
+          log(`[FOMO] SKIP ${mint.substring(0,8)} — no cost basis and no SOL price; cannot verify buys`);
+          return;
+        }
+        const parts = inTime.map(r => `${walletName(r.wallet)} ${r.usd === null ? '?' : fmtUsd(r.usd)}`);
+        sized = inTime.filter(r => r.usd === null ? FOMO_SIZE_FAIL_OPEN : r.usd >= FOMO_MIN_BUY_USD);
+        if (sized.length < FOMO_MIN_WALLETS) {
+          log(`[FOMO] SKIP ${mint.substring(0,8)} — ${inTime.length} in time, only ${sized.length} spent >= ${fmtUsd(FOMO_MIN_BUY_USD)} [${parts.join(', ')}] (SOL spend)`);
+          return;
+        }
+      }
+    } else if (FOMO_MIN_BUY_USD > 0) {
+      if (!(solPrice > 0)) {
+        if (!FOMO_SIZE_FAIL_OPEN) {
+          log(`[FOMO] SKIP ${mint.substring(0,8)} — size floor ${fmtUsd(FOMO_MIN_BUY_USD)} set but SOL price unavailable; cannot verify buys`);
+          return;
+        }
+        log(`[FOMO] ${mint.substring(0,8)} — SOL price unavailable, size floor NOT enforced (FOMO_SIZE_FAIL_OPEN=1)`);
+      } else {
+        const parts = inTime.map(r => `${walletName(r.wallet)} ${r.usd === null ? '?' : fmtUsd(r.usd)}`);
+        sized = inTime.filter(rec => rec.usd === null ? FOMO_SIZE_FAIL_OPEN : rec.usd >= FOMO_MIN_BUY_USD);
+        if (sized.length < FOMO_MIN_WALLETS) {
+          log(`[FOMO] SKIP ${mint.substring(0,8)} — ${inTime.length} in time, only ${sized.length} bought >= ${fmtUsd(FOMO_MIN_BUY_USD)} [${parts.join(', ')}]`);
+          return;
+        }
+      }
     }
+    if (sized.length < FOMO_MIN_WALLETS) return;
 
     // TELEGRAM CALL GATE. No call yet -> do NOT mark fired and do NOT clear the
     // bucket, so the next entry on this mint re-runs this and re-checks.
-    const tg = tgCallCheck(mint, FOMO_MIN_CALLS, info?.symbol);
+    const tg = FOMO_MIN_CALLS > 0
+      ? tgCallCheck(mint, FOMO_MIN_CALLS, info?.symbol)
+      : { ok: true, stale: false, detail: null };   // telegram gate off for this signal
     if (!tg.ok) {
       if (!pendingFomo[mint]) {
         pendingFomo[mint] = { since: Date.now(), symbol: info?.symbol || null };
@@ -2159,7 +2268,7 @@ async function recheckPendingFomo() {
       delete pendingFomo[mint];
       continue;
     }
-    if (!tgCallCheck(mint, FOMO_MIN_CALLS, pendingFomo[mint].symbol).ok) continue;
+    if (FOMO_MIN_CALLS > 0 && !tgCallCheck(mint, FOMO_MIN_CALLS, pendingFomo[mint].symbol).ok) continue;
     try {
       log(`[FOMO] pending SATISFIED ${mint.substring(0,8)} — calls landed, re-evaluating`);
       // Re-enter the one existing fire path so the alert can't drift out of sync.
@@ -2349,7 +2458,7 @@ http.createServer((req, res) => {
 // ── START ─────────────────────────────────────────────────────
 log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-28a ═══`);
 log(`[START] wallets: ${WALLETS.length} watched = ${_needLegacy ? LEGACY_ADDR_SET.size : 0} legacy (bluechip/cluster/#1/whale)${_needLegacy ? '' : ' — SKIPPED, those signals are off'} + ${ENABLE_FOMO ? FOMO_ADDR_SET.size : 0} FOMO traders`);
-log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets entering within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | min buy ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any'} | >=${FOMO_MIN_CALLS} telegram channel(s)${TG_MATCH_TICKERS ? ' (contract or $ticker)' : ' (contract only)'} | chat ${FOMO_SIGNAL_CHAT}`);
+log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets each buying >= ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any size'} within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | ${FOMO_MIN_CALLS > 0 ? `>=${FOMO_MIN_CALLS} telegram channel(s)` : 'NO telegram gate'} | chat ${FOMO_SIGNAL_CHAT}`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
