@@ -244,7 +244,11 @@ const WHALE_SIGNAL_CHAT   = process.env.WHALE_SIGNAL_CHAT || CLUSTER_SIGNAL_CHAT
 const ENABLE_FOMO       = (process.env.ENABLE_FOMO || '1') === '1';
 const FOMO_MIN_WALLETS  = parseInt(process.env.FOMO_MIN_WALLETS || '2', 10);
 const FOMO_MAX_MINT_AGE = parseInt(process.env.FOMO_MAX_MINT_AGE || '86400', 10); // seconds from mint
-const FOMO_MIN_BUY_USD  = parseFloat(process.env.FOMO_MIN_BUY_USD || '2500');     // per-wallet USD floor; 0 = any size
+const FOMO_MIN_BUY_USD  = parseFloat(process.env.FOMO_MIN_BUY_USD || '1250');     // per-wallet USD floor; 0 = any size
+// The qualifying entries must also land within this many seconds OF EACH OTHER.
+// The 24h-from-mint rule says the token is young; this says the wallets moved
+// together. 0 disables it.
+const FOMO_WINDOW_SEC   = parseInt(process.env.FOMO_WINDOW_SEC || '600', 10);
 const FOMO_SIGNAL_CHAT  = process.env.FOMO_SIGNAL_CHAT || '-5174318212';   // dedicated FOMO chat
 // How many DISTINCT telegram channels must have called the mint. 1 = the old
 // behaviour (any single call). 2+ means two independent channels.
@@ -2043,6 +2047,26 @@ function fomoIsDead(mint) {
   if (d.until && Date.now() > d.until) { delete fomoDead[mint]; return false; }
   return true;
 }
+// Tightest set of >= n records whose timestamps span <= windowSec. Returns that
+// subset, or null if no such set exists. One record per wallet already, so every
+// entry here is a distinct trader.
+function withinWindow(records, n, windowSec) {
+  if (!(windowSec > 0)) return records;
+  if (records.length < n) return null;
+  const sorted = [...records].sort((a, b) => a.ts - b.ts);
+  const span = windowSec * 1000;
+  let best = null;
+  for (let i = 0; i < sorted.length; i++) {
+    let j = i;
+    while (j + 1 < sorted.length && sorted[j + 1].ts - sorted[i].ts <= span) j++;
+    const count = j - i + 1;
+    if (count >= n) {
+      const width = sorted[j].ts - sorted[i].ts;
+      if (!best || width < best.width) best = { width, set: sorted.slice(i, j + 1) };
+    }
+  }
+  return best ? best.set : null;
+}
 // ── GMGN holdings (per-wallet cost basis) ────────────────────────────────────
 // One CLI call returns up to 50 positions, most-recently-active first, so a mint
 // bought in the last 24h is essentially always on the first page. Cached per
@@ -2204,6 +2228,22 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
       }
     }
     if (sized.length < FOMO_MIN_WALLETS) return;
+
+    // CLUSTERING: the qualifying buys must also be close together in time. Applied
+    // AFTER the size filter so an undersized buy can't occupy a slot in the window.
+    if (FOMO_WINDOW_SEC > 0) {
+      const clustered = withinWindow(sized, FOMO_MIN_WALLETS, FOMO_WINDOW_SEC);
+      if (!clustered) {
+        const stamps = [...sized].sort((a, b) => a.ts - b.ts)
+          .map(r => `${walletName(r.wallet)} ${new Date(r.ts).toISOString().slice(11, 19)}`);
+        const spread = sized.length > 1
+          ? Math.round((Math.max(...sized.map(r => r.ts)) - Math.min(...sized.map(r => r.ts))) / 1000)
+          : 0;
+        log(`[FOMO] SKIP ${mint.substring(0,8)} — ${sized.length} qualifying buys but no ${FOMO_MIN_WALLETS} within ${FOMO_WINDOW_SEC}s (spread ${fmtAge(spread)}) [${stamps.join(', ')}]`);
+        return;
+      }
+      sized = clustered;
+    }
 
     // TELEGRAM CALL GATE. No call yet -> do NOT mark fired and do NOT clear the
     // bucket, so the next entry on this mint re-runs this and re-checks.
@@ -2458,7 +2498,7 @@ http.createServer((req, res) => {
 // ── START ─────────────────────────────────────────────────────
 log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-28a ═══`);
 log(`[START] wallets: ${WALLETS.length} watched = ${_needLegacy ? LEGACY_ADDR_SET.size : 0} legacy (bluechip/cluster/#1/whale)${_needLegacy ? '' : ' — SKIPPED, those signals are off'} + ${ENABLE_FOMO ? FOMO_ADDR_SET.size : 0} FOMO traders`);
-log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets each buying >= ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any size'} within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | ${FOMO_MIN_CALLS > 0 ? `>=${FOMO_MIN_CALLS} telegram channel(s)` : 'NO telegram gate'} | chat ${FOMO_SIGNAL_CHAT}`);
+log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets each buying >= ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any size'}${FOMO_WINDOW_SEC > 0 ? ` within ${FOMO_WINDOW_SEC}s of each other` : ''} and within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | ${FOMO_MIN_CALLS > 0 ? `>=${FOMO_MIN_CALLS} telegram channel(s)` : 'NO telegram gate'} | chat ${FOMO_SIGNAL_CHAT}`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
