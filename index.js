@@ -249,6 +249,16 @@ const FOMO_MIN_BUY_USD  = parseFloat(process.env.FOMO_MIN_BUY_USD || '1250');   
 // The 24h-from-mint rule says the token is young; this says the wallets moved
 // together. 0 disables it.
 const FOMO_WINDOW_SEC   = parseInt(process.env.FOMO_WINDOW_SEC || '600', 10);
+// Reject a mint when FOMO_MIN_WALLETS or more wallets spent the exact same
+// amount — the signature of a distribution rather than independent buys. Solana
+// is already largely protected because sizing measures SOL actually spent (an
+// airdrop spends nothing), but the guard costs nothing and catches scripted buys.
+const FOMO_REJECT_IDENTICAL = (process.env.FOMO_REJECT_IDENTICAL || '1') === '1';
+// Require proof that each entry was a PURCHASE. On Solana that proof already
+// exists: extractSolSpent returns the SOL the wallet actually paid, so a token
+// sent to the wallet has no spend and is not a buy. Made explicit here so the
+// rule holds even if the USD floor is set to 0.
+const FOMO_REQUIRE_BUY = (process.env.FOMO_REQUIRE_BUY || '1') === '1';
 const FOMO_SIGNAL_CHAT  = process.env.FOMO_SIGNAL_CHAT || '-5174318212';   // dedicated FOMO chat
 // How many DISTINCT telegram channels must have called the mint. 1 = the old
 // behaviour (any single call). 2+ means two independent channels.
@@ -2157,7 +2167,7 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
 
     // Every qualifying entry must have landed within FOMO_MAX_MINT_AGE of mint.
     // Buys are stamped when detected, so this is the age the token actually was.
-    const inTime = [];
+    let inTime = [];
     const late = [];
     for (const [w, rec] of bucket) {
       const ageAtBuy = Math.floor(rec.ts / 1000) - created;
@@ -2169,6 +2179,21 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
     if (inTime.length < FOMO_MIN_WALLETS) {
       log(`[FOMO] SKIP ${mint.substring(0,8)} — ${bucket.size} traders but only ${inTime.length} within ${fmtAge(FOMO_MAX_MINT_AGE)} of mint (late: ${late.join(', ') || 'none'})`);
       return;
+    }
+
+    // BUY CHECK — the wallet must have actually paid SOL for this. A token that
+    // simply arrived spends nothing and is not an entry.
+    if (FOMO_REQUIRE_BUY) {
+      const notBuys = inTime.filter(r => !(r.sol > 0));
+      if (notBuys.length) {
+        const names = notBuys.map(r => walletName(r.wallet)).join(', ');
+        inTime = inTime.filter(r => r.sol > 0);
+        log(`[FOMO] ${mint.substring(0,8)} — dropped ${notBuys.length} non-buy(s) (no SOL spent): ${names}`);
+      }
+      if (inTime.length < FOMO_MIN_WALLETS) {
+        log(`[FOMO] SKIP ${mint.substring(0,8)} — only ${inTime.length} actual buy(s), need ${FOMO_MIN_WALLETS}`);
+        return;
+      }
     }
 
     // Optional size floor. 0 (the default) means "any entry counts" and skips the
@@ -2229,6 +2254,25 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
     }
     if (sized.length < FOMO_MIN_WALLETS) return;
 
+    // AIRDROP / SCRIPTED-BUY REJECTION. Independent traders do not spend the
+    // identical amount to the lamport.
+    if (FOMO_REJECT_IDENTICAL) {
+      const bySol = new Map();
+      for (const r of sized) {
+        if (r.sol === null || r.sol === undefined) continue;
+        const k = String(r.sol);
+        bySol.set(k, (bySol.get(k) || 0) + 1);
+      }
+      for (const [amt, n] of bySol) {
+        if (n >= FOMO_MIN_WALLETS) {
+          log(`[FOMO] SKIP ${mint.substring(0,8)} — ${n} wallets spent the identical amount (${amt} SOL); distribution, not ${n} buying decisions`);
+          fomoDead[mint] = { reason: 'airdrop', until: 0 };
+          delete fomoBuyers[mint];
+          return;
+        }
+      }
+    }
+
     // CLUSTERING: the qualifying buys must also be close together in time. Applied
     // AFTER the size filter so an undersized buy can't occupy a slot in the window.
     if (FOMO_WINDOW_SEC > 0) {
@@ -2280,7 +2324,11 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
     sendTelegram(FOMO_SIGNAL_CHAT,
       `\u{1F3AF} <b>${ordered.length} FOMO Traders Entered — ${symbol}</b>\n\n` +
       `Contract: <code>${mint}</code>\n\n` +
-      `Traders: <b>${ordered.length}</b> (all within ${fmtAge(FOMO_MAX_MINT_AGE)} of mint)\n` +
+      `Traders: <b>${ordered.length}</b>${(() => {
+        const ages = ordered.map(r => r.ageAtBuy).filter(v => v !== null && v !== undefined);
+        if (ages.length < 2) return '';
+        return ` — entries ${fmtAge(Math.max(...ages) - Math.min(...ages))} apart, ${fmtAge(Math.min(...ages))} after mint`;
+      })()}\n` +
       `Chain: Solana\n` +
       `Token Age: ${fmtAge(age)}\n` +
       `Market Cap: ${mcStr}\n` +
@@ -2498,7 +2546,7 @@ http.createServer((req, res) => {
 // ── START ─────────────────────────────────────────────────────
 log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-28a ═══`);
 log(`[START] wallets: ${WALLETS.length} watched = ${_needLegacy ? LEGACY_ADDR_SET.size : 0} legacy (bluechip/cluster/#1/whale)${_needLegacy ? '' : ' — SKIPPED, those signals are off'} + ${ENABLE_FOMO ? FOMO_ADDR_SET.size : 0} FOMO traders`);
-log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets each buying >= ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any size'}${FOMO_WINDOW_SEC > 0 ? ` within ${FOMO_WINDOW_SEC}s of each other` : ''} and within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | ${FOMO_MIN_CALLS > 0 ? `>=${FOMO_MIN_CALLS} telegram channel(s)` : 'NO telegram gate'} | chat ${FOMO_SIGNAL_CHAT}`);
+log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets each buying >= ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any size'}${FOMO_WINDOW_SEC > 0 ? ` within ${FOMO_WINDOW_SEC}s of each other` : ''}${FOMO_REQUIRE_BUY ? ' (verified buys only)' : ''} and within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | ${FOMO_MIN_CALLS > 0 ? `>=${FOMO_MIN_CALLS} telegram channel(s)` : 'NO telegram gate'} | chat ${FOMO_SIGNAL_CHAT}`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
