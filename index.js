@@ -259,6 +259,13 @@ const FOMO_REJECT_IDENTICAL = (process.env.FOMO_REJECT_IDENTICAL || '1') === '1'
 // sent to the wallet has no spend and is not a buy. Made explicit here so the
 // rule holds even if the USD floor is set to 0.
 const FOMO_REQUIRE_BUY = (process.env.FOMO_REQUIRE_BUY || '1') === '1';
+// Quote/base assets are never what this signal is looking for — a wallet
+// receiving wSOL or USDC has SOLD something, the opposite of an entry.
+const FOMO_SKIP_SYMBOLS = new Set(
+  (process.env.FOMO_SKIP_SYMBOLS ||
+   'WSOL,SOL,USDC,USDT,USDS,DAI,WBTC,WETH,ETH,JITOSOL,MSOL,BSOL,JUPSOL'
+  ).split(',').map(x => x.trim().toUpperCase()).filter(Boolean)
+);
 const FOMO_SIGNAL_CHAT  = process.env.FOMO_SIGNAL_CHAT || '-5174318212';   // dedicated FOMO chat
 // How many DISTINCT telegram channels must have called the mint. 1 = the old
 // behaviour (any single call). 2+ means two independent channels.
@@ -2147,6 +2154,12 @@ async function checkFomoSignal(trackedWallet, mint, tx) {
     // Mint time, fetched only once the threshold is reached — a token that never
     // gets there costs no API call.
     const info = await getCachedTokenInfo(mint);
+    if (FOMO_SKIP_SYMBOLS.has(String(info?.symbol || '').toUpperCase())) {
+      fomoDead[mint] = { reason: 'quote/base asset', until: 0 };
+      delete fomoBuyers[mint];
+      log(`[FOMO] RETIRED ${info?.symbol} — quote/base asset, not a tradeable entry`);
+      return;
+    }
     const created = parseInt(info?.creation_timestamp ?? 0, 10) || 0;
     if (!(created > 0)) {
       fomoDead[mint] = { reason: 'no creation timestamp', until: Date.now() + 3600_000 };
@@ -2546,7 +2559,7 @@ http.createServer((req, res) => {
 // ── START ─────────────────────────────────────────────────────
 log(`═══ SOL BLUECHIP TRENDING BOT — VERSION 2026-08-28a ═══`);
 log(`[START] wallets: ${WALLETS.length} watched = ${_needLegacy ? LEGACY_ADDR_SET.size : 0} legacy (bluechip/cluster/#1/whale)${_needLegacy ? '' : ' — SKIPPED, those signals are off'} + ${ENABLE_FOMO ? FOMO_ADDR_SET.size : 0} FOMO traders`);
-log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets each buying >= ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any size'}${FOMO_WINDOW_SEC > 0 ? ` within ${FOMO_WINDOW_SEC}s of each other` : ''}${FOMO_REQUIRE_BUY ? ' (verified buys only)' : ''} and within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | ${FOMO_MIN_CALLS > 0 ? `>=${FOMO_MIN_CALLS} telegram channel(s)` : 'NO telegram gate'} | chat ${FOMO_SIGNAL_CHAT}`);
+log(`[START] FOMO signal: ${ENABLE_FOMO ? 'ON' : 'OFF'} | >=${FOMO_MIN_WALLETS} tracked wallets each buying >= ${FOMO_MIN_BUY_USD > 0 ? '$' + FOMO_MIN_BUY_USD : 'any size'}${FOMO_WINDOW_SEC > 0 ? ` within ${FOMO_WINDOW_SEC}s of each other` : ''}${FOMO_REQUIRE_BUY ? ' (verified buys only)' : ''} and within ${Math.round(FOMO_MAX_MINT_AGE/3600)}h of mint | ${FOMO_MIN_CALLS > 0 ? `>=${FOMO_MIN_CALLS} telegram channel(s)` : 'NO telegram gate'} | chat ${FOMO_SIGNAL_CHAT} | ignoring ${FOMO_SKIP_SYMBOLS.size} quote/base symbols`);
 log(`[START] ${WALLETS.length} wallets | SOLE SIGNAL: tracked buy + top-${TREND_TOP_N} trending (any interval) + age < ${TREND_MAX_TOKEN_AGE/3600}h + bluechip > ${(TREND_MIN_BLUECHIP*100).toFixed(0)}%`);
 log(`[START] Signal chat: ${TREND_SIGNAL_CHAT} | Trending refresh: every ${TREND_POLL_SECS}s across [${TREND_INTERVALS.join(', ')}]`);
 log(`[START] WSS chain: ${WSS_ENDPOINTS.map(e => e.name).join(' -> ')}`);
